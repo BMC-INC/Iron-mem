@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Persistent session memory for Claude Code and other AI coding assistants"
 license = "Apache-2.0"
+authors = ["ExecLayer Inc."]
+repository = "https://github.com/BMC-INC/Iron-mem"
 
 [[bin]]
 name = "ironmem"
