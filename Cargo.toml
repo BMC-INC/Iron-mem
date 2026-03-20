@@ -6,6 +6,10 @@ description = "Persistent session memory for Claude Code and other AI coding ass
 license = "Apache-2.0"
 authors = ["ExecLayer Inc."]
 repository = "https://github.com/BMC-INC/Iron-mem"
+homepage = "https://github.com/BMC-INC/Iron-mem"
+readme = "README.md"
+keywords = ["ai", "memory", "claude", "coding-assistant", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "ironmem"

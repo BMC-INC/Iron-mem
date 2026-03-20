@@ -21,6 +21,7 @@
   <img src="https://img.shields.io/badge/storage-SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white" alt="SQLite"/>
   <img src="https://img.shields.io/badge/license-Apache--2.0-brightgreen?style=for-the-badge" alt="License"/>
   <img src="https://img.shields.io/github/stars/BMC-INC/Ironmem?style=for-the-badge&color=yellow" alt="Stars"/>
+  <a href="https://github.com/BMC-INC/Iron-mem/actions/workflows/rust.yml"><img src="https://github.com/BMC-INC/Iron-mem/actions/workflows/rust.yml/badge.svg" alt="CI"/></a>
 </p>
 
 <p align="center">
@@ -204,6 +205,16 @@ IronMem is **automatic and session-aware:**
 | **Effort** | High | Zero — hooks handle everything |
 
 They work together. `CLAUDE.md` holds your project rules. IronMem holds what happened.
+
+---
+
+## Roadmap
+
+- [ ] Windows native support
+- [ ] Neovim plugin
+- [ ] VSCode extension
+- [ ] OpenAI / Gemini provider support (for compression)
+- [ ] Web UI for memory browser
 
 ---
 
