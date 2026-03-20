@@ -74,8 +74,14 @@ Everything runs locally. Your data stays on your machine.
 ## Install
 
 ```bash
-git clone https://github.com/BMC-INC/Ironmem.git
-cd Ironmem
+curl -fsSL https://raw.githubusercontent.com/BMC-INC/Iron-mem/main/install.sh | bash
+```
+
+Or clone and build manually:
+
+```bash
+git clone https://github.com/BMC-INC/Iron-mem.git
+cd Iron-mem
 chmod +x install.sh
 ./install.sh
 ```
@@ -175,6 +181,24 @@ All fields optional. Sensible defaults provided.
 - **Provider-agnostic** — plain markdown output works with any AI tool
 - **No bloat** — no Bun, no Python, no Docker, no cloud accounts
 - **Fail-safe** — if IronMem crashes, your coding session is unaffected
+
+---
+
+## Why not just use CLAUDE.md?
+
+`CLAUDE.md` is great for static project context — things like "use tabs not spaces" or "we use Axum for routing." But it's manual. You write it, you maintain it, and it doesn't know what happened last session.
+
+IronMem is **automatic and session-aware:**
+
+| | CLAUDE.md | IronMem |
+|---|-----------|---------|
+| **Updates** | You write it manually | Auto-generated from session activity |
+| **Scope** | Static project rules | Dynamic session history |
+| **Rotation** | You manage it | Old memories age out automatically |
+| **Search** | Ctrl+F | Full-text search across all sessions |
+| **Effort** | High | Zero — hooks handle everything |
+
+They work together. `CLAUDE.md` holds your project rules. IronMem holds what happened.
 
 ---
 
