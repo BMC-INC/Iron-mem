@@ -15,7 +15,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             port: 37778,
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6-20250627".to_string(),
             inject_limit: 5,
             max_observation_bytes: 2048,
             db_path: ironmem_dir()
