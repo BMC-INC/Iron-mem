@@ -1,5 +1,6 @@
 # IronMem
 
+![IRON-MEM Logo](logo.png)
 Persistent session memory for Claude Code and any AI coding assistant. Captures what you build each session, compresses it with AI, and injects context into your next session automatically.
 
 Built with Rust. No Bun, no Python, no memecoin.
