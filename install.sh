@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # IronMem installer
 # Builds the release binary, installs hooks into ~/.claude/hooks/,
-# and sets up ~/.ironmem/ directory structure.
+# registers hooks in Claude Code settings.json, and sets up ~/.ironmem/
 
 set -euo pipefail
 
@@ -19,6 +19,7 @@ error()   { echo -e "${RED}❌ $1${NC}"; exit 1; }
 IRONMEM_HOME="${HOME}/.ironmem"
 IRONMEM_BIN="${IRONMEM_HOME}/bin/ironmem"
 CLAUDE_HOOKS_DIR="${HOME}/.claude/hooks"
+CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 info "Installing IronMem — persistent session memory for AI coding assistants"
@@ -47,39 +48,69 @@ success "Binary installed to $IRONMEM_BIN"
 # ── 4. Install Claude Code hooks ───────────────────────────────────────────────
 mkdir -p "$CLAUDE_HOOKS_DIR"
 
-HOOKS=(
-  "session-start.sh:PreToolUse"
-  "post-tool-use.sh:PostToolUse"
-  "stop.sh:Stop"
-  "session-end.sh:PostToolUse"
-)
-
-for entry in "${HOOKS[@]}"; do
-  src="${entry%%:*}"
-  dest_name="${entry##*:}"
-  src_path="${SCRIPT_DIR}/hooks/${src}"
-  dest_path="${CLAUDE_HOOKS_DIR}/${src}"
-
-  cp "$src_path" "$dest_path"
-  chmod +x "$dest_path"
-  info "  Hook installed: $dest_path"
+for src in session-start.sh post-tool-use.sh stop.sh session-end.sh; do
+  cp "${SCRIPT_DIR}/hooks/${src}" "${CLAUDE_HOOKS_DIR}/${src}"
+  chmod +x "${CLAUDE_HOOKS_DIR}/${src}"
+  info "  Hook installed: ${CLAUDE_HOOKS_DIR}/${src}"
 done
 
 success "Hooks installed to $CLAUDE_HOOKS_DIR"
 
-# ── 5. Create ~/.ironmem directory structure ───────────────────────────────────
+# ── 5. Register hooks in Claude Code settings.json ────────────────────────────
+mkdir -p "${HOME}/.claude"
+
+if [ ! -f "$CLAUDE_SETTINGS" ]; then
+  cat > "$CLAUDE_SETTINGS" << EOF
+{
+  "hooks": {
+    "SessionStart": [{"type": "command", "command": "${CLAUDE_HOOKS_DIR}/session-start.sh"}],
+    "PostToolUse":  [{"type": "command", "command": "${CLAUDE_HOOKS_DIR}/post-tool-use.sh"}],
+    "Stop":         [{"type": "command", "command": "${CLAUDE_HOOKS_DIR}/stop.sh"}],
+    "PreCompact":   [{"type": "command", "command": "${CLAUDE_HOOKS_DIR}/session-end.sh"}]
+  }
+}
+EOF
+  success "Created Claude Code settings.json with hooks registered"
+else
+  # Merge hooks into existing settings.json using Python
+  python3 - "$CLAUDE_SETTINGS" "$CLAUDE_HOOKS_DIR" << 'PYEOF'
+import json, sys
+
+settings_path = sys.argv[1]
+hooks_dir = sys.argv[2]
+
+with open(settings_path, 'r') as f:
+    settings = json.load(f)
+
+if 'hooks' in settings:
+    print("[ironmem] 'hooks' key already exists in settings.json — skipping.")
+    print("[ironmem] If IronMem hooks are missing, manually add them to:", settings_path)
+else:
+    settings['hooks'] = {
+        "SessionStart": [{"type": "command", "command": f"{hooks_dir}/session-start.sh"}],
+        "PostToolUse":  [{"type": "command", "command": f"{hooks_dir}/post-tool-use.sh"}],
+        "Stop":         [{"type": "command", "command": f"{hooks_dir}/stop.sh"}],
+        "PreCompact":   [{"type": "command", "command": f"{hooks_dir}/session-end.sh"}]
+    }
+    with open(settings_path, 'w') as f:
+        json.dump(settings, f, indent=2)
+    print(f"✅ Hooks registered in {settings_path}")
+PYEOF
+fi
+
+# ── 6. Create ~/.ironmem directory structure ───────────────────────────────────
 mkdir -p "${IRONMEM_HOME}"
 touch "${IRONMEM_HOME}/server.log"
 
 success "Directory structure created at $IRONMEM_HOME"
 
-# ── 6. Initialize config (if not present) ─────────────────────────────────────
+# ── 7. Initialize config (if not present) ─────────────────────────────────────
 if [ ! -f "${IRONMEM_HOME}/settings.json" ]; then
   "$IRONMEM_BIN" config > /dev/null 2>&1 || true
   info "Default config created at ${IRONMEM_HOME}/settings.json"
 fi
 
-# ── 7. PATH check ──────────────────────────────────────────────────────────────
+# ── 8. PATH check ──────────────────────────────────────────────────────────────
 echo ""
 info "Checking PATH..."
 if echo "$PATH" | grep -q "${IRONMEM_HOME}/bin"; then
@@ -91,7 +122,7 @@ else
   echo ""
 fi
 
-# ── 8. API key check ───────────────────────────────────────────────────────────
+# ── 9. API key check ───────────────────────────────────────────────────────────
 if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
   warn "ANTHROPIC_API_KEY is not set."
   warn "AI compression will not work until you add it to your shell profile:"
