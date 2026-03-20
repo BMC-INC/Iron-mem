@@ -17,10 +17,17 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/built_with-Rust-dea584?style=flat-square&logo=rust" alt="Built with Rust"/>
-  <img src="https://img.shields.io/badge/storage-SQLite-003B57?style=flat-square&logo=sqlite" alt="SQLite"/>
-  <img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="License"/>
-  <img src="https://img.shields.io/github/stars/BMC-INC/Ironmem?style=flat-square" alt="Stars"/>
+  <img src="https://img.shields.io/badge/built_with-Rust-F74C00?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust"/>
+  <img src="https://img.shields.io/badge/storage-SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white" alt="SQLite"/>
+  <img src="https://img.shields.io/badge/license-Apache--2.0-brightgreen?style=for-the-badge" alt="License"/>
+  <img src="https://img.shields.io/github/stars/BMC-INC/Ironmem?style=for-the-badge&color=yellow" alt="Stars"/>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/works_with-Claude_Code-D97706?style=flat-square&logo=anthropic&logoColor=white" alt="Claude Code"/>
+  <img src="https://img.shields.io/badge/works_with-Cursor-000000?style=flat-square&logo=cursor&logoColor=white" alt="Cursor"/>
+  <img src="https://img.shields.io/badge/works_with-Copilot-2b3137?style=flat-square&logo=github&logoColor=white" alt="Copilot"/>
+  <img src="https://img.shields.io/badge/works_with-Windsurf-06B6D4?style=flat-square" alt="Windsurf"/>
 </p>
 
 ---
@@ -38,33 +45,31 @@ IronMem silently records what happens during your coding session, compresses it 
 No setup per session. No copy-pasting. No "remember when we..."
 
 <p align="center">
-  <img src="assets/demo-hero.png" alt="IronMem CLI Demo" width="600"/>
+  <img src="assets/demo.gif" alt="IronMem in action" width="640"/>
 </p>
+
+> **Without IronMem:** _"Hey Claude, remember yesterday we refactored the auth middleware and switched to JWT? And the database migration for the users table? And..."_
+>
+> **With IronMem:** You open a new session. It already knows.
 
 ---
 
 ## How It Works
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    YOUR CODING SESSION                   │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  SessionStart                                           │
-│  └─→ Injects previous memories into IRONMEM.md          │
-│      └─→ AI assistant reads it automatically            │
-│                                                         │
-│  Every Tool Call (file edits, searches, etc.)            │
-│  └─→ Recorded to SQLite via local HTTP server           │
-│                                                         │
-│  SessionEnd                                             │
-│  └─→ All observations compressed via Claude API         │
-│      └─→ Stored as a 3-5 sentence memory with tags     │
-│                                                         │
-│  Next Session                                           │
-│  └─→ Loop repeats. Context never lost.                  │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    A["🟢 Session Start"] -->|inject memories| B["📄 IRONMEM.md"]
+    B --> C["🤖 AI reads context"]
+    C --> D["🔧 You code"]
+    D -->|every tool call| E["🗄️ SQLite"]
+    D --> F["🔴 Session End"]
+    F -->|compress via Claude API| G["🧠 Memory"]
+    G -->|next session| A
+
+    style A fill:#22c55e,color:#fff,stroke:none
+    style F fill:#ef4444,color:#fff,stroke:none
+    style G fill:#8b5cf6,color:#fff,stroke:none
+    style E fill:#0ea5e9,color:#fff,stroke:none
 ```
 
 Everything runs locally. Your data stays on your machine.
@@ -126,7 +131,7 @@ ironmem config              # Print current settings
 `IRONMEM.md` is plain markdown. It works everywhere:
 
 | Tool | Setup |
-|------|-------|
+| ---- | ----- |
 | **Claude Code** | Automatic — hooks handle everything |
 | **Cursor** | Add `@IRONMEM.md` to `.cursorrules` |
 | **Windsurf** | Add to `.windsurfrules` |
@@ -155,7 +160,7 @@ All fields optional. Sensible defaults provided.
 
 ## Architecture
 
-```
+```text
 ~/.ironmem/
 ├── bin/ironmem          # Single compiled binary
 ├── mem.db               # SQLite database (FTS5 full-text search)
@@ -190,8 +195,8 @@ All fields optional. Sensible defaults provided.
 
 IronMem is **automatic and session-aware:**
 
-| | CLAUDE.md | IronMem |
-|---|-----------|---------|
+|   | CLAUDE.md | IronMem |
+| - | --------- | ------- |
 | **Updates** | You write it manually | Auto-generated from session activity |
 | **Scope** | Static project rules | Dynamic session history |
 | **Rotation** | You manage it | Old memories age out automatically |
