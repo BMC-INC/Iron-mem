@@ -1,0 +1,46 @@
+[package]
+name = "ironmem"
+version = "0.1.0"
+edition = "2021"
+description = "Persistent session memory for Claude Code and other AI coding assistants"
+license = "Apache-2.0"
+
+[[bin]]
+name = "ironmem"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server
+axum = { version = "0.7", features = ["json"] }
+tower = "0.4"
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP client (for Claude API)
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
