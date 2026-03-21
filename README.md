@@ -5,7 +5,11 @@
 </p>
 
 <p align="center">
-  <strong>Your AI coding assistant forgets everything. IronMem fixes that.</strong>
+  <strong>Persistent memory for AI coding assistants.</strong>
+</p>
+
+<p align="center">
+  Stop re-explaining your project every time you start a new session.
 </p>
 
 <p align="center">
@@ -20,7 +24,7 @@
   <img src="https://img.shields.io/badge/built_with-Rust-F74C00?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust"/>
   <img src="https://img.shields.io/badge/storage-SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white" alt="SQLite"/>
   <img src="https://img.shields.io/badge/license-Apache--2.0-brightgreen?style=for-the-badge" alt="License"/>
-  <img src="https://img.shields.io/github/stars/BMC-INC/Ironmem?style=for-the-badge&color=yellow" alt="Stars"/>
+  <img src="https://img.shields.io/github/stars/BMC-INC/Iron-mem?style=for-the-badge&color=yellow" alt="Stars"/>
   <img src="https://img.shields.io/github/issues/BMC-INC/Iron-mem?style=for-the-badge" alt="Issues"/>
   <a href="https://github.com/BMC-INC/Iron-mem/actions/workflows/rust.yml"><img src="https://github.com/BMC-INC/Iron-mem/actions/workflows/rust.yml/badge.svg" alt="CI"/></a>
 </p>
@@ -35,6 +39,42 @@
 ---
 
 <!-- SEO Keywords: AI coding assistant memory, session-aware AI tools, Rust AI tools, context preservation, Claude Code memory, Cursor context -->
+
+IronMem gives AI coding tools persistent memory across sessions.
+It silently records what happened during your session, compresses it into concise memory, and injects that context into your next session automatically.
+
+No copy-pasting.
+No rebuilding context from scratch.
+No "remember when we refactored auth yesterday?"
+
+Runs locally.
+No telemetry.
+SQLite storage.
+Plain markdown output.
+Single Rust binary.
+
+<p align="center">
+  <img src="assets/demo.gif" alt="IronMem in action" width="640"/>
+</p>
+
+## Why this exists
+
+AI coding tools are great inside a session and terrible across sessions.
+They help you ship faster, but every fresh session forgets your architecture decisions, debugging trail, and what changed yesterday.
+
+IronMem fixes the handoff.
+
+## Before vs after
+
+Without IronMem:
+
+> "We already changed the auth middleware, switched to JWT, updated the migration, and fixed the failing tests in billing. Let me explain the whole thing again."
+
+With IronMem:
+
+> Open a new session. Your assistant already has the recent project context.
+
+---
 
 ## Quick Start
 
@@ -245,6 +285,28 @@ Rust was chosen for IronMem to deliver:
 - **Provider-agnostic** — plain markdown output works with any AI tool
 - **No bloat** — no Bun, no Python, no Docker, no cloud accounts
 - **Fail-safe** — if IronMem crashes, your coding session is unaffected
+
+---
+
+## Who this is for
+
+IronMem is for developers who use AI coding tools heavily and want continuity across sessions.
+
+It is especially useful if you:
+- switch between Claude Code, Cursor, Copilot, or Windsurf
+- work on projects that span many sessions
+- are tired of re-explaining architecture, bugs, and recent changes
+- want local-first memory instead of a hosted service
+
+## Who this is not for
+
+IronMem is not trying to be:
+- a generic memory platform for every kind of agent
+- a cloud sync product
+- a team knowledge base
+- a dashboard-heavy workflow tool
+
+It solves one narrow problem well: session memory for AI coding workflows.
 
 ---
 
