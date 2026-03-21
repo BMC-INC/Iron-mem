@@ -17,6 +17,13 @@ if [ ! -x "$IRONMEM_BIN" ]; then
   exit 0
 fi
 
+# Persist API key to file so the server can read it even when launched via nohup
+# (nohup/sandbox may strip environment variables from child processes)
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  echo "$ANTHROPIC_API_KEY" > "${HOME}/.ironmem/api_key"
+  chmod 600 "${HOME}/.ironmem/api_key"
+fi
+
 # Check if server is running; start it if not
 if ! curl -sf "http://127.0.0.1:${PORT}/status" > /dev/null 2>&1; then
   # Start server in background, detached from this shell

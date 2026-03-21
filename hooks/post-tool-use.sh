@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # IronMem: post-tool-use hook
 # Records each tool call observation to the ironmem worker.
+# Claude Code passes hook data via stdin as JSON.
 # Fails silently so it never interrupts Claude Code.
 
 PORT="${IRONMEM_PORT:-37778}"
@@ -16,29 +17,36 @@ if [ -z "$SESSION_ID" ]; then
   exit 0
 fi
 
-# Resolve project
-PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+# Read hook data from stdin (Claude Code sends JSON via stdin)
+HOOK_INPUT="$(cat)"
+if [ -z "$HOOK_INPUT" ]; then
+  exit 0
+fi
 
-# Claude Code exposes these env vars in PostToolUse hooks
-TOOL_NAME="${CLAUDE_TOOL_NAME:-unknown}"
-TOOL_INPUT="${CLAUDE_TOOL_INPUT:-}"
-TOOL_OUTPUT="${CLAUDE_TOOL_OUTPUT:-}"
+# Build the event payload in Python, passing hook data via env to avoid quoting issues
+PAYLOAD="$(HOOK_DATA="$HOOK_INPUT" SESS_ID="$SESSION_ID" python3 -c "
+import json, os
 
-# Truncate large values before sending (shell-level safety net)
-TOOL_INPUT="${TOOL_INPUT:0:2000}"
-TOOL_OUTPUT="${TOOL_OUTPUT:0:2000}"
+hook = json.loads(os.environ['HOOK_DATA'])
+session_id = os.environ['SESS_ID']
 
-# Build JSON payload
-PAYLOAD=$(cat <<EOF
-{
-  "session_id": "$SESSION_ID",
-  "project": "$PROJECT_ROOT",
-  "tool": "$TOOL_NAME",
-  "input": $(echo "$TOOL_INPUT" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))" 2>/dev/null || echo "null"),
-  "output": $(echo "$TOOL_OUTPUT" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))" 2>/dev/null || echo "null")
-}
-EOF
-)
+project = hook.get('cwd', '')
+tool_name = hook.get('tool_name', 'unknown')
+tool_input = json.dumps(hook.get('tool_input', {}))[:2000]
+tool_output = json.dumps(hook.get('tool_response', {}))[:2000]
+
+print(json.dumps({
+    'session_id': session_id,
+    'project': project,
+    'tool': tool_name,
+    'input': tool_input,
+    'output': tool_output,
+}))
+" 2>/dev/null)"
+
+if [ -z "$PAYLOAD" ]; then
+  exit 0
+fi
 
 curl -sf \
   -X POST \
