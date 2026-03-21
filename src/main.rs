@@ -242,8 +242,15 @@ async fn run_inject(cfg: &config::Config, project: Option<&str>, limit: i64) -> 
 }
 
 async fn run_compress_cmd(cfg: &config::Config, session_id: &str) -> Result<()> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
+    // Try env var first, then fall back to key file
+    let api_key = std::env::var("ANTHROPIC_API_KEY").or_else(|_| {
+        let key_path = config::ironmem_dir().join("api_key");
+        std::fs::read_to_string(&key_path)
+            .map(|k| k.trim().to_string())
+            .map_err(|_| std::env::VarError::NotPresent)
+    }).map_err(|_| anyhow::anyhow!(
+        "ANTHROPIC_API_KEY not set and ~/.ironmem/api_key not found"
+    ))?;
 
     let pool = db::init_db(&cfg.db_path).await?;
     let session = db::get_session(&pool, session_id)

@@ -101,6 +101,7 @@ With IronMem:
 - [CLI](#cli)
 - [Multi-Provider Support](#multi-provider-support)
 - [Configuration](#configuration)
+- [Troubleshooting](#troubleshooting)
 - [Architecture](#architecture)
 - [Why Rust?](#why-rust)
 - [Design Principles](#design-principles)
@@ -246,6 +247,50 @@ ironmem config              # Print current settings
 
 All fields optional. Sensible defaults provided.
 
+### API Key
+
+IronMem needs an Anthropic API key to compress session observations into memories. It checks two locations:
+
+1. **`ANTHROPIC_API_KEY` environment variable** — set this in your shell profile
+2. **`~/.ironmem/api_key` file** — auto-created by the session-start hook as a fallback
+
+The file fallback exists because the IronMem server runs as a background process via `nohup`, and some environments strip environment variables from child processes. The session-start hook automatically persists your API key to `~/.ironmem/api_key` (with `chmod 600` permissions) so the server can always access it.
+
+---
+
+## Troubleshooting
+
+**Server not starting:**
+
+```bash
+ironmem status                           # Check if server responds
+cat ~/.ironmem/server.log                # Check server logs
+~/.ironmem/bin/ironmem server            # Run manually to see errors
+```
+
+**Observations not being recorded:**
+
+```bash
+ironmem status                           # Check observation count
+sqlite3 ~/.ironmem/mem.db "SELECT count(*) FROM observations;"
+```
+
+If count stays at 0, your hooks may not be installed. Re-run `./install.sh` or check that `~/.claude/hooks/post-tool-use.sh` exists and is executable.
+
+**Compression failing (memories always 0):**
+
+```bash
+# Check if the API key is accessible
+cat ~/.ironmem/api_key                   # Should contain your key
+echo $ANTHROPIC_API_KEY                  # Should be set
+
+# Try manual compression
+ironmem compress <session-id>            # Get session ID from server.log
+```
+
+**Hooks not firing:**
+Check that `~/.claude/settings.json` has the hooks registered under the `"hooks"` key. Re-running `./install.sh` will fix this.
+
 ---
 
 ## Architecture
@@ -255,6 +300,7 @@ All fields optional. Sensible defaults provided.
 ├── bin/ironmem          # Single compiled binary
 ├── mem.db               # SQLite database (FTS5 full-text search)
 ├── settings.json        # Configuration
+├── api_key              # Anthropic API key (auto-persisted, chmod 600)
 ├── current_session      # Active session ID (ephemeral)
 └── server.log           # Worker logs
 
