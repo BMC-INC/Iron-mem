@@ -232,8 +232,15 @@ async fn get_status(
 
 // Shared compression logic
 async fn run_compression(state: &AppState, session_id: &str) -> anyhow::Result<i64> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
+    // Try env var first, then fall back to key file
+    let api_key = std::env::var("ANTHROPIC_API_KEY").or_else(|_| {
+        let key_path = crate::config::ironmem_dir().join("api_key");
+        std::fs::read_to_string(&key_path)
+            .map(|k| k.trim().to_string())
+            .map_err(|_| std::env::VarError::NotPresent)
+    }).map_err(|_| anyhow::anyhow!(
+        "ANTHROPIC_API_KEY not set and ~/.ironmem/api_key not found"
+    ))?;
 
     let session = db::get_session(&state.pool, session_id)
         .await?
