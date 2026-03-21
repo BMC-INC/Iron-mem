@@ -28,4 +28,15 @@ fi
 # Inject memories into IRONMEM.md and update CLAUDE.md
 "$IRONMEM_BIN" inject --project "$PROJECT_ROOT" --limit "$LIMIT" > /dev/null 2>&1 || true
 
+# Start a new session and write the session ID so post-tool-use can record observations
+SESSION_ID=$(curl -sf \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d "{\"project\": \"$PROJECT_ROOT\"}" \
+  "http://127.0.0.1:${PORT}/session/start" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['session_id'])" 2>/dev/null || echo "")
+
+if [ -n "$SESSION_ID" ]; then
+  echo "$SESSION_ID" > "${HOME}/.ironmem/current_session"
+fi
+
 exit 0
