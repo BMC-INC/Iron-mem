@@ -356,4 +356,6 @@ Contributions, issues, and feature requests are also highly welcome.
 
 ## License
 
-Apache-2.0
+Apache-2.0 © 2026 ExecLayer Inc
+
+**Maintainer:** [James Benton](https://github.com/BMC-INC)
