@@ -21,6 +21,7 @@
   <img src="https://img.shields.io/badge/storage-SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white" alt="SQLite"/>
   <img src="https://img.shields.io/badge/license-Apache--2.0-brightgreen?style=for-the-badge" alt="License"/>
   <img src="https://img.shields.io/github/stars/BMC-INC/Ironmem?style=for-the-badge&color=yellow" alt="Stars"/>
+  <img src="https://img.shields.io/github/issues/BMC-INC/Iron-mem?style=for-the-badge" alt="Issues"/>
   <a href="https://github.com/BMC-INC/Iron-mem/actions/workflows/rust.yml"><img src="https://github.com/BMC-INC/Iron-mem/actions/workflows/rust.yml/badge.svg" alt="CI"/></a>
 </p>
 
@@ -30,6 +31,44 @@
   <img src="https://img.shields.io/badge/works_with-Copilot-2b3137?style=flat-square&logo=github&logoColor=white" alt="Copilot"/>
   <img src="https://img.shields.io/badge/works_with-Windsurf-06B6D4?style=flat-square" alt="Windsurf"/>
 </p>
+
+---
+
+<!-- SEO Keywords: AI coding assistant memory, session-aware AI tools, Rust AI tools, context preservation, Claude Code memory, Cursor context -->
+
+## Quick Start
+
+1. **Install IronMem**:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/BMC-INC/Iron-mem/main/install.sh | bash
+   ```
+2. **Add your API key** (in your `~/.zshrc` or `~/.bashrc`):
+   ```bash
+   export ANTHROPIC_API_KEY="your-key-here"
+   ```
+3. **Start coding!** IronMem handles the rest silently in the background.
+
+---
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [The Problem](#the-problem)
+- [The Fix](#the-fix)
+- [Who Should Use This?](#who-should-use-this)
+- [How It Works](#how-it-works)
+- [Install](#install)
+- [CLI](#cli)
+- [Multi-Provider Support](#multi-provider-support)
+- [Configuration](#configuration)
+- [Architecture](#architecture)
+- [Why Rust?](#why-rust)
+- [Design Principles](#design-principles)
+- [Why not just use CLAUDE.md?](#why-not-just-use-claudemd)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [Support](#-support)
+- [License](#license)
 
 ---
 
@@ -52,6 +91,16 @@ No setup per session. No copy-pasting. No "remember when we..."
 > **Without IronMem:** _"Hey Claude, remember yesterday we refactored the auth middleware and switched to JWT? And the database migration for the users table? And..."_
 >
 > **With IronMem:** You open a new session. It already knows.
+
+---
+
+## Who Should Use This?
+
+IronMem is designed for:
+- **Developers frustrated with re-explaining context** to AI tools every single session.
+- **Teams working on large, multi-session projects** where context gets easily lost.
+- **Developers frequently switching** between multiple AI tools like Copilot, Claude Code, Windsurf, or Cursor.
+- **Solo developers** who want to maintain flow and continuity without manual effort.
 
 ---
 
@@ -180,6 +229,15 @@ All fields optional. Sensible defaults provided.
 
 ---
 
+## Why Rust?
+
+Rust was chosen for IronMem to deliver:
+- **Maximum Performance:** Minimal overhead and lightning-fast execution, essential for a tool that hooks into every single CLI command.
+- **Zero Dependencies:** Compiles down to a single binary. No need to install Python, Node.js, or complex runtime environments.
+- **Memory Safety & Reliability:** Guaranteed safety without a garbage collector ensures the background worker remains rock-solid and leak-free.
+
+---
+
 ## Design Principles
 
 - **Zero friction** — hooks run silently, never interrupt your workflow
@@ -223,6 +281,14 @@ They work together. `CLAUDE.md` holds your project rules. IronMem holds what hap
 Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR.
 
 **TL;DR:** Open an issue first. Bug fixes and provider compatibility improvements are always welcome. We don't accept changes that add runtime dependencies or complexity.
+
+---
+
+## ⭐ Support
+
+If you find IronMem useful, please consider giving it a star! 🌟
+This helps others discover the project and motivates further development.
+Contributions, issues, and feature requests are also highly welcome.
 
 ---
 
