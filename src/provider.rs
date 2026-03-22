@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::db::Observation;
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
+    #[default]
     Anthropic,
     Openai,
     Google,
@@ -27,12 +28,6 @@ impl Provider {
             Provider::Openai => "gpt-4o",
             Provider::Google => "gemini-2.0-flash",
         }
-    }
-}
-
-impl Default for Provider {
-    fn default() -> Self {
-        Provider::Anthropic
     }
 }
 
