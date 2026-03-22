@@ -15,6 +15,8 @@ pub struct Config {
     pub mcp_transport: String,
     #[serde(default = "default_mcp_sse_port")]
     pub mcp_sse_port: u16,
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 fn default_mcp_transport() -> String {
@@ -36,6 +38,7 @@ impl Default for Config {
             database_url: None,
             mcp_transport: default_mcp_transport(),
             mcp_sse_port: default_mcp_sse_port(),
+            auth_token: None,
         }
     }
 }
@@ -50,6 +53,17 @@ impl Config {
 
     pub fn effective_mcp_transport(&self) -> String {
         std::env::var("IRONMEM_MCP_TRANSPORT").unwrap_or_else(|_| self.mcp_transport.clone())
+    }
+
+    /// Get or generate the auth token for SSE. Persists to settings on first generation.
+    pub fn ensure_auth_token(&mut self) -> String {
+        if let Some(ref token) = self.auth_token {
+            return token.clone();
+        }
+        let token = uuid::Uuid::new_v4().to_string();
+        self.auth_token = Some(token.clone());
+        let _ = save(self);
+        token
     }
 }
 

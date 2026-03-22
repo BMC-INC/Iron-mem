@@ -79,6 +79,13 @@ enum Commands {
     /// Start the MCP server (stdio transport, for Claude Desktop/Code)
     Mcp,
 
+    /// Start the SSE server for claude.ai (with auth + optional public tunnel)
+    Serve {
+        /// Expose via Cloudflare Tunnel for claude.ai access
+        #[arg(long)]
+        public: bool,
+    },
+
     /// Print current configuration
     Config,
 }
@@ -98,6 +105,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Server => run_server(cfg).await?,
         Commands::Mcp => run_mcp(cfg).await?,
+        Commands::Serve { public } => run_serve(cfg, public).await?,
         Commands::Status => run_status(&cfg).await?,
         Commands::Search {
             query,
@@ -141,8 +149,11 @@ async fn run_server(cfg: config::Config) -> Result<()> {
             format!("0.0.0.0:{}", cfg.mcp_sse_port).parse().unwrap();
         let sse_db = db.clone();
         let sse_cfg = cfg.clone();
+        let auth_token = cfg.auth_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = mcp::run_sse(sse_db, sse_cfg, sse_addr).await {
+            if let Err(e) =
+                mcp::run_sse_with_auth(sse_db, sse_cfg, sse_addr, auth_token).await
+            {
                 tracing::error!("MCP SSE server error: {}", e);
             }
         });
@@ -160,6 +171,129 @@ async fn run_mcp(cfg: config::Config) -> Result<()> {
     let db = std::sync::Arc::new(database);
     mcp::run_stdio(db, cfg).await?;
     Ok(())
+}
+
+async fn run_serve(mut cfg: config::Config, public: bool) -> Result<()> {
+    let db_url = cfg.effective_database_url();
+    let database = db::Database::new(&db_url).await?;
+    database.migrate().await?;
+    let db = std::sync::Arc::new(database);
+
+    let token = cfg.ensure_auth_token();
+    let sse_port = cfg.mcp_sse_port;
+    let bind: std::net::SocketAddr = format!("0.0.0.0:{}", sse_port).parse().unwrap();
+
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("  IronMem SSE Server");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("  Local:  http://127.0.0.1:{}/sse", sse_port);
+    println!("  Token:  {}", token);
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    if public {
+        // Launch Cloudflare tunnel in background
+        let tunnel_port = sse_port;
+        tokio::spawn(async move {
+            // Give the SSE server a moment to bind
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            run_cloudflare_tunnel(tunnel_port).await;
+        });
+    }
+
+    let serve_cfg = cfg.clone();
+    mcp::run_sse_with_auth(db, serve_cfg, bind, Some(token)).await?;
+
+    Ok(())
+}
+
+async fn run_cloudflare_tunnel(port: u16) {
+    // Try cloudflared first (installed binary), then npx fallback
+    let url = format!("http://localhost:{}", port);
+
+    // Check for cloudflared binary
+    let cloudflared = tokio::process::Command::new("cloudflared")
+        .arg("--version")
+        .output()
+        .await;
+
+    if cloudflared.is_ok() {
+        println!("\n  Starting Cloudflare Tunnel (cloudflared)...\n");
+        let mut child = match tokio::process::Command::new("cloudflared")
+            .args(["tunnel", "--url", &url])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("  Failed to start cloudflared: {}", e);
+                return;
+            }
+        };
+
+        // Read stderr for the tunnel URL
+        if let Some(stderr) = child.stderr.take() {
+            let reader = tokio::io::BufReader::new(stderr);
+            use tokio::io::AsyncBufReadExt;
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.contains("https://") && line.contains(".trycloudflare.com") {
+                    if let Some(url) = line.split_whitespace().find(|s| s.starts_with("https://")) {
+                        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                        println!("  Public URL: {}", url);
+                        println!();
+                        println!("  Add to claude.ai as MCP server:");
+                        println!("    URL:   {}/sse", url);
+                        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                    }
+                }
+                tracing::debug!("cloudflared: {}", line);
+            }
+        }
+
+        let _ = child.wait().await;
+    } else {
+        // Fallback: try npx with cloudflared
+        println!("\n  cloudflared not found. Install it for best results:");
+        println!("    brew install cloudflared");
+        println!("    # or: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/\n");
+        println!("  Trying npx fallback...\n");
+
+        let mut child = match tokio::process::Command::new("npx")
+            .args(["-y", "cloudflared", "tunnel", "--url", &url])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("  Failed to start tunnel: {}", e);
+                eprintln!("  Install cloudflared manually: brew install cloudflared");
+                return;
+            }
+        };
+
+        if let Some(stderr) = child.stderr.take() {
+            let reader = tokio::io::BufReader::new(stderr);
+            use tokio::io::AsyncBufReadExt;
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.contains("https://") && line.contains(".trycloudflare.com") {
+                    if let Some(url) = line.split_whitespace().find(|s| s.starts_with("https://")) {
+                        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                        println!("  Public URL: {}", url);
+                        println!();
+                        println!("  Add to claude.ai as MCP server:");
+                        println!("    URL:   {}/sse", url);
+                        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                    }
+                }
+                tracing::debug!("cloudflared: {}", line);
+            }
+        }
+
+        let _ = child.wait().await;
+    }
 }
 
 async fn run_status(cfg: &config::Config) -> Result<()> {

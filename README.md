@@ -119,6 +119,7 @@ With IronMem:
 - [Install](#install)
 - [CLI](#cli)
 - [Multi-Provider Support](#multi-provider-support)
+- [MCP Setup](#mcp-setup)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
 - [Architecture](#architecture)
@@ -219,6 +220,8 @@ Restart your terminal and Claude Code. That's it.
 ```bash
 ironmem server              # Start REST + MCP SSE server
 ironmem mcp                 # Start MCP stdio server (for Claude Desktop/Code)
+ironmem serve               # Start SSE server with bearer token auth
+ironmem serve --public      # Same + Cloudflare Tunnel for claude.ai
 ironmem status              # Health check + DB stats
 ironmem list                # Recent memories for current project
 ironmem search "auth middleware"  # Full-text search across memories
@@ -243,15 +246,147 @@ IronMem works as an **MCP server** (native integration) or via **IRONMEM.md** (p
 
 | Platform | MCP Native | IRONMEM.md | Setup |
 | -------- | :--------: | :--------: | ----- |
-| **Claude Desktop** | **Yes** | Yes | Add to `claude_desktop_config.json` |
-| **Claude Code** | **Yes** | Yes | Add to `.mcp.json` or use hooks |
-| **Cursor** | **Yes** | Yes | MCP config or `.cursorrules` |
-| **Windsurf** | **Yes** | Yes | MCP config or `.windsurfrules` |
-| **ChatGPT Desktop** | **Yes** | — | MCP config |
-| **Zed** | **Yes** | — | MCP config |
-| **VS Code (Copilot/Continue/Cline)** | **Yes** | Yes | MCP config or `.github/copilot-instructions.md` |
+| **Claude Code** | **Yes** | Yes | [Setup →](#claude-code-mcp-setup) |
+| **Claude Desktop / claude.ai** | **Yes** | Yes | [Setup →](#claude-desktop-mcp-setup) |
+| **Cursor** | **Yes** | Yes | [Setup →](#cursor--windsurf-mcp-setup) |
+| **Windsurf** | **Yes** | Yes | [Setup →](#cursor--windsurf-mcp-setup) |
+| **ChatGPT Desktop** | **Yes** | — | [Setup →](#other-mcp-clients) |
+| **Zed** | **Yes** | — | [Setup →](#other-mcp-clients) |
+| **VS Code (Copilot/Continue/Cline)** | **Yes** | Yes | [Setup →](#other-mcp-clients) |
 | **Any MCP Client** | **Yes** | — | stdio or SSE transport |
 | **Any AI Tool** | — | Yes | Read `IRONMEM.md` as project context |
+
+---
+
+## MCP Setup
+
+IronMem supports two MCP transports:
+
+- **stdio** — for local clients that launch the server themselves (Claude Code, Claude Desktop, Cursor)
+- **SSE** — for remote/cloud clients that connect over HTTP (claude.ai, team deployments)
+
+### Claude Code MCP Setup
+
+Claude Code connects via **stdio** — it launches `ironmem mcp` directly.
+
+**Option A: CLI (recommended)**
+
+```bash
+claude mcp add ironmem -- ~/.ironmem/bin/ironmem mcp
+```
+
+**Option B: Project `.mcp.json`** (share with your team)
+
+Create `.mcp.json` in your project root:
+
+```json
+{
+  "mcpServers": {
+    "ironmem": {
+      "command": "~/.ironmem/bin/ironmem",
+      "args": ["mcp"],
+      "env": {
+        "ANTHROPIC_API_KEY": "your-key-here"
+      }
+    }
+  }
+}
+```
+
+> **Note:** Claude Code hooks (installed by `install.sh`) and MCP can coexist. The hooks use the REST API for automatic observation recording; MCP gives you direct tool access. You can use both, or just one.
+
+### Claude Desktop MCP Setup
+
+Claude Desktop also connects via **stdio**.
+
+Add to your `claude_desktop_config.json`:
+
+**macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+**Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "ironmem": {
+      "command": "/Users/YOU/.ironmem/bin/ironmem",
+      "args": ["mcp"],
+      "env": {
+        "ANTHROPIC_API_KEY": "your-key-here"
+      }
+    }
+  }
+}
+```
+
+Replace `/Users/YOU` with your actual home directory path. Restart Claude Desktop after saving.
+
+### claude.ai (Web) MCP Setup
+
+claude.ai runs in the cloud — it **cannot** reach `localhost`. IronMem solves this with one command:
+
+```bash
+ironmem serve --public
+```
+
+This does three things:
+1. Starts the SSE server with **bearer token authentication**
+2. Launches a **Cloudflare Tunnel** (free, no account needed) to expose it publicly
+3. Prints the public URL and auth token
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  IronMem SSE Server
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Local:  http://127.0.0.1:37779/sse
+  Token:  a1b2c3d4-e5f6-...
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Public URL: https://xxx-yyy-zzz.trycloudflare.com
+  Add to claude.ai as MCP server:
+    URL:   https://xxx-yyy-zzz.trycloudflare.com/sse
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Add the URL to claude.ai under Settings → MCP Servers, with your auth token as the bearer token.
+
+**Everything stays local.** Your data never leaves your machine — the tunnel just forwards authenticated MCP protocol messages.
+
+**Without `--public`:** `ironmem serve` starts the SSE server locally with auth (for LAN or your own reverse proxy).
+
+**Requirements:** Install [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) for best results (`brew install cloudflared`). Falls back to `npx cloudflared` if not installed.
+
+### Cursor / Windsurf MCP Setup
+
+Both use stdio. Add to your MCP settings:
+
+**Cursor:** Settings → MCP → Add Server
+
+**Windsurf:** Settings → MCP → Add Server
+
+```json
+{
+  "ironmem": {
+    "command": "~/.ironmem/bin/ironmem",
+    "args": ["mcp"]
+  }
+}
+```
+
+### Other MCP Clients
+
+Any MCP client that supports **stdio** transport can use IronMem:
+
+```json
+{
+  "command": "~/.ironmem/bin/ironmem",
+  "args": ["mcp"]
+}
+```
+
+For clients that only support **SSE**, start the server with SSE enabled and point the client at `http://localhost:37779/sse`:
+
+```bash
+IRONMEM_MCP_TRANSPORT=sse ironmem server
+```
 
 ---
 
@@ -268,7 +403,8 @@ IronMem works as an **MCP server** (native integration) or via **IRONMEM.md** (p
   "db_path": "/Users/you/.ironmem/mem.db",
   "database_url": null,
   "mcp_transport": "stdio",
-  "mcp_sse_port": 37779
+  "mcp_sse_port": 37779,
+  "auth_token": null
 }
 ```
 
