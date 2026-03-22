@@ -1,14 +1,14 @@
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
-    response::Json,
-    routing::{get, post},
+    response::{Html, Json},
+    routing::{delete, get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::{compress, config::Config, db};
+use crate::{config::Config, db, provider};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -24,6 +24,11 @@ pub fn router(state: AppState) -> Router {
         .route("/compress", post(compress_session))
         .route("/context", get(get_context))
         .route("/status", get(get_status))
+        // Web UI routes
+        .route("/ui", get(web_ui))
+        .route("/api/memories", get(api_list_memories))
+        .route("/api/memories/{id}", delete(api_delete_memory))
+        .route("/api/sessions", get(api_list_sessions))
         .with_state(Arc::new(state))
 }
 
@@ -234,25 +239,13 @@ async fn get_status(
 
 // Shared compression logic
 async fn run_compression(state: &AppState, session_id: &str) -> anyhow::Result<i64> {
-    // Try env var first, then fall back to key file
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .or_else(|_| {
-            let key_path = crate::config::ironmem_dir().join("api_key");
-            std::fs::read_to_string(&key_path)
-                .map(|k| k.trim().to_string())
-                .map_err(|_| std::env::VarError::NotPresent)
-        })
-        .map_err(|_| {
-            anyhow::anyhow!("ANTHROPIC_API_KEY not set and ~/.ironmem/api_key not found")
-        })?;
-
     let session = db::get_session(&state.db, session_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
     let observations = db::get_observations_for_session(&state.db, session_id).await?;
 
-    let result = compress::compress_session(&observations, &state.config.model, &api_key).await?;
+    let result = provider::compress(&observations, &state.config).await?;
 
     let memory_id = db::insert_memory(
         &state.db,
@@ -272,4 +265,69 @@ async fn run_compression(state: &AppState, session_id: &str) -> anyhow::Result<i
     );
 
     Ok(memory_id)
+}
+
+// ── Web UI ──────────────────────────────────────────────────────────
+
+async fn web_ui() -> Html<&'static str> {
+    Html(include_str!("web_ui.html"))
+}
+
+#[derive(Deserialize)]
+pub struct MemoriesQuery {
+    pub project: Option<String>,
+    pub query: Option<String>,
+    pub limit: Option<i64>,
+}
+
+async fn api_list_memories(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<MemoriesQuery>,
+) -> Result<Json<Vec<db::Memory>>, (StatusCode, String)> {
+    let limit = params.limit.unwrap_or(50);
+
+    let memories = if let Some(project) = &params.project {
+        if let Some(q) = &params.query {
+            db::search_memories(&state.db, project, q, limit)
+                .await
+                .unwrap_or_default()
+        } else {
+            db::get_recent_memories(&state.db, project, limit)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        }
+    } else {
+        db::get_all_memories(&state.db, limit)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    Ok(Json(memories))
+}
+
+async fn api_delete_memory(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let deleted = db::delete_memory(&state.db, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "deleted": deleted })))
+}
+
+#[derive(Deserialize)]
+pub struct SessionsQuery {
+    pub limit: Option<i64>,
+}
+
+async fn api_list_sessions(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SessionsQuery>,
+) -> Result<Json<Vec<db::Session>>, (StatusCode, String)> {
+    let limit = params.limit.unwrap_or(50);
+    let sessions = db::list_sessions(&state.db, limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(sessions))
 }

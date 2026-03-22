@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::db::{self, Database};
-use crate::{compress, hooks};
+use crate::{hooks, provider};
 use anyhow::Result;
 use rmcp::model::*;
 use rmcp::transport::streamable_http_server::{
@@ -405,25 +405,13 @@ impl IronMemServer {
     }
 
     async fn run_compression(&self, session_id: &str) -> anyhow::Result<i64> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .or_else(|_| {
-                let key_path = crate::config::ironmem_dir().join("api_key");
-                std::fs::read_to_string(&key_path)
-                    .map(|k| k.trim().to_string())
-                    .map_err(|_| std::env::VarError::NotPresent)
-            })
-            .map_err(|_| {
-                anyhow::anyhow!("ANTHROPIC_API_KEY not set and ~/.ironmem/api_key not found")
-            })?;
-
         let session = db::get_session(&self.db, session_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
         let observations = db::get_observations_for_session(&self.db, session_id).await?;
 
-        let result =
-            compress::compress_session(&observations, &self.config.model, &api_key).await?;
+        let result = provider::compress(&observations, &self.config).await?;
 
         let memory_id = db::insert_memory(
             &self.db,

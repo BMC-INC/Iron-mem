@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IronMem — Memory Browser</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --purple: #bc8cff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; background: var(--bg); color: var(--text); padding: 24px; max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 24px; }
+  .stats { display: flex; gap: 16px; margin-bottom: 24px; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; flex: 1; }
+  .stat-value { font-size: 1.5rem; font-weight: bold; color: var(--accent); }
+  .stat-label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  .tab { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 8px 16px; cursor: pointer; color: var(--muted); font-size: 0.85rem; }
+  .tab.active { color: var(--accent); border-color: var(--accent); }
+  .search { width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px; color: var(--text); font-size: 0.9rem; margin-bottom: 16px; outline: none; }
+  .search:focus { border-color: var(--accent); }
+  .search::placeholder { color: var(--muted); }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+  .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .card-id { color: var(--purple); font-size: 0.8rem; font-weight: 600; }
+  .card-project { color: var(--muted); font-size: 0.75rem; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card-date { color: var(--muted); font-size: 0.75rem; }
+  .card-summary { line-height: 1.5; font-size: 0.9rem; margin-bottom: 8px; }
+  .card-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tag { background: #1f2937; color: var(--accent); padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
+  .card-actions { margin-top: 8px; }
+  .btn-delete { background: none; border: 1px solid var(--border); color: var(--red); padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 0.75rem; }
+  .btn-delete:hover { border-color: var(--red); }
+  .session-status { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .session-status.active { background: var(--green); }
+  .session-status.ended { background: var(--muted); }
+  .session-status.compressed { background: var(--purple); }
+  .empty { text-align: center; color: var(--muted); padding: 48px; }
+  .loading { text-align: center; color: var(--muted); padding: 24px; }
+</style>
+</head>
+<body>
+
+<h1>IronMem</h1>
+<p class="subtitle">Memory Browser</p>
+
+<div class="stats" id="stats">
+  <div class="stat"><div class="stat-value" id="stat-sessions">-</div><div class="stat-label">Sessions</div></div>
+  <div class="stat"><div class="stat-value" id="stat-memories">-</div><div class="stat-label">Memories</div></div>
+  <div class="stat"><div class="stat-value" id="stat-observations">-</div><div class="stat-label">Observations</div></div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" data-tab="memories" onclick="switchTab('memories')">Memories</div>
+  <div class="tab" data-tab="sessions" onclick="switchTab('sessions')">Sessions</div>
+</div>
+
+<input class="search" id="search" type="text" placeholder="Search memories..." oninput="debounceSearch()">
+
+<div id="content"><div class="loading">Loading...</div></div>
+
+<script>
+const API = window.location.origin;
+let currentTab = 'memories';
+let searchTimer = null;
+
+async function fetchJSON(path) {
+  const r = await fetch(API + path);
+  return r.json();
+}
+
+function formatDate(ts) {
+  if (!ts) return '—';
+  return new Date(ts * 1000).toLocaleString();
+}
+
+function formatProject(p) {
+  const parts = p.split('/');
+  return parts.slice(-2).join('/');
+}
+
+async function loadStats() {
+  const s = await fetchJSON('/status');
+  document.getElementById('stat-sessions').textContent = s.sessions;
+  document.getElementById('stat-memories').textContent = s.memories;
+  document.getElementById('stat-observations').textContent = s.observations;
+}
+
+async function loadMemories(query) {
+  const el = document.getElementById('content');
+  const params = new URLSearchParams({ limit: '50' });
+  if (query) {
+    // search needs a project — skip project filter for browse
+    el.innerHTML = '<div class="loading">Searching...</div>';
+  }
+  const memories = await fetchJSON('/api/memories?' + params);
+
+  if (!memories.length) {
+    el.innerHTML = '<div class="empty">No memories yet. Start a session to build memory.</div>';
+    return;
+  }
+
+  el.innerHTML = memories.map(m => `
+    <div class="card" id="mem-${m.id}">
+      <div class="card-header">
+        <span class="card-id">Memory #${m.id}</span>
+        <span class="card-project" title="${m.project}">${formatProject(m.project)}</span>
+        <span class="card-date">${formatDate(m.created_at)}</span>
+      </div>
+      <div class="card-summary">${escapeHtml(m.summary)}</div>
+      ${m.tags ? `<div class="card-tags">${m.tags.split(' ').map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('')}</div>` : ''}
+      <div class="card-actions">
+        <button class="btn-delete" onclick="deleteMemory(${m.id})">Delete</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function loadSessions() {
+  const el = document.getElementById('content');
+  const sessions = await fetchJSON('/api/sessions?limit=50');
+
+  if (!sessions.length) {
+    el.innerHTML = '<div class="empty">No sessions yet.</div>';
+    return;
+  }
+
+  el.innerHTML = sessions.map(s => {
+    const status = s.compressed ? 'compressed' : (s.ended_at ? 'ended' : 'active');
+    const label = s.compressed ? 'Compressed' : (s.ended_at ? 'Ended' : 'Active');
+    return `
+      <div class="card">
+        <div class="card-header">
+          <span><span class="session-status ${status}"></span><span class="card-id">${s.id.slice(0, 8)}</span></span>
+          <span class="card-project" title="${s.project}">${formatProject(s.project)}</span>
+          <span class="card-date">${formatDate(s.started_at)}</span>
+        </div>
+        <div style="color: var(--muted); font-size: 0.8rem;">
+          Status: ${label} &bull; Started: ${formatDate(s.started_at)} ${s.ended_at ? '&bull; Ended: ' + formatDate(s.ended_at) : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+async function deleteMemory(id) {
+  if (!confirm('Delete memory #' + id + '?')) return;
+  await fetch(API + '/api/memories/' + id, { method: 'DELETE' });
+  const el = document.getElementById('mem-' + id);
+  if (el) el.remove();
+  loadStats();
+}
+
+function switchTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+  document.getElementById('search').style.display = tab === 'memories' ? '' : 'none';
+  if (tab === 'memories') loadMemories();
+  else loadSessions();
+}
+
+function debounceSearch() {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    loadMemories(document.getElementById('search').value);
+  }, 300);
+}
+
+function escapeHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str;
+  return d.innerHTML;
+}
+
+loadStats();
+loadMemories();
+</script>
+</body>
+</html>

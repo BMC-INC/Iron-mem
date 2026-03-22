@@ -1,8 +1,8 @@
-mod compress;
 mod config;
 mod db;
 mod hooks;
 mod mcp;
+mod provider;
 mod server;
 
 use anyhow::Result;
@@ -250,7 +250,12 @@ async fn run_cloudflare_tunnel(port: u16) {
     } else {
         // Fallback: try npx with cloudflared
         println!("\n  cloudflared not found. Install it for best results:");
+        #[cfg(target_os = "macos")]
         println!("    brew install cloudflared");
+        #[cfg(target_os = "windows")]
+        println!("    winget install Cloudflare.cloudflared");
+        #[cfg(target_os = "linux")]
+        println!("    See https://pkg.cloudflare.com/ for your distro");
         println!("    # or: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/\n");
         println!("  Trying npx fallback...\n");
 
@@ -263,7 +268,12 @@ async fn run_cloudflare_tunnel(port: u16) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("  Failed to start tunnel: {}", e);
+                #[cfg(target_os = "macos")]
                 eprintln!("  Install cloudflared manually: brew install cloudflared");
+                #[cfg(target_os = "windows")]
+                eprintln!("  Install cloudflared manually: winget install Cloudflare.cloudflared");
+                #[cfg(target_os = "linux")]
+                eprintln!("  Install cloudflared manually: see https://pkg.cloudflare.com/");
                 return;
             }
         };
@@ -412,18 +422,6 @@ async fn run_inject(cfg: &config::Config, project: Option<&str>, limit: i64) -> 
 }
 
 async fn run_compress_cmd(cfg: &config::Config, session_id: &str) -> Result<()> {
-    // Try env var first, then fall back to key file
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .or_else(|_| {
-            let key_path = config::ironmem_dir().join("api_key");
-            std::fs::read_to_string(&key_path)
-                .map(|k| k.trim().to_string())
-                .map_err(|_| std::env::VarError::NotPresent)
-        })
-        .map_err(|_| {
-            anyhow::anyhow!("ANTHROPIC_API_KEY not set and ~/.ironmem/api_key not found")
-        })?;
-
     let database = db::Database::new(&cfg.effective_database_url()).await?;
     database.migrate().await?;
     let session = db::get_session(&database, session_id)
@@ -436,9 +434,13 @@ async fn run_compress_cmd(cfg: &config::Config, session_id: &str) -> Result<()> 
         return Ok(());
     }
 
-    println!("Compressing {} observations...", observations.len());
+    println!(
+        "Compressing {} observations via {}...",
+        observations.len(),
+        cfg.model
+    );
 
-    let result = compress::compress_session(&observations, &cfg.model, &api_key).await?;
+    let result = provider::compress(&observations, cfg).await?;
     let memory_id = db::insert_memory(
         &database,
         &session.project,

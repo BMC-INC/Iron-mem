@@ -2,9 +2,13 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::provider::Provider;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub port: u16,
+    #[serde(default)]
+    pub provider: Provider,
     pub model: String,
     pub inject_limit: usize,
     pub max_observation_bytes: usize,
@@ -29,9 +33,11 @@ fn default_mcp_sse_port() -> u16 {
 
 impl Default for Config {
     fn default() -> Self {
+        let provider = Provider::default();
         Self {
             port: 37778,
-            model: "claude-sonnet-4-6-20250627".to_string(),
+            provider,
+            model: provider.default_model().to_string(),
             inject_limit: 5,
             max_observation_bytes: 2048,
             db_path: ironmem_dir().join("mem.db").to_string_lossy().to_string(),
@@ -70,7 +76,17 @@ impl Config {
 
 pub fn ironmem_dir() -> PathBuf {
     dirs::home_dir()
-        .expect("Could not find home directory")
+        .unwrap_or_else(|| {
+            // Fallback for environments where home dir detection fails
+            #[cfg(windows)]
+            {
+                PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string()))
+            }
+            #[cfg(not(windows))]
+            {
+                PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+            }
+        })
         .join(".ironmem")
 }
 

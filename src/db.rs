@@ -419,6 +419,71 @@ pub async fn delete_memories_for_project(db: &Database, project: &str) -> Result
     Ok(result.rows_affected())
 }
 
+// List sessions
+
+pub async fn list_sessions(db: &Database, limit: i64) -> Result<Vec<Session>> {
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(
+        "SELECT id, project, started_at, ended_at, compressed
+         FROM sessions ORDER BY started_at DESC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(&db.pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r: sqlx::any::AnyRow| Session {
+            id: r.get("id"),
+            project: r.get("project"),
+            started_at: r.get("started_at"),
+            ended_at: r.try_get("ended_at").ok().flatten(),
+            compressed: r.get::<i64, _>("compressed") != 0,
+        })
+        .collect())
+}
+
+pub async fn delete_memory(db: &Database, memory_id: i64) -> Result<bool> {
+    let query_str = match db.backend {
+        Backend::Sqlite => "DELETE FROM memories WHERE rowid = $1",
+        Backend::Postgres => "DELETE FROM memories WHERE id = $1",
+    };
+    let result = sqlx::query(query_str)
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn get_all_memories(db: &Database, limit: i64) -> Result<Vec<Memory>> {
+    let query_str = match db.backend {
+        Backend::Sqlite => {
+            "SELECT rowid as id, project, session_id, summary, tags, created_at
+             FROM memories ORDER BY created_at DESC LIMIT $1"
+        }
+        Backend::Postgres => {
+            "SELECT id, project, session_id, summary, tags, created_at
+             FROM memories ORDER BY created_at DESC LIMIT $1"
+        }
+    };
+
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(query_str)
+        .bind(limit)
+        .fetch_all(&db.pool)
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r: sqlx::any::AnyRow| Memory {
+            id: r.get("id"),
+            project: r.get("project"),
+            session_id: r.get("session_id"),
+            summary: r.get("summary"),
+            tags: r.try_get("tags").ok().flatten(),
+            created_at: r.get("created_at"),
+        })
+        .collect())
+}
+
 // Stats
 
 pub struct DbStats {

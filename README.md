@@ -45,9 +45,18 @@
 
 <!-- SEO Keywords: AI coding assistant memory, session-aware AI tools, Rust AI tools, context preservation, Claude Code memory, Cursor context -->
 
-## What's New in v0.2.0
+## What's New in v0.3.0
 
-> Previously REST-only and local. Now an MCP-native server that works everywhere.
+> Now multi-provider, cross-platform, with a built-in web UI.
+
+- **Multi-provider compression** — use OpenAI, Google Gemini, or Anthropic as your LLM. Set `"provider": "openai"` in settings.
+- **Neovim plugin** — native Lua plugin with auto session lifecycle, `:IronMemSearch`, `:IronMemStatus`
+- **Windows support** — `install.ps1`, platform-aware messages, robust home directory detection
+- **Web UI** — browse, search, and delete memories at `http://localhost:37778/ui`
+- **Still zero telemetry. Still local-first. Your data stays yours.**
+
+<details>
+<summary>v0.2.0</summary>
 
 - **10 MCP tools** — session_start, session_end, record_event, compress_session, get_context, get_status, list_memories, search_memories, inject_context, wipe_project
 - **Dual database** — SQLite (local, FTS5 full-text search) + Postgres (self-hosted, tsvector) via `DATABASE_URL`
@@ -55,7 +64,7 @@
 - **Docker deployment** — `docker-compose up` for remote/team setups with Postgres
 - **`ironmem mcp`** — new subcommand for direct MCP stdio transport (Claude Desktop/Code)
 - **REST server still works** — existing hooks and curl-based workflows unaffected
-- **Still zero telemetry. Still local-first. Your data stays yours.**
+</details>
 
 ---
 
@@ -66,11 +75,11 @@ No copy-pasting.
 No rebuilding context from scratch.
 No "remember when we refactored auth yesterday?"
 
-Runs locally or on your own infrastructure.
-No telemetry.
-SQLite or Postgres storage.
-Plain markdown output.
-Single Rust binary.
+**Works with every major AI coding tool** — Claude Code, Claude Desktop, Cursor, Windsurf, ChatGPT Desktop, GitHub Copilot, Zed, VS Code, and any MCP-compatible client.
+
+**Compress with the LLM you already pay for** — Anthropic Claude, OpenAI GPT-4o, or Google Gemini. Switch providers with one config change.
+
+**Free and open source.** Runs locally or on your own infrastructure. No telemetry. No cloud dependency. No subscription. SQLite or Postgres storage. Plain markdown output. Single Rust binary.
 
 <p align="center">
   <img src="assets/demo.gif" alt="IronMem in action" width="640"/>
@@ -120,6 +129,7 @@ With IronMem:
 - [CLI](#cli)
 - [Multi-Provider Support](#multi-provider-support)
 - [MCP Setup](#mcp-setup)
+- [Web UI](#web-ui)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
 - [Architecture](#architecture)
@@ -141,7 +151,7 @@ Every time you start a new session with Claude Code, Cursor, Copilot, or any AI 
 
 ## The Fix
 
-IronMem silently records what happens during your coding session, compresses it into a concise memory using Claude's API, and injects that context into your next session automatically.
+IronMem silently records what happens during your coding session, compresses it into a concise memory using your LLM provider of choice (Anthropic, OpenAI, or Gemini), and injects that context into your next session automatically.
 
 No setup per session. No copy-pasting. No "remember when we..."
 
@@ -174,7 +184,7 @@ flowchart LR
     C --> D["🔧 You code"]
     D -->|every tool call| E["🗄️ SQLite"]
     D --> F["🔴 Session End"]
-    F -->|compress via Claude API| G["🧠 Memory"]
+    F -->|compress via LLM| G["🧠 Memory"]
     G -->|next session| A
 
     style A fill:#22c55e,color:#fff,stroke:none
@@ -200,6 +210,14 @@ git clone https://github.com/BMC-INC/Iron-mem.git
 cd Iron-mem
 chmod +x install.sh
 ./install.sh
+```
+
+**Windows:**
+
+```powershell
+git clone https://github.com/BMC-INC/Iron-mem.git
+cd Iron-mem
+powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
 Add to your shell profile (`~/.zshrc` or `~/.bashrc`):
@@ -351,7 +369,7 @@ Add the URL to claude.ai under Settings → Integrations → Add MCP Server.
 
 **Without `--public`:** `ironmem serve` starts the SSE server locally with auth (for LAN or your own reverse proxy).
 
-**Requirements:** Install [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) for best results (`brew install cloudflared`). Falls back to `npx cloudflared` if not installed.
+**Requirements:** Install [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) for best results (`brew install cloudflared` on macOS, `winget install Cloudflare.cloudflared` on Windows). Falls back to `npx cloudflared` if not installed.
 
 ### Cursor / Windsurf MCP Setup
 
@@ -387,6 +405,47 @@ For clients that support **Streamable HTTP**, start the server and point the cli
 ironmem serve
 ```
 
+### Neovim Plugin
+
+IronMem includes a native Neovim plugin that communicates via MCP stdio.
+
+**Install with lazy.nvim:**
+
+```lua
+{
+  "BMC-INC/Iron-mem",
+  config = function()
+    require("ironmem").setup({
+      -- binary = "~/.ironmem/bin/ironmem",  -- default
+      -- auto_start = true,   -- session_start on VimEnter
+      -- auto_end = true,     -- session_end on VimLeavePre
+      -- record_events = true, -- record buffer writes
+    })
+  end,
+}
+```
+
+**Commands:**
+
+| Command | Description |
+|---------|-------------|
+| `:IronMemStart` | Manually start a session |
+| `:IronMemEnd` | End session and compress |
+| `:IronMemStatus` | Show database stats |
+| `:IronMemSearch <query>` | Search memories in a split buffer |
+
+---
+
+## Web UI
+
+When the REST server is running, a built-in memory browser is available at:
+
+```
+http://localhost:37778/ui
+```
+
+The UI shows sessions, memories, and database stats. You can browse, search, and delete memories directly from the browser.
+
 ---
 
 ## Configuration
@@ -396,6 +455,7 @@ ironmem serve
 ```json
 {
   "port": 37778,
+  "provider": "anthropic",
   "model": "claude-sonnet-4-6-20250627",
   "inject_limit": 5,
   "max_observation_bytes": 2048,
@@ -409,20 +469,33 @@ ironmem serve
 
 All fields optional. Sensible defaults provided.
 
+### Provider
+
+IronMem supports three LLM providers for session compression:
+
+| Provider | `provider` value | Default model | API key env var |
+|----------|-----------------|---------------|-----------------|
+| **Anthropic** | `"anthropic"` | `claude-sonnet-4-6-20250627` | `ANTHROPIC_API_KEY` |
+| **OpenAI** | `"openai"` | `gpt-4o` | `OPENAI_API_KEY` |
+| **Google Gemini** | `"google"` | `gemini-2.0-flash` | `GOOGLE_API_KEY` |
+
+To switch providers, set `"provider"` in `~/.ironmem/settings.json` and ensure the corresponding API key is set. The `model` field overrides the provider's default model.
+
+### Environment Variables
+
 | Variable | Default | Description |
 |:---------|:--------|:------------|
 | `DATABASE_URL` | _(none)_ | Postgres URL. Overrides `db_path` when set. |
 | `IRONMEM_MCP_TRANSPORT` | `stdio` | MCP transport: `stdio` or `sse` |
-| `ANTHROPIC_API_KEY` | _(none)_ | Required for session compression |
+| `ANTHROPIC_API_KEY` | _(none)_ | Required when provider is `anthropic` (default) |
+| `OPENAI_API_KEY` | _(none)_ | Required when provider is `openai` |
+| `GOOGLE_API_KEY` | _(none)_ | Required when provider is `google` |
 
 ### API Key
 
-IronMem needs an Anthropic API key to compress session observations into memories. It checks two locations:
+IronMem needs an LLM API key to compress session observations into memories. Set the environment variable for your chosen provider (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GOOGLE_API_KEY`).
 
-1. **`ANTHROPIC_API_KEY` environment variable** — set this in your shell profile
-2. **`~/.ironmem/api_key` file** — auto-created by the session-start hook as a fallback
-
-The file fallback exists because the IronMem server runs as a background process via `nohup`, and some environments strip environment variables from child processes. The session-start hook automatically persists your API key to `~/.ironmem/api_key` (with `chmod 600` permissions) so the server can always access it.
+For the default Anthropic provider, IronMem also checks `~/.ironmem/api_key` as a fallback. This file is auto-created by the session-start hook because the IronMem server runs as a background process via `nohup`, and some environments strip environment variables from child processes. The hook persists your API key with `chmod 600` permissions so the server can always access it.
 
 ---
 
@@ -479,7 +552,7 @@ Check that `~/.claude/settings.json` has the hooks registered under the `"hooks"
 └── session-end.sh       # Cleanup
 ```
 
-**~1,700 lines of Rust.** MCP-native. SQLite or Postgres. One binary. No external runtimes.
+**~2,400 lines of Rust.** MCP-native. SQLite or Postgres. One binary. No external runtimes.
 
 ---
 
@@ -557,11 +630,21 @@ This starts IronMem with Streamable HTTP on `http://localhost:37779/mcp` and Pos
 
 ## Roadmap
 
-- [ ] Windows native support
-- [ ] Neovim plugin
-- [ ] VSCode extension
-- [ ] OpenAI / Gemini provider support (for compression)
-- [ ] Web UI for memory browser
+### Shipped in v0.2.0
+
+- [x] MCP-native server (stdio + Streamable HTTP)
+- [x] Dual database — SQLite (local, FTS5) + Postgres (self-hosted)
+- [x] Docker deployment with Postgres
+- [x] Bearer token authentication
+- [x] `ironmem serve --public` with Cloudflare Tunnel for claude.ai
+- [x] Works with Claude Code, Claude Desktop, Cursor, Windsurf, ChatGPT Desktop, Zed, VS Code
+
+### Shipped in v0.3.0
+
+- [x] Multi-provider compression — OpenAI, Google Gemini, or Anthropic (configurable via `provider` in settings)
+- [x] Neovim plugin (`nvim/lua/ironmem/`) — auto session lifecycle, `:IronMemSearch`, `:IronMemStatus`
+- [x] Windows native support — `install.ps1`, platform-aware install messages, robust home dir detection
+- [x] Web UI memory browser — `http://localhost:37778/ui` when REST server is running
 
 ---
 
