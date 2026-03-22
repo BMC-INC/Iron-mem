@@ -263,7 +263,7 @@ IronMem works as an **MCP server** (native integration) or via **IRONMEM.md** (p
 IronMem supports two MCP transports:
 
 - **stdio** — for local clients that launch the server themselves (Claude Code, Claude Desktop, Cursor)
-- **SSE** — for remote/cloud clients that connect over HTTP (claude.ai, team deployments)
+- **Streamable HTTP** — for remote/cloud clients that connect over HTTP (claude.ai, team deployments). Uses standard request/response — works through any tunnel or proxy.
 
 ### Claude Code MCP Setup
 
@@ -337,16 +337,15 @@ This does three things:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   IronMem SSE Server
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Local:  http://127.0.0.1:37779/sse
-  Token:  a1b2c3d4-e5f6-...
+  Local:  http://127.0.0.1:37779/mcp
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Public URL: https://xxx-yyy-zzz.trycloudflare.com
   Add to claude.ai as MCP server:
-    URL:   https://xxx-yyy-zzz.trycloudflare.com/sse
+    URL:   https://xxx-yyy-zzz.trycloudflare.com/mcp
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-Add the URL to claude.ai under Settings → MCP Servers, with your auth token as the bearer token.
+Add the URL to claude.ai under Settings → Integrations → Add MCP Server.
 
 **Everything stays local.** Your data never leaves your machine — the tunnel just forwards authenticated MCP protocol messages.
 
@@ -382,10 +381,10 @@ Any MCP client that supports **stdio** transport can use IronMem:
 }
 ```
 
-For clients that only support **SSE**, start the server with SSE enabled and point the client at `http://localhost:37779/sse`:
+For clients that support **Streamable HTTP**, start the server and point the client at `http://localhost:37779/mcp`:
 
 ```bash
-IRONMEM_MCP_TRANSPORT=sse ironmem server
+ironmem serve
 ```
 
 ---
@@ -552,7 +551,7 @@ Run IronMem with Postgres for team/remote setups:
 ANTHROPIC_API_KEY=your-key docker-compose up --build
 ```
 
-This starts IronMem in SSE mode on `http://localhost:37779/sse` with Postgres 16, plus the REST server on `http://localhost:37778`.
+This starts IronMem with Streamable HTTP on `http://localhost:37779/mcp` and Postgres 16, plus the REST server on `http://localhost:37778`.
 
 ---
 

@@ -2,11 +2,10 @@ use crate::config::Config;
 use crate::db::{self, Database};
 use crate::{compress, hooks};
 use anyhow::Result;
-use axum::extract::State as AxumState;
-use axum::http::{HeaderMap, StatusCode as AxumStatusCode};
-use axum::response::IntoResponse;
-use axum::routing::{any, get};
 use rmcp::model::*;
+use rmcp::transport::streamable_http_server::{
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+};
 use rmcp::{ServerHandler, ServiceExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -449,32 +448,22 @@ impl IronMemServer {
 
 impl ServerHandler for IronMemServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "IronMem".to_string(),
-                version: "0.1.0".to_string(),
-            },
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("IronMem", "0.2.0"))
     }
 
     async fn list_tools(
         &self,
-        _request: PaginatedRequestParam,
-        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult {
-            tools: Self::build_tool_list(),
-            next_cursor: None,
-        })
+        Ok(ListToolsResult::with_all_items(Self::build_tool_list()))
     }
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParam,
-        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        request: CallToolRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let args = request.arguments.unwrap_or_default();
         match request.name.as_ref() {
@@ -507,167 +496,44 @@ pub async fn run_stdio(db: Arc<Database>, config: Config) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_sse_with_auth(
-    db: Arc<Database>,
-    config: Config,
-    bind: SocketAddr,
-    auth_token: Option<String>,
-) -> Result<()> {
+pub async fn run_streamable_http(db: Arc<Database>, config: Config, bind: SocketAddr) -> Result<()> {
     let server = IronMemServer {
         db,
         config: Arc::new(config),
     };
 
-    match auth_token {
-        Some(token) => {
-            // Auth mode: rmcp on internal loopback, auth proxy on public port
-            let internal_port = bind.port() + 100;
-            let internal_addr: SocketAddr =
-                format!("127.0.0.1:{}", internal_port).parse().unwrap();
+    let http_config = StreamableHttpServerConfig {
+        json_response: true,
+        stateful_mode: false,
+        ..Default::default()
+    };
 
-            let ct = rmcp::transport::sse_server::SseServer::serve(internal_addr)
-                .await?
-                .with_service(move || server.clone());
+    let session_manager = Arc::new(LocalSessionManager::default());
+    let service = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        session_manager,
+        http_config,
+    );
 
-            let client = reqwest::Client::new();
-            let proxy_state = AuthProxyState {
-                token,
-                upstream: format!("http://127.0.0.1:{}", internal_port),
-                client,
-            };
+    let app = axum::Router::new().route(
+        "/mcp",
+        axum::routing::any_service(service),
+    );
 
-            let app = axum::Router::new()
-                .route("/sse", get(proxy_sse))
-                .route("/message", any(proxy_message))
-                .with_state(proxy_state);
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    tracing::info!("IronMem MCP Streamable HTTP server listening on {}", bind);
+    tracing::info!("Endpoint: http://{}/mcp", bind);
 
-            let listener = tokio::net::TcpListener::bind(bind).await?;
-            tracing::info!(
-                "IronMem MCP SSE server (auth-protected) listening on {}",
-                bind
-            );
-            tracing::info!("SSE endpoint: http://{}/sse", bind);
-
-            tokio::select! {
-                result = axum::serve(listener, app) => {
-                    if let Err(e) = result {
-                        tracing::error!("Auth proxy error: {}", e);
-                    }
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("Shutting down...");
-                }
+    tokio::select! {
+        result = axum::serve(listener, app) => {
+            if let Err(e) = result {
+                tracing::error!("Streamable HTTP server error: {}", e);
             }
-
-            ct.cancel();
         }
-        None => {
-            // No auth: rmcp directly on the requested address
-            let ct = rmcp::transport::sse_server::SseServer::serve(bind)
-                .await?
-                .with_service(move || server.clone());
-
-            tracing::info!("IronMem MCP SSE server listening on {}", bind);
-            tracing::info!("SSE endpoint: http://{}/sse", bind);
-
-            tokio::signal::ctrl_c().await?;
-            ct.cancel();
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Shutting down...");
         }
     }
 
-    tracing::info!("SSE transport shutdown complete.");
     Ok(())
-}
-
-// --- Auth proxy for SSE endpoint ---
-
-#[derive(Clone)]
-struct AuthProxyState {
-    token: String,
-    upstream: String,
-    client: reqwest::Client,
-}
-
-fn check_bearer_token(headers: &HeaderMap, expected: &str) -> Result<(), AxumStatusCode> {
-    let auth = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AxumStatusCode::UNAUTHORIZED)?;
-
-    if let Some(token) = auth.strip_prefix("Bearer ") {
-        if token == expected {
-            return Ok(());
-        }
-    }
-    Err(AxumStatusCode::UNAUTHORIZED)
-}
-
-async fn proxy_sse(
-    AxumState(state): AxumState<AuthProxyState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, AxumStatusCode> {
-    check_bearer_token(&headers, &state.token)?;
-
-    let upstream_url = format!("{}/sse", state.upstream);
-    let resp = state
-        .client
-        .get(&upstream_url)
-        .send()
-        .await
-        .map_err(|_| AxumStatusCode::BAD_GATEWAY)?;
-
-    let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
-        .unwrap_or(AxumStatusCode::BAD_GATEWAY);
-
-    let mut response_headers = axum::http::HeaderMap::new();
-    for (key, value) in resp.headers() {
-        if let Ok(name) = axum::http::HeaderName::from_bytes(key.as_ref()) {
-            if let Ok(val) = axum::http::HeaderValue::from_bytes(value.as_ref()) {
-                response_headers.insert(name, val);
-            }
-        }
-    }
-
-    let stream = resp.bytes_stream();
-    let body = axum::body::Body::from_stream(stream);
-
-    Ok((status, response_headers, body))
-}
-
-async fn proxy_message(
-    AxumState(state): AxumState<AuthProxyState>,
-    headers: HeaderMap,
-    query: axum::extract::RawQuery,
-    body: axum::body::Bytes,
-) -> Result<impl IntoResponse, AxumStatusCode> {
-    check_bearer_token(&headers, &state.token)?;
-
-    let mut upstream_url = format!("{}/message", state.upstream);
-    if let Some(q) = query.0 {
-        upstream_url = format!("{}?{}", upstream_url, q);
-    }
-
-    let content_type = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-
-    let resp = state
-        .client
-        .post(&upstream_url)
-        .header("content-type", content_type)
-        .body(body)
-        .send()
-        .await
-        .map_err(|_| AxumStatusCode::BAD_GATEWAY)?;
-
-    let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
-        .unwrap_or(AxumStatusCode::BAD_GATEWAY);
-    let resp_body = resp
-        .bytes()
-        .await
-        .map_err(|_| AxumStatusCode::BAD_GATEWAY)?;
-
-    Ok((status, resp_body))
 }

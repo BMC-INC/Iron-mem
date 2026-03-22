@@ -56,6 +56,7 @@ impl Config {
     }
 
     /// Get or generate the auth token for SSE. Persists to settings on first generation.
+    #[allow(dead_code)]
     pub fn ensure_auth_token(&mut self) -> String {
         if let Some(ref token) = self.auth_token {
             return token.clone();

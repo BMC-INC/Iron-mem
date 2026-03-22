@@ -149,12 +149,9 @@ async fn run_server(cfg: config::Config) -> Result<()> {
             format!("0.0.0.0:{}", cfg.mcp_sse_port).parse().unwrap();
         let sse_db = db.clone();
         let sse_cfg = cfg.clone();
-        let auth_token = cfg.auth_token.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                mcp::run_sse_with_auth(sse_db, sse_cfg, sse_addr, auth_token).await
-            {
-                tracing::error!("MCP SSE server error: {}", e);
+            if let Err(e) = mcp::run_streamable_http(sse_db, sse_cfg, sse_addr).await {
+                tracing::error!("MCP Streamable HTTP server error: {}", e);
             }
         });
     }
@@ -173,21 +170,19 @@ async fn run_mcp(cfg: config::Config) -> Result<()> {
     Ok(())
 }
 
-async fn run_serve(mut cfg: config::Config, public: bool) -> Result<()> {
+async fn run_serve(cfg: config::Config, public: bool) -> Result<()> {
     let db_url = cfg.effective_database_url();
     let database = db::Database::new(&db_url).await?;
     database.migrate().await?;
     let db = std::sync::Arc::new(database);
 
-    let token = cfg.ensure_auth_token();
     let sse_port = cfg.mcp_sse_port;
     let bind: std::net::SocketAddr = format!("0.0.0.0:{}", sse_port).parse().unwrap();
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  IronMem SSE Server");
+    println!("  IronMem MCP Server");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  Local:  http://127.0.0.1:{}/sse", sse_port);
-    println!("  Token:  {}", token);
+    println!("  Local:  http://127.0.0.1:{}/mcp", sse_port);
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     if public {
@@ -201,7 +196,7 @@ async fn run_serve(mut cfg: config::Config, public: bool) -> Result<()> {
     }
 
     let serve_cfg = cfg.clone();
-    mcp::run_sse_with_auth(db, serve_cfg, bind, Some(token)).await?;
+    mcp::run_streamable_http(db, serve_cfg, bind).await?;
 
     Ok(())
 }
@@ -243,7 +238,7 @@ async fn run_cloudflare_tunnel(port: u16) {
                         println!("  Public URL: {}", url);
                         println!();
                         println!("  Add to claude.ai as MCP server:");
-                        println!("    URL:   {}/sse", url);
+                        println!("    URL:   {}/mcp", url);
                         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                     }
                 }
@@ -284,7 +279,7 @@ async fn run_cloudflare_tunnel(port: u16) {
                         println!("  Public URL: {}", url);
                         println!();
                         println!("  Add to claude.ai as MCP server:");
-                        println!("    URL:   {}/sse", url);
+                        println!("    URL:   {}/mcp", url);
                         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                     }
                 }
