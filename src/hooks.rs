@@ -74,10 +74,7 @@ pub fn ensure_claude_md_import(project_root: &str) -> Result<()> {
         tracing::info!("Added @IRONMEM.md import to CLAUDE.md");
     } else {
         // Create a minimal CLAUDE.md with just the import
-        let content = format!(
-            "# Project Context\n\n{}\n",
-            import_line
-        );
+        let content = format!("# Project Context\n\n{}\n", import_line);
         std::fs::write(&claude_md_path, content)?;
         tracing::info!("Created CLAUDE.md with @IRONMEM.md import");
     }

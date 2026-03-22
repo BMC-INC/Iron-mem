@@ -1,0 +1,30 @@
+services:
+  ironmem:
+    build: .
+    ports:
+      - "37778:37778"
+      - "37779:37779"
+    environment:
+      - DATABASE_URL=postgres://ironmem:ironmem@postgres:5432/ironmem
+      - IRONMEM_MCP_TRANSPORT=sse
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ironmem
+      POSTGRES_PASSWORD: ironmem
+      POSTGRES_DB: ironmem
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ironmem"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:

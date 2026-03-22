@@ -9,6 +9,20 @@ pub struct Config {
     pub inject_limit: usize,
     pub max_observation_bytes: usize,
     pub db_path: String,
+    #[serde(default)]
+    pub database_url: Option<String>,
+    #[serde(default = "default_mcp_transport")]
+    pub mcp_transport: String,
+    #[serde(default = "default_mcp_sse_port")]
+    pub mcp_sse_port: u16,
+}
+
+fn default_mcp_transport() -> String {
+    "stdio".to_string()
+}
+
+fn default_mcp_sse_port() -> u16 {
+    37779
 }
 
 impl Default for Config {
@@ -18,11 +32,24 @@ impl Default for Config {
             model: "claude-sonnet-4-6-20250627".to_string(),
             inject_limit: 5,
             max_observation_bytes: 2048,
-            db_path: ironmem_dir()
-                .join("mem.db")
-                .to_string_lossy()
-                .to_string(),
+            db_path: ironmem_dir().join("mem.db").to_string_lossy().to_string(),
+            database_url: None,
+            mcp_transport: default_mcp_transport(),
+            mcp_sse_port: default_mcp_sse_port(),
         }
+    }
+}
+
+impl Config {
+    pub fn effective_database_url(&self) -> String {
+        std::env::var("DATABASE_URL")
+            .ok()
+            .or_else(|| self.database_url.clone())
+            .unwrap_or_else(|| format!("sqlite://{}?mode=rwc", self.db_path))
+    }
+
+    pub fn effective_mcp_transport(&self) -> String {
+        std::env::var("IRONMEM_MCP_TRANSPORT").unwrap_or_else(|_| self.mcp_transport.clone())
     }
 }
 

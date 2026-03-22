@@ -6,14 +6,13 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 use std::sync::Arc;
 
 use crate::{compress, config::Config, db};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: SqlitePool,
+    pub db: db::Database,
     pub config: Config,
 }
 
@@ -43,7 +42,7 @@ async fn session_start(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SessionStartRequest>,
 ) -> Result<Json<SessionStartResponse>, (StatusCode, String)> {
-    let session_id = db::create_session(&state.pool, &body.project)
+    let session_id = db::create_session(&state.db, &body.project)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -69,17 +68,20 @@ async fn session_end(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SessionEndRequest>,
 ) -> Result<Json<SessionEndResponse>, (StatusCode, String)> {
-    db::end_session(&state.pool, &body.session_id)
+    db::end_session(&state.db, &body.session_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Check if there are any observations worth compressing
-    let count = db::observation_count_for_session(&state.pool, &body.session_id)
+    let count = db::observation_count_for_session(&state.db, &body.session_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if count == 0 {
-        tracing::info!("Session {} ended with no observations, skipping compression", body.session_id);
+        tracing::info!(
+            "Session {} ended with no observations, skipping compression",
+            body.session_id
+        );
         return Ok(Json(SessionEndResponse {
             ok: true,
             memory_id: None,
@@ -130,7 +132,7 @@ async fn record_event(
     Json(body): Json<EventRequest>,
 ) -> Result<Json<EventResponse>, (StatusCode, String)> {
     let id = db::insert_observation(
-        &state.pool,
+        &state.db,
         &body.session_id,
         &body.project,
         &body.tool,
@@ -187,16 +189,16 @@ async fn get_context(
 
     let memories = if let Some(q) = &params.query {
         if !q.is_empty() {
-            db::search_memories(&state.pool, &params.project, q, limit)
+            db::search_memories(&state.db, &params.project, q, limit)
                 .await
                 .unwrap_or_else(|_| vec![])
         } else {
-            db::get_recent_memories(&state.pool, &params.project, limit)
+            db::get_recent_memories(&state.db, &params.project, limit)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         }
     } else {
-        db::get_recent_memories(&state.pool, &params.project, limit)
+        db::get_recent_memories(&state.db, &params.project, limit)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
@@ -217,7 +219,7 @@ pub struct StatusResponse {
 async fn get_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<StatusResponse>, (StatusCode, String)> {
-    let stats = db::get_stats(&state.pool)
+    let stats = db::get_stats(&state.db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -233,25 +235,27 @@ async fn get_status(
 // Shared compression logic
 async fn run_compression(state: &AppState, session_id: &str) -> anyhow::Result<i64> {
     // Try env var first, then fall back to key file
-    let api_key = std::env::var("ANTHROPIC_API_KEY").or_else(|_| {
-        let key_path = crate::config::ironmem_dir().join("api_key");
-        std::fs::read_to_string(&key_path)
-            .map(|k| k.trim().to_string())
-            .map_err(|_| std::env::VarError::NotPresent)
-    }).map_err(|_| anyhow::anyhow!(
-        "ANTHROPIC_API_KEY not set and ~/.ironmem/api_key not found"
-    ))?;
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .or_else(|_| {
+            let key_path = crate::config::ironmem_dir().join("api_key");
+            std::fs::read_to_string(&key_path)
+                .map(|k| k.trim().to_string())
+                .map_err(|_| std::env::VarError::NotPresent)
+        })
+        .map_err(|_| {
+            anyhow::anyhow!("ANTHROPIC_API_KEY not set and ~/.ironmem/api_key not found")
+        })?;
 
-    let session = db::get_session(&state.pool, session_id)
+    let session = db::get_session(&state.db, session_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
-    let observations = db::get_observations_for_session(&state.pool, session_id).await?;
+    let observations = db::get_observations_for_session(&state.db, session_id).await?;
 
     let result = compress::compress_session(&observations, &state.config.model, &api_key).await?;
 
     let memory_id = db::insert_memory(
-        &state.pool,
+        &state.db,
         &session.project,
         session_id,
         &result.summary,
@@ -259,7 +263,7 @@ async fn run_compression(state: &AppState, session_id: &str) -> anyhow::Result<i
     )
     .await?;
 
-    db::mark_compressed(&state.pool, session_id).await?;
+    db::mark_compressed(&state.db, session_id).await?;
 
     tracing::info!(
         "Session {} compressed → memory_id={}",

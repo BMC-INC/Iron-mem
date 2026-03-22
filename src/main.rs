@@ -2,6 +2,7 @@ mod compress;
 mod config;
 mod db;
 mod hooks;
+mod mcp;
 mod server;
 
 use anyhow::Result;
@@ -75,6 +76,9 @@ enum Commands {
         session_id: String,
     },
 
+    /// Start the MCP server (stdio transport, for Claude Desktop/Code)
+    Mcp,
+
     /// Print current configuration
     Config,
 }
@@ -93,16 +97,17 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Server => run_server(cfg).await?,
+        Commands::Mcp => run_mcp(cfg).await?,
         Commands::Status => run_status(&cfg).await?,
-        Commands::Search { query, project, limit } => {
-            run_search(&cfg, &query, project.as_deref(), limit).await?
-        }
+        Commands::Search {
+            query,
+            project,
+            limit,
+        } => run_search(&cfg, &query, project.as_deref(), limit).await?,
         Commands::List { project, limit } => run_list(&cfg, project.as_deref(), limit).await?,
         Commands::Wipe { project, force } => run_wipe(&cfg, project.as_deref(), force).await?,
         Commands::Inject { project, limit } => run_inject(&cfg, project.as_deref(), limit).await?,
-        Commands::Compress { session_id } => {
-            run_compress_cmd(&cfg, &session_id).await?
-        }
+        Commands::Compress { session_id } => run_compress_cmd(&cfg, &session_id).await?,
         Commands::Config => {
             println!("{}", serde_json::to_string_pretty(&cfg)?);
         }
@@ -112,16 +117,48 @@ async fn main() -> Result<()> {
 }
 
 async fn run_server(cfg: config::Config) -> Result<()> {
-    let pool = db::init_db(&cfg.db_path).await?;
+    let db_url = cfg.effective_database_url();
+    let database = db::Database::new(&db_url).await?;
+    database.migrate().await?;
+    let db = std::sync::Arc::new(database);
+
+    // Start REST server
+    let rest_db = db.clone();
+    let rest_cfg = cfg.clone();
+    let addr = format!("127.0.0.1:{}", cfg.port);
+    tracing::info!("ironmem REST server listening on http://{}", addr);
+
     let state = server::AppState {
-        pool,
-        config: cfg.clone(),
+        db: (*rest_db).clone(),
+        config: rest_cfg,
     };
     let app = server::router(state);
-    let addr = format!("127.0.0.1:{}", cfg.port);
-    tracing::info!("ironmem server listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    let mcp_transport = cfg.effective_mcp_transport();
+    if mcp_transport == "sse" {
+        let sse_addr: std::net::SocketAddr =
+            format!("0.0.0.0:{}", cfg.mcp_sse_port).parse().unwrap();
+        let sse_db = db.clone();
+        let sse_cfg = cfg.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mcp::run_sse(sse_db, sse_cfg, sse_addr).await {
+                tracing::error!("MCP SSE server error: {}", e);
+            }
+        });
+    }
+
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn run_mcp(cfg: config::Config) -> Result<()> {
+    // MCP stdio mode — tracing to stderr only (stdout is the MCP transport)
+    let db_url = cfg.effective_database_url();
+    let database = db::Database::new(&db_url).await?;
+    database.migrate().await?;
+    let db = std::sync::Arc::new(database);
+    mcp::run_stdio(db, cfg).await?;
     Ok(())
 }
 
@@ -152,8 +189,9 @@ async fn run_search(
     limit: i64,
 ) -> Result<()> {
     let project = resolve_project(project)?;
-    let pool = db::init_db(&cfg.db_path).await?;
-    let memories = db::search_memories(&pool, &project, query, limit).await?;
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let memories = db::search_memories(&database, &project, query, limit).await?;
 
     if memories.is_empty() {
         println!("No memories found for query: {}", query);
@@ -175,8 +213,9 @@ async fn run_search(
 
 async fn run_list(cfg: &config::Config, project: Option<&str>, limit: i64) -> Result<()> {
     let project = resolve_project(project)?;
-    let pool = db::init_db(&cfg.db_path).await?;
-    let memories = db::get_recent_memories(&pool, &project, limit).await?;
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let memories = db::get_recent_memories(&database, &project, limit).await?;
 
     if memories.is_empty() {
         println!("No memories for project: {}", project);
@@ -214,8 +253,9 @@ async fn run_wipe(cfg: &config::Config, project: Option<&str>, force: bool) -> R
         }
     }
 
-    let pool = db::init_db(&cfg.db_path).await?;
-    let count = db::delete_memories_for_project(&pool, &project).await?;
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let count = db::delete_memories_for_project(&database, &project).await?;
 
     // Clean up IRONMEM.md and CLAUDE.md import
     let _ = std::fs::remove_file(std::path::Path::new(&project).join("IRONMEM.md"));
@@ -227,8 +267,9 @@ async fn run_wipe(cfg: &config::Config, project: Option<&str>, force: bool) -> R
 
 async fn run_inject(cfg: &config::Config, project: Option<&str>, limit: i64) -> Result<()> {
     let project = resolve_project(project)?;
-    let pool = db::init_db(&cfg.db_path).await?;
-    let memories = db::get_recent_memories(&pool, &project, limit).await?;
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let memories = db::get_recent_memories(&database, &project, limit).await?;
 
     hooks::write_ironmem_file(&project, &memories)?;
     hooks::ensure_claude_md_import(&project)?;
@@ -243,36 +284,41 @@ async fn run_inject(cfg: &config::Config, project: Option<&str>, limit: i64) -> 
 
 async fn run_compress_cmd(cfg: &config::Config, session_id: &str) -> Result<()> {
     // Try env var first, then fall back to key file
-    let api_key = std::env::var("ANTHROPIC_API_KEY").or_else(|_| {
-        let key_path = config::ironmem_dir().join("api_key");
-        std::fs::read_to_string(&key_path)
-            .map(|k| k.trim().to_string())
-            .map_err(|_| std::env::VarError::NotPresent)
-    }).map_err(|_| anyhow::anyhow!(
-        "ANTHROPIC_API_KEY not set and ~/.ironmem/api_key not found"
-    ))?;
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .or_else(|_| {
+            let key_path = config::ironmem_dir().join("api_key");
+            std::fs::read_to_string(&key_path)
+                .map(|k| k.trim().to_string())
+                .map_err(|_| std::env::VarError::NotPresent)
+        })
+        .map_err(|_| {
+            anyhow::anyhow!("ANTHROPIC_API_KEY not set and ~/.ironmem/api_key not found")
+        })?;
 
-    let pool = db::init_db(&cfg.db_path).await?;
-    let session = db::get_session(&pool, session_id)
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let session = db::get_session(&database, session_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
-    let observations = db::get_observations_for_session(&pool, session_id).await?;
+    let observations = db::get_observations_for_session(&database, session_id).await?;
     if observations.is_empty() {
         println!("No observations for session {}", session_id);
         return Ok(());
     }
 
-    println!(
-        "Compressing {} observations...",
-        observations.len()
-    );
+    println!("Compressing {} observations...", observations.len());
 
     let result = compress::compress_session(&observations, &cfg.model, &api_key).await?;
-    let memory_id =
-        db::insert_memory(&pool, &session.project, session_id, &result.summary, Some(&result.tags))
-            .await?;
-    db::mark_compressed(&pool, session_id).await?;
+    let memory_id = db::insert_memory(
+        &database,
+        &session.project,
+        session_id,
+        &result.summary,
+        Some(&result.tags),
+    )
+    .await?;
+    db::mark_compressed(&database, session_id).await?;
 
     println!("✅ Memory created (id={})", memory_id);
     println!("\nSummary:\n{}", result.summary);
