@@ -1,7 +1,20 @@
 use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::any::AnyPoolOptions;
+use sqlx::{AnyPool, Row};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Backend {
+    Sqlite,
+    Postgres,
+}
+
+#[derive(Clone)]
+pub struct Database {
+    pub pool: AnyPool,
+    pub backend: Backend,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Session {
@@ -33,100 +46,171 @@ pub struct Memory {
     pub created_at: i64,
 }
 
-pub async fn init_db(db_path: &str) -> Result<SqlitePool> {
-    // Ensure parent directory exists
-    if let Some(parent) = std::path::Path::new(db_path).parent() {
-        std::fs::create_dir_all(parent)?;
+impl Database {
+    pub async fn new(url: &str) -> Result<Self> {
+        sqlx::any::install_default_drivers();
+        let (db_url, backend) =
+            if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+                (url.to_string(), Backend::Postgres)
+            } else if url.starts_with("sqlite://") {
+                (url.to_string(), Backend::Sqlite)
+            } else {
+                if let Some(parent) = std::path::Path::new(url).parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                (format!("sqlite://{}?mode=rwc", url), Backend::Sqlite)
+            };
+        let pool = AnyPoolOptions::new()
+            .max_connections(5)
+            .connect(&db_url)
+            .await?;
+        Ok(Self { pool, backend })
     }
 
-    let url = format!("sqlite://{}?mode=rwc", db_path);
-    let pool = SqlitePool::connect(&url).await?;
+    pub async fn migrate(&self) -> Result<()> {
+        // Sessions table (works for both backends)
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS sessions (
+                id          TEXT PRIMARY KEY,
+                project     TEXT NOT NULL,
+                started_at  BIGINT NOT NULL,
+                ended_at    BIGINT,
+                compressed  BIGINT NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
 
-    // Create tables
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS sessions (
-            id          TEXT PRIMARY KEY,
-            project     TEXT NOT NULL,
-            started_at  INTEGER NOT NULL,
-            ended_at    INTEGER,
-            compressed  INTEGER NOT NULL DEFAULT 0
-        );
+        // Observations table (branched for auto-increment)
+        match self.backend {
+            Backend::Sqlite => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS observations (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id  TEXT NOT NULL REFERENCES sessions(id),
+                        project     TEXT NOT NULL,
+                        tool        TEXT NOT NULL,
+                        input       TEXT,
+                        output      TEXT,
+                        created_at  INTEGER NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+            Backend::Postgres => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS observations (
+                        id          BIGSERIAL PRIMARY KEY,
+                        session_id  TEXT NOT NULL REFERENCES sessions(id),
+                        project     TEXT NOT NULL,
+                        tool        TEXT NOT NULL,
+                        input       TEXT,
+                        output      TEXT,
+                        created_at  BIGINT NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+        }
 
-        CREATE TABLE IF NOT EXISTS observations (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id  TEXT NOT NULL REFERENCES sessions(id),
-            project     TEXT NOT NULL,
-            tool        TEXT NOT NULL,
-            input       TEXT,
-            output      TEXT,
-            created_at  INTEGER NOT NULL
-        );
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_obs_session ON observations(session_id)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_obs_project ON observations(project)")
+            .execute(&self.pool)
+            .await?;
 
-        CREATE INDEX IF NOT EXISTS idx_obs_session ON observations(session_id);
-        CREATE INDEX IF NOT EXISTS idx_obs_project ON observations(project);
+        // Memories table (branched for FTS5 vs tsvector)
+        match self.backend {
+            Backend::Sqlite => {
+                sqlx::query(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(
+                        project,
+                        session_id,
+                        summary,
+                        tags,
+                        created_at UNINDEXED,
+                        tokenize='porter ascii'
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+            Backend::Postgres => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS memories (
+                        id              BIGSERIAL PRIMARY KEY,
+                        project         TEXT NOT NULL,
+                        session_id      TEXT NOT NULL,
+                        summary         TEXT NOT NULL,
+                        tags            TEXT,
+                        created_at      BIGINT NOT NULL,
+                        search_vector   TSVECTOR
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
 
-        CREATE VIRTUAL TABLE IF NOT EXISTS memories USING fts5(
-            project,
-            session_id,
-            summary,
-            tags,
-            created_at UNINDEXED,
-            tokenize='porter ascii'
-        );
-        "#,
-    )
-    .execute(&pool)
-    .await?;
+                sqlx::query(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_search
+                     ON memories USING GIN(search_vector)",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+        }
 
-    Ok(pool)
+        Ok(())
+    }
 }
 
 // Sessions
 
-pub async fn create_session(pool: &SqlitePool, project: &str) -> Result<String> {
+pub async fn create_session(db: &Database, project: &str) -> Result<String> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
-    sqlx::query("INSERT INTO sessions (id, project, started_at) VALUES (?, ?, ?)")
+    sqlx::query("INSERT INTO sessions (id, project, started_at) VALUES ($1, $2, $3)")
         .bind(&id)
         .bind(project)
         .bind(now)
-        .execute(pool)
+        .execute(&db.pool)
         .await?;
     Ok(id)
 }
 
-pub async fn end_session(pool: &SqlitePool, session_id: &str) -> Result<()> {
+pub async fn end_session(db: &Database, session_id: &str) -> Result<()> {
     let now = Utc::now().timestamp();
-    sqlx::query("UPDATE sessions SET ended_at = ? WHERE id = ?")
+    sqlx::query("UPDATE sessions SET ended_at = $1 WHERE id = $2")
         .bind(now)
         .bind(session_id)
-        .execute(pool)
+        .execute(&db.pool)
         .await?;
     Ok(())
 }
 
-pub async fn mark_compressed(pool: &SqlitePool, session_id: &str) -> Result<()> {
-    sqlx::query("UPDATE sessions SET compressed = 1 WHERE id = ?")
+pub async fn mark_compressed(db: &Database, session_id: &str) -> Result<()> {
+    sqlx::query("UPDATE sessions SET compressed = 1 WHERE id = $1")
         .bind(session_id)
-        .execute(pool)
+        .execute(&db.pool)
         .await?;
     Ok(())
 }
 
-pub async fn get_session(pool: &SqlitePool, session_id: &str) -> Result<Option<Session>> {
-    let row = sqlx::query(
-        "SELECT id, project, started_at, ended_at, compressed FROM sessions WHERE id = ?",
+pub async fn get_session(db: &Database, session_id: &str) -> Result<Option<Session>> {
+    let row: Option<sqlx::any::AnyRow> = sqlx::query(
+        "SELECT id, project, started_at, ended_at, compressed FROM sessions WHERE id = $1",
     )
     .bind(session_id)
-    .fetch_optional(pool)
+    .fetch_optional(&db.pool)
     .await?;
 
-    Ok(row.map(|r| Session {
+    Ok(row.map(|r: sqlx::any::AnyRow| Session {
         id: r.get("id"),
         project: r.get("project"),
         started_at: r.get("started_at"),
-        ended_at: r.get("ended_at"),
+        ended_at: r.try_get("ended_at").ok().flatten(),
         compressed: r.get::<i64, _>("compressed") != 0,
     }))
 }
@@ -134,7 +218,7 @@ pub async fn get_session(pool: &SqlitePool, session_id: &str) -> Result<Option<S
 // Observations
 
 pub async fn insert_observation(
-    pool: &SqlitePool,
+    db: &Database,
     session_id: &str,
     project: &str,
     tool: &str,
@@ -153,143 +237,184 @@ pub async fn insert_observation(
         }
     });
 
-    let result = sqlx::query(
+    let row: sqlx::any::AnyRow = sqlx::query(
         "INSERT INTO observations (session_id, project, tool, input, output, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id",
     )
     .bind(session_id)
     .bind(project)
     .bind(tool)
     .bind(input)
-    .bind(truncated_output)
+    .bind(truncated_output.as_deref())
     .bind(now)
-    .execute(pool)
+    .fetch_one(&db.pool)
     .await?;
 
-    Ok(result.last_insert_rowid())
+    Ok(row.get("id"))
 }
 
 pub async fn get_observations_for_session(
-    pool: &SqlitePool,
+    db: &Database,
     session_id: &str,
 ) -> Result<Vec<Observation>> {
-    let rows = sqlx::query(
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(
         "SELECT id, session_id, project, tool, input, output, created_at
-         FROM observations WHERE session_id = ? ORDER BY created_at ASC",
+         FROM observations WHERE session_id = $1 ORDER BY created_at ASC",
     )
     .bind(session_id)
-    .fetch_all(pool)
+    .fetch_all(&db.pool)
     .await?;
 
     Ok(rows
         .into_iter()
-        .map(|r| Observation {
+        .map(|r: sqlx::any::AnyRow| Observation {
             id: r.get("id"),
             session_id: r.get("session_id"),
             project: r.get("project"),
             tool: r.get("tool"),
-            input: r.get("input"),
-            output: r.get("output"),
+            input: r.try_get("input").ok().flatten(),
+            output: r.try_get("output").ok().flatten(),
             created_at: r.get("created_at"),
         })
         .collect())
 }
 
-pub async fn observation_count_for_session(pool: &SqlitePool, session_id: &str) -> Result<i64> {
-    let row = sqlx::query("SELECT COUNT(*) as cnt FROM observations WHERE session_id = ?")
-        .bind(session_id)
-        .fetch_one(pool)
-        .await?;
+pub async fn observation_count_for_session(db: &Database, session_id: &str) -> Result<i64> {
+    let row: sqlx::any::AnyRow =
+        sqlx::query("SELECT COUNT(*) as cnt FROM observations WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_one(&db.pool)
+            .await?;
     Ok(row.get("cnt"))
 }
 
 // Memories
 
 pub async fn insert_memory(
-    pool: &SqlitePool,
+    db: &Database,
     project: &str,
     session_id: &str,
     summary: &str,
     tags: Option<&str>,
 ) -> Result<i64> {
     let now = Utc::now().timestamp();
-    let result = sqlx::query(
-        "INSERT INTO memories (project, session_id, summary, tags, created_at)
-         VALUES (?, ?, ?, ?, ?)",
-    )
-    .bind(project)
-    .bind(session_id)
-    .bind(summary)
-    .bind(tags)
-    .bind(now)
-    .execute(pool)
-    .await?;
-    Ok(result.last_insert_rowid())
+
+    match db.backend {
+        Backend::Sqlite => {
+            sqlx::query(
+                "INSERT INTO memories (project, session_id, summary, tags, created_at)
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(project)
+            .bind(session_id)
+            .bind(summary)
+            .bind(tags)
+            .bind(now)
+            .execute(&db.pool)
+            .await?;
+
+            let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() as id")
+                .fetch_one(&db.pool)
+                .await?;
+            Ok(row.get("id"))
+        }
+        Backend::Postgres => {
+            let row: sqlx::any::AnyRow = sqlx::query(
+                "INSERT INTO memories (project, session_id, summary, tags, created_at, search_vector)
+                 VALUES ($1, $2, $3, $4, $5, to_tsvector('english', $6 || ' ' || COALESCE($7, '')))
+                 RETURNING id",
+            )
+            .bind(project)
+            .bind(session_id)
+            .bind(summary)
+            .bind(tags)
+            .bind(now)
+            .bind(summary)
+            .bind(tags)
+            .fetch_one(&db.pool)
+            .await?;
+            Ok(row.get("id"))
+        }
+    }
 }
 
-pub async fn get_recent_memories(
-    pool: &SqlitePool,
-    project: &str,
-    limit: i64,
-) -> Result<Vec<Memory>> {
-    let rows = sqlx::query(
-        "SELECT rowid as id, project, session_id, summary, tags, created_at
-         FROM memories WHERE project = ?
-         ORDER BY created_at DESC LIMIT ?",
-    )
-    .bind(project)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+pub async fn get_recent_memories(db: &Database, project: &str, limit: i64) -> Result<Vec<Memory>> {
+    let query_str = match db.backend {
+        Backend::Sqlite => {
+            "SELECT rowid as id, project, session_id, summary, tags, created_at
+             FROM memories WHERE project = $1
+             ORDER BY created_at DESC LIMIT $2"
+        }
+        Backend::Postgres => {
+            "SELECT id, project, session_id, summary, tags, created_at
+             FROM memories WHERE project = $1
+             ORDER BY created_at DESC LIMIT $2"
+        }
+    };
+
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(query_str)
+        .bind(project)
+        .bind(limit)
+        .fetch_all(&db.pool)
+        .await?;
 
     Ok(rows
         .into_iter()
-        .map(|r| Memory {
+        .map(|r: sqlx::any::AnyRow| Memory {
             id: r.get("id"),
             project: r.get("project"),
             session_id: r.get("session_id"),
             summary: r.get("summary"),
-            tags: r.get("tags"),
+            tags: r.try_get("tags").ok().flatten(),
             created_at: r.get("created_at"),
         })
         .collect())
 }
 
 pub async fn search_memories(
-    pool: &SqlitePool,
+    db: &Database,
     project: &str,
     query: &str,
     limit: i64,
 ) -> Result<Vec<Memory>> {
-    // FTS5 search with project filter
-    let rows = sqlx::query(
-        "SELECT rowid as id, project, session_id, summary, tags, created_at
-         FROM memories WHERE memories MATCH ? AND project = ?
-         ORDER BY created_at DESC LIMIT ?",
-    )
-    .bind(query)
-    .bind(project)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+    let query_str = match db.backend {
+        Backend::Sqlite => {
+            "SELECT rowid as id, project, session_id, summary, tags, created_at
+             FROM memories WHERE memories MATCH $1 AND project = $2
+             ORDER BY created_at DESC LIMIT $3"
+        }
+        Backend::Postgres => {
+            "SELECT id, project, session_id, summary, tags, created_at
+             FROM memories WHERE search_vector @@ plainto_tsquery($1) AND project = $2
+             ORDER BY created_at DESC LIMIT $3"
+        }
+    };
+
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(query_str)
+        .bind(query)
+        .bind(project)
+        .bind(limit)
+        .fetch_all(&db.pool)
+        .await?;
 
     Ok(rows
         .into_iter()
-        .map(|r| Memory {
+        .map(|r: sqlx::any::AnyRow| Memory {
             id: r.get("id"),
             project: r.get("project"),
             session_id: r.get("session_id"),
             summary: r.get("summary"),
-            tags: r.get("tags"),
+            tags: r.try_get("tags").ok().flatten(),
             created_at: r.get("created_at"),
         })
         .collect())
 }
 
-pub async fn delete_memories_for_project(pool: &SqlitePool, project: &str) -> Result<u64> {
-    let result = sqlx::query("DELETE FROM memories WHERE project = ?")
+pub async fn delete_memories_for_project(db: &Database, project: &str) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM memories WHERE project = $1")
         .bind(project)
-        .execute(pool)
+        .execute(&db.pool)
         .await?;
     Ok(result.rows_affected())
 }
@@ -302,21 +427,21 @@ pub struct DbStats {
     pub total_observations: i64,
 }
 
-pub async fn get_stats(pool: &SqlitePool) -> Result<DbStats> {
-    let sessions: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM sessions")
-        .fetch_one(pool)
-        .await?
-        .get("cnt");
+pub async fn get_stats(db: &Database) -> Result<DbStats> {
+    let r: sqlx::any::AnyRow = sqlx::query("SELECT COUNT(*) as cnt FROM sessions")
+        .fetch_one(&db.pool)
+        .await?;
+    let sessions: i64 = r.get("cnt");
 
-    let memories: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM memories")
-        .fetch_one(pool)
-        .await?
-        .get("cnt");
+    let r: sqlx::any::AnyRow = sqlx::query("SELECT COUNT(*) as cnt FROM memories")
+        .fetch_one(&db.pool)
+        .await?;
+    let memories: i64 = r.get("cnt");
 
-    let observations: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM observations")
-        .fetch_one(pool)
-        .await?
-        .get("cnt");
+    let r: sqlx::any::AnyRow = sqlx::query("SELECT COUNT(*) as cnt FROM observations")
+        .fetch_one(&db.pool)
+        .await?;
+    let observations: i64 = r.get("cnt");
 
     Ok(DbStats {
         total_sessions: sessions,

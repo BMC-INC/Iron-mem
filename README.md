@@ -22,7 +22,9 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/built_with-Rust-F74C00?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust"/>
-  <img src="https://img.shields.io/badge/storage-SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white" alt="SQLite"/>
+  <img src="https://img.shields.io/badge/MCP-Native-6c5ce7?style=for-the-badge" alt="MCP Native"/>
+  <img src="https://img.shields.io/badge/SQLite%20%2B%20Postgres-003B57?style=for-the-badge&logo=sqlite&logoColor=white" alt="SQLite + Postgres"/>
+  <img src="https://img.shields.io/badge/Docker%20Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker Ready"/>
   <img src="https://img.shields.io/badge/license-Apache--2.0-brightgreen?style=for-the-badge" alt="License"/>
   <img src="https://img.shields.io/github/stars/BMC-INC/Iron-mem?style=for-the-badge&color=yellow" alt="Stars"/>
   <img src="https://img.shields.io/github/issues/BMC-INC/Iron-mem?style=for-the-badge" alt="Issues"/>
@@ -30,15 +32,32 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/works_with-Claude_Desktop-D97706?style=flat-square&logo=anthropic&logoColor=white" alt="Claude Desktop"/>
   <img src="https://img.shields.io/badge/works_with-Claude_Code-D97706?style=flat-square&logo=anthropic&logoColor=white" alt="Claude Code"/>
   <img src="https://img.shields.io/badge/works_with-Cursor-000000?style=flat-square&logo=cursor&logoColor=white" alt="Cursor"/>
+  <img src="https://img.shields.io/badge/works_with-ChatGPT_Desktop-10a37f?style=flat-square&logo=openai&logoColor=white" alt="ChatGPT Desktop"/>
   <img src="https://img.shields.io/badge/works_with-Copilot-2b3137?style=flat-square&logo=github&logoColor=white" alt="Copilot"/>
   <img src="https://img.shields.io/badge/works_with-Windsurf-06B6D4?style=flat-square" alt="Windsurf"/>
+  <img src="https://img.shields.io/badge/works_with-Zed-000000?style=flat-square" alt="Zed"/>
 </p>
 
 ---
 
 <!-- SEO Keywords: AI coding assistant memory, session-aware AI tools, Rust AI tools, context preservation, Claude Code memory, Cursor context -->
+
+## What's New in v0.2.0
+
+> Previously REST-only and local. Now an MCP-native server that works everywhere.
+
+- **10 MCP tools** — session_start, session_end, record_event, compress_session, get_context, get_status, list_memories, search_memories, inject_context, wipe_project
+- **Dual database** — SQLite (local, FTS5 full-text search) + Postgres (self-hosted, tsvector) via `DATABASE_URL`
+- **Every MCP client** — Claude Desktop, Claude Code, Cursor, Windsurf, ChatGPT Desktop, Zed, and more
+- **Docker deployment** — `docker-compose up` for remote/team setups with Postgres
+- **`ironmem mcp`** — new subcommand for direct MCP stdio transport (Claude Desktop/Code)
+- **REST server still works** — existing hooks and curl-based workflows unaffected
+- **Still zero telemetry. Still local-first. Your data stays yours.**
+
+---
 
 IronMem gives AI coding tools persistent memory across sessions.
 It silently records what happened during your session, compresses it into concise memory, and injects that context into your next session automatically.
@@ -47,9 +66,9 @@ No copy-pasting.
 No rebuilding context from scratch.
 No "remember when we refactored auth yesterday?"
 
-Runs locally.
+Runs locally or on your own infrastructure.
 No telemetry.
-SQLite storage.
+SQLite or Postgres storage.
 Plain markdown output.
 Single Rust binary.
 
@@ -198,7 +217,8 @@ Restart your terminal and Claude Code. That's it.
 ## CLI
 
 ```bash
-ironmem server              # Start the background worker (auto-started by hooks)
+ironmem server              # Start REST + MCP SSE server
+ironmem mcp                 # Start MCP stdio server (for Claude Desktop/Code)
 ironmem status              # Health check + DB stats
 ironmem list                # Recent memories for current project
 ironmem search "auth middleware"  # Full-text search across memories
@@ -219,15 +239,19 @@ ironmem config              # Print current settings
 
 ## Multi-Provider Support
 
-`IRONMEM.md` is plain markdown. It works everywhere:
+IronMem works as an **MCP server** (native integration) or via **IRONMEM.md** (plain markdown, universal):
 
-| Tool | Setup |
-| ---- | ----- |
-| **Claude Code** | Automatic — hooks handle everything |
-| **Cursor** | Add `@IRONMEM.md` to `.cursorrules` |
-| **Windsurf** | Add to `.windsurfrules` |
-| **GitHub Copilot** | Add to `.github/copilot-instructions.md` |
-| **Any other** | Read `IRONMEM.md` as project context |
+| Platform | MCP Native | IRONMEM.md | Setup |
+| -------- | :--------: | :--------: | ----- |
+| **Claude Desktop** | **Yes** | Yes | Add to `claude_desktop_config.json` |
+| **Claude Code** | **Yes** | Yes | Add to `.mcp.json` or use hooks |
+| **Cursor** | **Yes** | Yes | MCP config or `.cursorrules` |
+| **Windsurf** | **Yes** | Yes | MCP config or `.windsurfrules` |
+| **ChatGPT Desktop** | **Yes** | — | MCP config |
+| **Zed** | **Yes** | — | MCP config |
+| **VS Code (Copilot/Continue/Cline)** | **Yes** | Yes | MCP config or `.github/copilot-instructions.md` |
+| **Any MCP Client** | **Yes** | — | stdio or SSE transport |
+| **Any AI Tool** | — | Yes | Read `IRONMEM.md` as project context |
 
 ---
 
@@ -241,11 +265,20 @@ ironmem config              # Print current settings
   "model": "claude-sonnet-4-6-20250627",
   "inject_limit": 5,
   "max_observation_bytes": 2048,
-  "db_path": "/Users/you/.ironmem/mem.db"
+  "db_path": "/Users/you/.ironmem/mem.db",
+  "database_url": null,
+  "mcp_transport": "stdio",
+  "mcp_sse_port": 37779
 }
 ```
 
 All fields optional. Sensible defaults provided.
+
+| Variable | Default | Description |
+|:---------|:--------|:------------|
+| `DATABASE_URL` | _(none)_ | Postgres URL. Overrides `db_path` when set. |
+| `IRONMEM_MCP_TRANSPORT` | `stdio` | MCP transport: `stdio` or `sse` |
+| `ANTHROPIC_API_KEY` | _(none)_ | Required for session compression |
 
 ### API Key
 
@@ -311,7 +344,7 @@ Check that `~/.claude/settings.json` has the hooks registered under the `"hooks"
 └── session-end.sh       # Cleanup
 ```
 
-**~1,200 lines of Rust.** No external runtimes. No background daemons you forget about. SQLite for storage. One binary.
+**~1,700 lines of Rust.** MCP-native. SQLite or Postgres. One binary. No external runtimes.
 
 ---
 
@@ -327,9 +360,10 @@ Rust was chosen for IronMem to deliver:
 ## Design Principles
 
 - **Zero friction** — hooks run silently, never interrupt your workflow
-- **Local-first** — all data on your machine, server binds to `127.0.0.1` only
-- **Provider-agnostic** — plain markdown output works with any AI tool
-- **No bloat** — no Bun, no Python, no Docker, no cloud accounts
+- **Local-first** — runs on your machine by default, your data stays yours
+- **MCP-native** — speaks the protocol every major AI client is adopting
+- **Provider-agnostic** — MCP for native integration, plain markdown for everything else
+- **Self-hostable** — Docker + Postgres for team deployments, still zero cloud dependencies
 - **Fail-safe** — if IronMem crashes, your coding session is unaffected
 
 ---
@@ -371,6 +405,18 @@ IronMem is **automatic and session-aware:**
 | **Effort** | High | Zero — hooks handle everything |
 
 They work together. `CLAUDE.md` holds your project rules. IronMem holds what happened.
+
+---
+
+## Docker Deployment
+
+Run IronMem with Postgres for team/remote setups:
+
+```bash
+ANTHROPIC_API_KEY=your-key docker-compose up --build
+```
+
+This starts IronMem in SSE mode on `http://localhost:37779/sse` with Postgres 16, plus the REST server on `http://localhost:37778`.
 
 ---
 

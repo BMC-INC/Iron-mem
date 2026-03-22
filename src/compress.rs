@@ -113,7 +113,10 @@ fn build_prompt(observations: &[Observation]) -> String {
     lines.push(String::new());
     lines.push("Respond with EXACTLY this format, nothing else:".to_string());
     lines.push("SUMMARY: [3-5 sentences describing what was built, changed, or decided. Include specific file names, key decisions, errors resolved, and patterns established.]".to_string());
-    lines.push("TAGS: [8-12 space-separated lowercase keywords: technologies, file names, concepts]".to_string());
+    lines.push(
+        "TAGS: [8-12 space-separated lowercase keywords: technologies, file names, concepts]"
+            .to_string(),
+    );
 
     lines.join("\n")
 }
