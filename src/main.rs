@@ -170,7 +170,7 @@ async fn run_mcp(cfg: config::Config) -> Result<()> {
     Ok(())
 }
 
-async fn run_serve(cfg: config::Config, public: bool) -> Result<()> {
+async fn run_serve(mut cfg: config::Config, public: bool) -> Result<()> {
     let db_url = cfg.effective_database_url();
     let database = db::Database::new(&db_url).await?;
     database.migrate().await?;
@@ -178,20 +178,23 @@ async fn run_serve(cfg: config::Config, public: bool) -> Result<()> {
 
     let sse_port = cfg.mcp_sse_port;
     let bind: std::net::SocketAddr = format!("0.0.0.0:{}", sse_port).parse().unwrap();
+    let auth_token = cfg.ensure_auth_token();
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  IronMem MCP Server");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  Local:  http://127.0.0.1:{}/mcp", sse_port);
+    println!("  Auth:   Bearer {}", auth_token);
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     if public {
         // Launch Cloudflare tunnel in background
         let tunnel_port = sse_port;
+        let tunnel_auth_token = auth_token.clone();
         tokio::spawn(async move {
             // Give the SSE server a moment to bind
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            run_cloudflare_tunnel(tunnel_port).await;
+            run_cloudflare_tunnel(tunnel_port, tunnel_auth_token).await;
         });
     }
 
@@ -201,7 +204,7 @@ async fn run_serve(cfg: config::Config, public: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_cloudflare_tunnel(port: u16) {
+async fn run_cloudflare_tunnel(port: u16, auth_token: String) {
     // Try cloudflared first (installed binary), then npx fallback
     let url = format!("http://localhost:{}", port);
 
@@ -239,6 +242,10 @@ async fn run_cloudflare_tunnel(port: u16) {
                         println!();
                         println!("  Add to claude.ai as MCP server:");
                         println!("    URL:   {}/mcp", url);
+                        println!("    Auth:  Bearer {}", auth_token);
+                        println!(
+                            "    Note:  trycloudflare URLs are ephemeral and change on restart."
+                        );
                         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                     }
                 }
@@ -290,6 +297,10 @@ async fn run_cloudflare_tunnel(port: u16) {
                         println!();
                         println!("  Add to claude.ai as MCP server:");
                         println!("    URL:   {}/mcp", url);
+                        println!("    Auth:  Bearer {}", auth_token);
+                        println!(
+                            "    Note:  trycloudflare URLs are ephemeral and change on restart."
+                        );
                         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                     }
                 }
