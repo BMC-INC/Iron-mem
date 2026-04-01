@@ -2,6 +2,10 @@ use crate::config::Config;
 use crate::db::{self, Database};
 use crate::{hooks, provider};
 use anyhow::Result;
+use axum::extract::Request;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use rmcp::model::*;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -14,6 +18,37 @@ type JsonObject = serde_json::Map<String, serde_json::Value>;
 
 fn schema(val: serde_json::Value) -> Arc<JsonObject> {
     Arc::new(val.as_object().expect("schema must be an object").clone())
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+async fn require_bearer_auth(request: Request, next: Next, auth_token: String) -> Response {
+    match extract_bearer_token(request.headers()) {
+        Some(token) if token == auth_token => next.run(request).await,
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            "Missing or invalid bearer token",
+        )
+            .into_response(),
+    }
+}
+
+fn with_optional_bearer_auth(router: axum::Router, auth_token: Option<String>) -> axum::Router {
+    match auth_token {
+        Some(auth_token) if !auth_token.trim().is_empty() => {
+            router.route_layer(middleware::from_fn(move |request, next| {
+                let auth_token = auth_token.clone();
+                async move { require_bearer_auth(request, next, auth_token).await }
+            }))
+        }
+        _ => router,
+    }
 }
 
 #[derive(Clone)]
@@ -484,11 +519,16 @@ pub async fn run_stdio(db: Arc<Database>, config: Config) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_streamable_http(db: Arc<Database>, config: Config, bind: SocketAddr) -> Result<()> {
+pub async fn run_streamable_http(
+    db: Arc<Database>,
+    config: Config,
+    bind: SocketAddr,
+) -> Result<()> {
     let server = IronMemServer {
         db,
         config: Arc::new(config),
     };
+    let auth_token = server.config.auth_token.clone();
 
     let http_config = StreamableHttpServerConfig {
         json_response: true,
@@ -497,15 +537,12 @@ pub async fn run_streamable_http(db: Arc<Database>, config: Config, bind: Socket
     };
 
     let session_manager = Arc::new(LocalSessionManager::default());
-    let service = StreamableHttpService::new(
-        move || Ok(server.clone()),
-        session_manager,
-        http_config,
-    );
+    let service =
+        StreamableHttpService::new(move || Ok(server.clone()), session_manager, http_config);
 
-    let app = axum::Router::new().route(
-        "/mcp",
-        axum::routing::any_service(service),
+    let app = with_optional_bearer_auth(
+        axum::Router::new().route("/mcp", axum::routing::any_service(service)),
+        auth_token,
     );
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -524,4 +561,77 @@ pub async fn run_streamable_http(db: Arc<Database>, config: Config, bind: Socket
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use axum::routing::get;
+    use axum::Router;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn auth_middleware_rejects_requests_without_token() {
+        let app = with_optional_bearer_auth(
+            Router::new().route("/mcp", get(|| async { "ok" })),
+            Some("secret-token".to_string()),
+        );
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/mcp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+            "Bearer"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_accepts_matching_bearer_token() {
+        let app = with_optional_bearer_auth(
+            Router::new().route("/mcp", get(|| async { "ok" })),
+            Some("secret-token".to_string()),
+        );
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/mcp")
+                    .header(header::AUTHORIZATION, "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_is_disabled_without_token() {
+        let app =
+            with_optional_bearer_auth(Router::new().route("/mcp", get(|| async { "ok" })), None);
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/mcp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

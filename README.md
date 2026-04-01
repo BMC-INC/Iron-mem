@@ -356,14 +356,18 @@ This does three things:
   IronMem SSE Server
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Local:  http://127.0.0.1:37779/mcp
+  Auth:   Bearer <token>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Public URL: https://xxx-yyy-zzz.trycloudflare.com
   Add to claude.ai as MCP server:
     URL:   https://xxx-yyy-zzz.trycloudflare.com/mcp
+    Auth:  Bearer <token>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-Add the URL to claude.ai under Settings → Integrations → Add MCP Server.
+Add the URL to claude.ai under Settings → Integrations → Add MCP Server. When prompted for authentication, use `Bearer <token>`.
+
+The `trycloudflare.com` URL is ephemeral and changes whenever you restart the public tunnel, so update your MCP connection if you relaunch `ironmem serve --public`.
 
 **Everything stays local.** Your data never leaves your machine — the tunnel just forwards authenticated MCP protocol messages.
 
@@ -467,7 +471,7 @@ The UI shows sessions, memories, and database stats. You can browse, search, and
 }
 ```
 
-All fields optional. Sensible defaults provided.
+All fields optional. Sensible defaults provided. `auth_token` is generated automatically the first time you run `ironmem serve`.
 
 ### Provider
 
