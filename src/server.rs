@@ -26,6 +26,7 @@ pub fn router(state: AppState) -> Router {
         .route("/status", get(get_status))
         // Web UI routes
         .route("/ui", get(web_ui))
+        .route("/api/projects", get(api_list_projects))
         .route("/api/memories", get(api_list_memories))
         .route("/api/memories/{id}", delete(api_delete_memory))
         .route("/api/sessions", get(api_list_sessions))
@@ -280,6 +281,22 @@ pub struct MemoriesQuery {
     pub limit: Option<i64>,
 }
 
+#[derive(Deserialize)]
+pub struct ProjectsQuery {
+    pub limit: Option<i64>,
+}
+
+async fn api_list_projects(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ProjectsQuery>,
+) -> Result<Json<Vec<db::ProjectSummary>>, (StatusCode, String)> {
+    let limit = params.limit.unwrap_or(100);
+    let projects = db::list_projects(&state.db, limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(projects))
+}
+
 async fn api_list_memories(
     State(state): State<Arc<AppState>>,
     Query(params): Query<MemoriesQuery>,
@@ -297,9 +314,15 @@ async fn api_list_memories(
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         }
     } else {
-        db::get_all_memories(&state.db, limit)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        if let Some(q) = &params.query {
+            db::search_all_memories(&state.db, q, limit)
+                .await
+                .unwrap_or_default()
+        } else {
+            db::get_all_memories(&state.db, limit)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        }
     };
 
     Ok(Json(memories))
@@ -318,16 +341,24 @@ async fn api_delete_memory(
 
 #[derive(Deserialize)]
 pub struct SessionsQuery {
+    pub project: Option<String>,
     pub limit: Option<i64>,
 }
 
 async fn api_list_sessions(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SessionsQuery>,
-) -> Result<Json<Vec<db::Session>>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(50);
-    let sessions = db::list_sessions(&state.db, limit)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(sessions))
+    if let Some(project) = &params.project {
+        let sessions = db::list_session_history(&state.db, project, limit)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        Ok(Json(serde_json::json!(sessions)))
+    } else {
+        let sessions = db::list_sessions(&state.db, limit)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        Ok(Json(serde_json::json!(sessions)))
+    }
 }

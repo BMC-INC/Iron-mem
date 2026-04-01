@@ -53,12 +53,13 @@
 - **Neovim plugin** — native Lua plugin with auto session lifecycle, `:IronMemSearch`, `:IronMemStatus`
 - **Windows support** — `install.ps1`, platform-aware messages, robust home directory detection
 - **Web UI** — browse, search, and delete memories at `http://localhost:37778/ui`
+- **Discovery tools** — list known projects, search across all projects, and inspect per-project session history
 - **Still zero telemetry. Still local-first. Your data stays yours.**
 
 <details>
 <summary>v0.2.0</summary>
 
-- **10 MCP tools** — session_start, session_end, record_event, compress_session, get_context, get_status, list_memories, search_memories, inject_context, wipe_project
+- **13 MCP tools** — session_start, session_end, record_event, compress_session, get_context, get_status, list_memories, search_memories, search_global, list_projects, list_sessions, inject_context, wipe_project
 - **Dual database** — SQLite (local, FTS5 full-text search) + Postgres (self-hosted, tsvector) via `DATABASE_URL`
 - **Every MCP client** — Claude Desktop, Claude Code, Cursor, Windsurf, ChatGPT Desktop, Zed, and more
 - **Docker deployment** — `docker-compose up` for remote/team setups with Postgres
@@ -242,8 +243,11 @@ ironmem serve               # Start SSE server with bearer token auth
 ironmem serve --public      # Same + Cloudflare Tunnel for remote MCP clients
 ironmem serve --public --no-auth  # Authless public tunnel for claude.ai personal use
 ironmem status              # Health check + DB stats
+ironmem projects            # All projects with stored memories
 ironmem list                # Recent memories for current project
 ironmem search "auth middleware"  # Full-text search across memories
+ironmem search-global "auth middleware"  # Search across all projects
+ironmem sessions            # Session history for current project
 ironmem inject              # Manually rebuild IRONMEM.md
 ironmem compress <id>       # Manually compress a session
 ironmem wipe                # Delete all memories for current project
@@ -284,6 +288,12 @@ IronMem supports two MCP transports:
 
 - **stdio** — for local clients that launch the server themselves (Claude Code, Claude Desktop, Cursor)
 - **Streamable HTTP** — for remote/cloud clients that connect over HTTP. Uses standard request/response and bearer-token auth, so it works through tunnels and reverse proxies for clients that support static bearer tokens.
+
+Once connected over MCP, IronMem now supports project discovery directly:
+
+- `list_projects` — show every project with stored memories
+- `search_global` — search across all projects
+- `list_sessions` — inspect session history inside a project
 
 ### Claude Code MCP Setup
 

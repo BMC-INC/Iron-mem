@@ -155,6 +155,40 @@ impl IronMemServer {
                 })),
             ),
             Tool::new(
+                "search_global",
+                "Full-text search across all projects.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Search query" },
+                        "limit": { "type": "integer", "description": "Max results (default 10)" }
+                    },
+                    "required": ["query"]
+                })),
+            ),
+            Tool::new(
+                "list_projects",
+                "List all projects that have stored memories.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "limit": { "type": "integer", "description": "Max results (default 50)" }
+                    }
+                })),
+            ),
+            Tool::new(
+                "list_sessions",
+                "List session history for a project, including observation counts and memory tags.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project": { "type": "string", "description": "Project root path" },
+                        "limit": { "type": "integer", "description": "Max results (default 20)" }
+                    },
+                    "required": ["project"]
+                })),
+            ),
+            Tool::new(
                 "inject_context",
                 "Write IRONMEM.md to a project root with recent session memories.",
                 schema(serde_json::json!({
@@ -389,6 +423,53 @@ impl IronMemServer {
         )]))
     }
 
+    async fn handle_search_global(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ErrorData::invalid_params("missing 'query'", None))?;
+        let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10);
+
+        let memories = db::search_all_memories(&self.db, query, limit)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json = serde_json::json!({ "memories": memories });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json).unwrap(),
+        )]))
+    }
+
+    async fn handle_list_projects(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
+        let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+
+        let projects = db::list_projects(&self.db, limit)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json = serde_json::json!({ "projects": projects });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json).unwrap(),
+        )]))
+    }
+
+    async fn handle_list_sessions(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
+        let project = args
+            .get("project")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ErrorData::invalid_params("missing 'project'", None))?;
+        let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
+
+        let sessions = db::list_session_history(&self.db, project, limit)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json = serde_json::json!({ "sessions": sessions });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json).unwrap(),
+        )]))
+    }
+
     async fn handle_inject_context(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
         let project = args
             .get("project")
@@ -498,6 +579,9 @@ impl ServerHandler for IronMemServer {
             "get_status" => self.handle_get_status().await,
             "list_memories" => self.handle_list_memories(&args).await,
             "search_memories" => self.handle_search_memories(&args).await,
+            "search_global" => self.handle_search_global(&args).await,
+            "list_projects" => self.handle_list_projects(&args).await,
+            "list_sessions" => self.handle_list_sessions(&args).await,
             "inject_context" => self.handle_inject_context(&args).await,
             "wipe_project" => self.handle_wipe_project(&args).await,
             _ => Err(ErrorData::invalid_params(

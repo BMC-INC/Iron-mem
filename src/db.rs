@@ -46,6 +46,24 @@ pub struct Memory {
     pub created_at: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ProjectSummary {
+    pub project: String,
+    pub memory_count: i64,
+    pub last_activity: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SessionHistoryEntry {
+    pub id: String,
+    pub project: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub compressed: bool,
+    pub observation_count: i64,
+    pub tags: Option<String>,
+}
+
 impl Database {
     pub async fn new(url: &str) -> Result<Self> {
         sqlx::any::install_default_drivers();
@@ -411,6 +429,64 @@ pub async fn search_memories(
         .collect())
 }
 
+pub async fn search_all_memories(db: &Database, query: &str, limit: i64) -> Result<Vec<Memory>> {
+    let query_str = match db.backend {
+        Backend::Sqlite => {
+            "SELECT rowid as id, project, session_id, summary, tags, created_at
+             FROM memories WHERE memories MATCH $1
+             ORDER BY created_at DESC LIMIT $2"
+        }
+        Backend::Postgres => {
+            "SELECT id, project, session_id, summary, tags, created_at
+             FROM memories WHERE search_vector @@ plainto_tsquery($1)
+             ORDER BY created_at DESC LIMIT $2"
+        }
+    };
+
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(query_str)
+        .bind(query)
+        .bind(limit)
+        .fetch_all(&db.pool)
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r: sqlx::any::AnyRow| Memory {
+            id: r.get("id"),
+            project: r.get("project"),
+            session_id: r.get("session_id"),
+            summary: r.get("summary"),
+            tags: r.try_get("tags").ok().flatten(),
+            created_at: r.get("created_at"),
+        })
+        .collect())
+}
+
+pub async fn list_projects(db: &Database, limit: i64) -> Result<Vec<ProjectSummary>> {
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(
+        "SELECT m.project,
+                COUNT(*) AS memory_count,
+                MAX(COALESCE(s.ended_at, s.started_at, m.created_at)) AS last_activity
+         FROM memories m
+         LEFT JOIN sessions s ON s.id = m.session_id
+         GROUP BY m.project
+         ORDER BY last_activity DESC
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(&db.pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r: sqlx::any::AnyRow| ProjectSummary {
+            project: r.get("project"),
+            memory_count: r.get("memory_count"),
+            last_activity: r.get("last_activity"),
+        })
+        .collect())
+}
+
 pub async fn delete_memories_for_project(db: &Database, project: &str) -> Result<u64> {
     let result = sqlx::query("DELETE FROM memories WHERE project = $1")
         .bind(project)
@@ -438,6 +514,47 @@ pub async fn list_sessions(db: &Database, limit: i64) -> Result<Vec<Session>> {
             started_at: r.get("started_at"),
             ended_at: r.try_get("ended_at").ok().flatten(),
             compressed: r.get::<i64, _>("compressed") != 0,
+        })
+        .collect())
+}
+
+pub async fn list_session_history(
+    db: &Database,
+    project: &str,
+    limit: i64,
+) -> Result<Vec<SessionHistoryEntry>> {
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(
+        "SELECT s.id,
+                s.project,
+                s.started_at,
+                s.ended_at,
+                s.compressed,
+                (SELECT COUNT(*) FROM observations o WHERE o.session_id = s.id) AS observation_count,
+                (SELECT m.tags
+                 FROM memories m
+                 WHERE m.session_id = s.id
+                 ORDER BY m.created_at DESC
+                 LIMIT 1) AS tags
+         FROM sessions s
+         WHERE s.project = $1
+         ORDER BY s.started_at DESC
+         LIMIT $2",
+    )
+    .bind(project)
+    .bind(limit)
+    .fetch_all(&db.pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r: sqlx::any::AnyRow| SessionHistoryEntry {
+            id: r.get("id"),
+            project: r.get("project"),
+            started_at: r.get("started_at"),
+            ended_at: r.try_get("ended_at").ok().flatten(),
+            compressed: r.get::<i64, _>("compressed") != 0,
+            observation_count: r.get("observation_count"),
+            tags: r.try_get("tags").ok().flatten(),
         })
         .collect())
 }
@@ -513,4 +630,90 @@ pub async fn get_stats(db: &Database) -> Result<DbStats> {
         total_memories: memories,
         total_observations: observations,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_db() -> Result<(Database, String)> {
+        let db_path =
+            std::env::temp_dir().join(format!("ironmem-test-{}.db", uuid::Uuid::new_v4()));
+        let db_path_string = db_path.to_string_lossy().to_string();
+        let db = Database::new(&db_path_string).await?;
+        db.migrate().await?;
+        Ok((db, db_path_string))
+    }
+
+    #[tokio::test]
+    async fn project_discovery_queries_return_cross_project_results() -> Result<()> {
+        let (db, db_path) = test_db().await?;
+
+        let alpha = "/tmp/alpha";
+        let beta = "/tmp/beta";
+
+        let alpha_session = create_session(&db, alpha).await?;
+        insert_observation(
+            &db,
+            &alpha_session,
+            alpha,
+            "Read",
+            Some("file"),
+            Some("notes about auth middleware"),
+            1024,
+        )
+        .await?;
+        end_session(&db, &alpha_session).await?;
+        insert_memory(
+            &db,
+            alpha,
+            &alpha_session,
+            "Fixed auth middleware bug and updated tunnel docs",
+            Some("auth,docs"),
+        )
+        .await?;
+
+        let beta_session = create_session(&db, beta).await?;
+        insert_observation(
+            &db,
+            &beta_session,
+            beta,
+            "Edit",
+            Some("search"),
+            Some("global search plan"),
+            1024,
+        )
+        .await?;
+        end_session(&db, &beta_session).await?;
+        insert_memory(
+            &db,
+            beta,
+            &beta_session,
+            "Added project discovery and global search ideas",
+            Some("search,discovery"),
+        )
+        .await?;
+
+        let projects = list_projects(&db, 10).await?;
+        assert_eq!(projects.len(), 2);
+        assert!(projects
+            .iter()
+            .any(|p| p.project == alpha && p.memory_count == 1));
+        assert!(projects
+            .iter()
+            .any(|p| p.project == beta && p.memory_count == 1));
+
+        let global = search_all_memories(&db, "auth", 10).await?;
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].project, alpha);
+
+        let sessions = list_session_history(&db, alpha, 10).await?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].project, alpha);
+        assert_eq!(sessions[0].observation_count, 1);
+        assert_eq!(sessions[0].tags.as_deref(), Some("auth,docs"));
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
 }

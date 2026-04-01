@@ -6,6 +6,7 @@ mod provider;
 mod server;
 
 use anyhow::Result;
+use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -39,6 +40,15 @@ enum Commands {
         limit: i64,
     },
 
+    /// Search memories across all projects
+    SearchGlobal {
+        /// Search query
+        query: String,
+        /// Max results
+        #[arg(short, long, default_value = "10")]
+        limit: i64,
+    },
+
     /// List recent memories for a project
     List {
         /// Project root path (defaults to current directory)
@@ -46,6 +56,23 @@ enum Commands {
         project: Option<String>,
         /// Max results
         #[arg(short, long, default_value = "5")]
+        limit: i64,
+    },
+
+    /// List projects with stored memories
+    Projects {
+        /// Max results
+        #[arg(short, long, default_value = "50")]
+        limit: i64,
+    },
+
+    /// List session history for a project
+    Sessions {
+        /// Project root path (defaults to current directory)
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Max results
+        #[arg(short, long, default_value = "20")]
         limit: i64,
     },
 
@@ -117,7 +144,12 @@ async fn main() -> Result<()> {
             project,
             limit,
         } => run_search(&cfg, &query, project.as_deref(), limit).await?,
+        Commands::SearchGlobal { query, limit } => run_search_global(&cfg, &query, limit).await?,
         Commands::List { project, limit } => run_list(&cfg, project.as_deref(), limit).await?,
+        Commands::Projects { limit } => run_projects(&cfg, limit).await?,
+        Commands::Sessions { project, limit } => {
+            run_sessions(&cfg, project.as_deref(), limit).await?
+        }
         Commands::Wipe { project, force } => run_wipe(&cfg, project.as_deref(), force).await?,
         Commands::Inject { project, limit } => run_inject(&cfg, project.as_deref(), limit).await?,
         Commands::Compress { session_id } => run_compress_cmd(&cfg, &session_id).await?,
@@ -380,6 +412,30 @@ async fn run_search(
     Ok(())
 }
 
+async fn run_search_global(cfg: &config::Config, query: &str, limit: i64) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let memories = db::search_all_memories(&database, query, limit).await?;
+
+    if memories.is_empty() {
+        println!("No memories found across any project for query: {}", query);
+        return Ok(());
+    }
+
+    println!("Found {} memories across all projects:\n", memories.len());
+    for m in memories {
+        println!("─────────────────────────────────");
+        println!("Project: {}", m.project);
+        println!("ID: {} | Session: {}", m.id, m.session_id);
+        println!("{}", m.summary);
+        if let Some(tags) = m.tags {
+            println!("Tags: {}", tags);
+        }
+        println!();
+    }
+    Ok(())
+}
+
 async fn run_list(cfg: &config::Config, project: Option<&str>, limit: i64) -> Result<()> {
     let project = resolve_project(project)?;
     let database = db::Database::new(&cfg.effective_database_url()).await?;
@@ -397,6 +453,57 @@ async fn run_list(cfg: &config::Config, project: Option<&str>, limit: i64) -> Re
         println!("ID: {}", m.id);
         println!("{}", m.summary);
         if let Some(tags) = m.tags {
+            println!("Tags: {}", tags);
+        }
+        println!();
+    }
+    Ok(())
+}
+
+async fn run_projects(cfg: &config::Config, limit: i64) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let projects = db::list_projects(&database, limit).await?;
+
+    if projects.is_empty() {
+        println!("No projects with stored memories yet.");
+        return Ok(());
+    }
+
+    println!("Projects with stored memories:\n");
+    for project in projects {
+        println!("─────────────────────────────────");
+        println!("Project: {}", project.project);
+        println!("Memories: {}", project.memory_count);
+        println!("Last activity: {}", format_timestamp(project.last_activity));
+        println!();
+    }
+    Ok(())
+}
+
+async fn run_sessions(cfg: &config::Config, project: Option<&str>, limit: i64) -> Result<()> {
+    let project = resolve_project(project)?;
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let sessions = db::list_session_history(&database, &project, limit).await?;
+
+    if sessions.is_empty() {
+        println!("No sessions for project: {}", project);
+        return Ok(());
+    }
+
+    println!("Session history for {}:\n", project);
+    for session in sessions {
+        println!("─────────────────────────────────");
+        println!("Session: {}", session.id);
+        println!("Started: {}", format_timestamp(session.started_at));
+        match session.ended_at {
+            Some(ended_at) => println!("Ended: {}", format_timestamp(ended_at)),
+            None => println!("Ended: still running"),
+        }
+        println!("Compressed: {}", session.compressed);
+        println!("Observations: {}", session.observation_count);
+        if let Some(tags) = session.tags {
             println!("Tags: {}", tags);
         }
         println!();
@@ -504,5 +611,12 @@ fn resolve_project(project: Option<&str>) -> Result<String> {
                 }
             }
         }
+    }
+}
+
+fn format_timestamp(timestamp: i64) -> String {
+    match Local.timestamp_opt(timestamp, 0).single() {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S %Z").to_string(),
+        None => timestamp.to_string(),
     }
 }
