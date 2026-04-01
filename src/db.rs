@@ -73,10 +73,11 @@ impl Database {
             } else if url.starts_with("sqlite://") {
                 (url.to_string(), Backend::Sqlite)
             } else {
-                if let Some(parent) = std::path::Path::new(url).parent() {
+                let path = std::path::Path::new(url);
+                if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                (format!("sqlite://{}?mode=rwc", url), Backend::Sqlite)
+                (sqlite_file_url(path), Backend::Sqlite)
             };
         let pool = AnyPoolOptions::new()
             .max_connections(5)
@@ -181,6 +182,16 @@ impl Database {
         }
 
         Ok(())
+    }
+}
+
+fn sqlite_file_url(path: &std::path::Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+
+    if normalized.len() >= 2 && normalized.as_bytes()[1] == b':' {
+        format!("sqlite:///{}?mode=rwc", normalized)
+    } else {
+        format!("sqlite://{}?mode=rwc", normalized)
     }
 }
 
@@ -635,6 +646,18 @@ pub async fn get_stats(db: &Database) -> Result<DbStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_file_url_formats_windows_and_unix_paths() {
+        assert_eq!(
+            sqlite_file_url(std::path::Path::new("/tmp/ironmem.db")),
+            "sqlite:///tmp/ironmem.db?mode=rwc"
+        );
+        assert_eq!(
+            sqlite_file_url(std::path::Path::new(r"C:\Users\runneradmin\ironmem.db")),
+            "sqlite:///C:/Users/runneradmin/ironmem.db?mode=rwc"
+        );
+    }
 
     async fn test_db() -> Result<(Database, String)> {
         let db_path =
