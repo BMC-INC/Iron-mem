@@ -239,7 +239,8 @@ Restart your terminal and Claude Code. That's it.
 ironmem server              # Start REST + MCP SSE server
 ironmem mcp                 # Start MCP stdio server (for Claude Desktop/Code)
 ironmem serve               # Start SSE server with bearer token auth
-ironmem serve --public      # Same + Cloudflare Tunnel for claude.ai
+ironmem serve --public      # Same + Cloudflare Tunnel for remote MCP clients
+ironmem serve --public --no-auth  # Authless public tunnel for claude.ai personal use
 ironmem status              # Health check + DB stats
 ironmem list                # Recent memories for current project
 ironmem search "auth middleware"  # Full-text search across memories
@@ -265,7 +266,8 @@ IronMem works as an **MCP server** (native integration) or via **IRONMEM.md** (p
 | Platform | MCP Native | IRONMEM.md | Setup |
 | -------- | :--------: | :--------: | ----- |
 | **Claude Code** | **Yes** | Yes | [Setup →](#claude-code-mcp-setup) |
-| **Claude Desktop / claude.ai** | **Yes** | Yes | [Setup →](#claude-desktop-mcp-setup) |
+| **Claude Desktop** | **Yes** | Yes | [Setup →](#claude-desktop-mcp-setup) |
+| **claude.ai** | **Yes** | Yes | [Setup →](#claudeai-web) |
 | **Cursor** | **Yes** | Yes | [Setup →](#cursor--windsurf-mcp-setup) |
 | **Windsurf** | **Yes** | Yes | [Setup →](#cursor--windsurf-mcp-setup) |
 | **ChatGPT Desktop** | **Yes** | — | [Setup →](#other-mcp-clients) |
@@ -281,7 +283,7 @@ IronMem works as an **MCP server** (native integration) or via **IRONMEM.md** (p
 IronMem supports two MCP transports:
 
 - **stdio** — for local clients that launch the server themselves (Claude Code, Claude Desktop, Cursor)
-- **Streamable HTTP** — for remote/cloud clients that connect over HTTP (claude.ai, team deployments). Uses standard request/response — works through any tunnel or proxy.
+- **Streamable HTTP** — for remote/cloud clients that connect over HTTP. Uses standard request/response and bearer-token auth, so it works through tunnels and reverse proxies for clients that support static bearer tokens.
 
 ### Claude Code MCP Setup
 
@@ -338,40 +340,53 @@ Add to your `claude_desktop_config.json`:
 
 Replace `/Users/YOU` with your actual home directory path. Restart Claude Desktop after saving.
 
-### claude.ai (Web) MCP Setup
+### claude.ai (Web)
 
-claude.ai runs in the cloud — it **cannot** reach `localhost`. IronMem solves this with one command:
+claude.ai runs in the cloud, so it **cannot** reach `localhost`.
+
+IronMem is a local-first tool. The recommended setup for full MCP access is **Claude Code** or **Claude Desktop** using stdio.
+
+Anthropic's current `claude.ai` custom connector UI supports **authless** and **OAuth-based** remote MCP servers, but not a manual static bearer-token field. For personal use, the honest compatibility path is an **authless ephemeral tunnel**:
 
 ```bash
-ironmem serve --public
+ironmem serve --public --no-auth
 ```
 
-This does three things:
-1. Starts the SSE server with **bearer token authentication**
+That command does three things:
+1. Starts the SSE server with **no auth**
 2. Launches a **Cloudflare Tunnel** (free, no account needed) to expose it publicly
-3. Prints the public URL and auth token
+3. Prints the public URL
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   IronMem SSE Server
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Local:  http://127.0.0.1:37779/mcp
-  Auth:   Bearer <token>
+  Auth:   Disabled (--no-auth)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Public URL: https://xxx-yyy-zzz.trycloudflare.com
-  Add to claude.ai as MCP server:
+  Remote MCP setup:
     URL:   https://xxx-yyy-zzz.trycloudflare.com/mcp
-    Auth:  Bearer <token>
+    Auth:  None
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-Add the URL to claude.ai under Settings → Integrations → Add MCP Server. When prompted for authentication, use `Bearer <token>`.
+In claude.ai:
 
-The `trycloudflare.com` URL is ephemeral and changes whenever you restart the public tunnel, so update your MCP connection if you relaunch `ironmem serve --public`.
+1. Open `Settings`
+2. Open `Integrations`
+3. Choose `Add custom connector`
+4. Set `Name` to `IronMem`
+5. Paste the printed `https://...trycloudflare.com/mcp` URL into `Remote MCP server URL`
+6. Leave the OAuth fields blank
 
-**Everything stays local.** Your data never leaves your machine — the tunnel just forwards authenticated MCP protocol messages.
+The `trycloudflare.com` URL is ephemeral and changes whenever you restart the public tunnel, so update your connector URL each time you relaunch `ironmem serve --public --no-auth`.
 
-**Without `--public`:** `ironmem serve` starts the SSE server locally with auth (for LAN or your own reverse proxy).
+**This is no longer local-only.** The tunnel exposes your MCP endpoint over the internet for as long as it is running.
+
+For a personal local tool, this tradeoff is often acceptable because the URL is short-lived and changes on each restart. Still, use `--no-auth` deliberately and only when you understand that you are trading security for compatibility.
+
+**Without `--no-auth`:** `ironmem serve` and `ironmem serve --public` use bearer-token auth for clients that support static bearer tokens.
 
 **Requirements:** Install [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) for best results (`brew install cloudflared` on macOS, `winget install Cloudflare.cloudflared` on Windows). Falls back to `npx cloudflared` if not installed.
 
@@ -471,7 +486,7 @@ The UI shows sessions, memories, and database stats. You can browse, search, and
 }
 ```
 
-All fields optional. Sensible defaults provided. `auth_token` is generated automatically the first time you run `ironmem serve`.
+All fields optional. Sensible defaults provided. `auth_token` is generated automatically the first time you run `ironmem serve` without `--no-auth`.
 
 ### Provider
 
@@ -640,7 +655,8 @@ This starts IronMem with Streamable HTTP on `http://localhost:37779/mcp` and Pos
 - [x] Dual database — SQLite (local, FTS5) + Postgres (self-hosted)
 - [x] Docker deployment with Postgres
 - [x] Bearer token authentication
-- [x] `ironmem serve --public` with Cloudflare Tunnel for claude.ai
+- [x] `ironmem serve --public` with Cloudflare Tunnel for remote MCP clients
+- [x] `ironmem serve --public --no-auth` for claude.ai personal use
 - [x] Works with Claude Code, Claude Desktop, Cursor, Windsurf, ChatGPT Desktop, Zed, VS Code
 
 ### Shipped in v0.3.0

@@ -79,11 +79,16 @@ enum Commands {
     /// Start the MCP server (stdio transport, for Claude Desktop/Code)
     Mcp,
 
-    /// Start the SSE server for claude.ai (with auth + optional public tunnel)
+    /// Start the SSE server for remote MCP clients
     Serve {
-        /// Expose via Cloudflare Tunnel for claude.ai access
+        /// Expose via Cloudflare Tunnel for remote access
         #[arg(long)]
         public: bool,
+        /// Disable auth entirely. Useful for claude.ai custom connectors, which
+        /// currently support authless and OAuth remote MCP servers but not static
+        /// bearer-token auth.
+        #[arg(long)]
+        no_auth: bool,
     },
 
     /// Print current configuration
@@ -105,7 +110,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Server => run_server(cfg).await?,
         Commands::Mcp => run_mcp(cfg).await?,
-        Commands::Serve { public } => run_serve(cfg, public).await?,
+        Commands::Serve { public, no_auth } => run_serve(cfg, public, no_auth).await?,
         Commands::Status => run_status(&cfg).await?,
         Commands::Search {
             query,
@@ -170,7 +175,7 @@ async fn run_mcp(cfg: config::Config) -> Result<()> {
     Ok(())
 }
 
-async fn run_serve(mut cfg: config::Config, public: bool) -> Result<()> {
+async fn run_serve(mut cfg: config::Config, public: bool, no_auth: bool) -> Result<()> {
     let db_url = cfg.effective_database_url();
     let database = db::Database::new(&db_url).await?;
     database.migrate().await?;
@@ -178,13 +183,21 @@ async fn run_serve(mut cfg: config::Config, public: bool) -> Result<()> {
 
     let sse_port = cfg.mcp_sse_port;
     let bind: std::net::SocketAddr = format!("0.0.0.0:{}", sse_port).parse().unwrap();
-    let auth_token = cfg.ensure_auth_token();
+    let auth_token = if no_auth {
+        cfg.auth_token = None;
+        None
+    } else {
+        Some(cfg.ensure_auth_token())
+    };
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  IronMem MCP Server");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  Local:  http://127.0.0.1:{}/mcp", sse_port);
-    println!("  Auth:   Bearer {}", auth_token);
+    match auth_token.as_deref() {
+        Some(token) => println!("  Auth:   Bearer {}", token),
+        None => println!("  Auth:   Disabled (--no-auth)"),
+    }
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     if public {
@@ -204,7 +217,7 @@ async fn run_serve(mut cfg: config::Config, public: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_cloudflare_tunnel(port: u16, auth_token: String) {
+async fn run_cloudflare_tunnel(port: u16, auth_token: Option<String>) {
     // Try cloudflared first (installed binary), then npx fallback
     let url = format!("http://localhost:{}", port);
 
@@ -240,9 +253,12 @@ async fn run_cloudflare_tunnel(port: u16, auth_token: String) {
                         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                         println!("  Public URL: {}", url);
                         println!();
-                        println!("  Add to claude.ai as MCP server:");
+                        println!("  Remote MCP setup:");
                         println!("    URL:   {}/mcp", url);
-                        println!("    Auth:  Bearer {}", auth_token);
+                        match auth_token.as_deref() {
+                            Some(token) => println!("    Auth:  Bearer {}", token),
+                            None => println!("    Auth:  None"),
+                        }
                         println!(
                             "    Note:  trycloudflare URLs are ephemeral and change on restart."
                         );
@@ -295,9 +311,12 @@ async fn run_cloudflare_tunnel(port: u16, auth_token: String) {
                         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                         println!("  Public URL: {}", url);
                         println!();
-                        println!("  Add to claude.ai as MCP server:");
+                        println!("  Remote MCP setup:");
                         println!("    URL:   {}/mcp", url);
-                        println!("    Auth:  Bearer {}", auth_token);
+                        match auth_token.as_deref() {
+                            Some(token) => println!("    Auth:  Bearer {}", token),
+                            None => println!("    Auth:  None"),
+                        }
                         println!(
                             "    Note:  trycloudflare URLs are ephemeral and change on restart."
                         );
