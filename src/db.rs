@@ -970,6 +970,49 @@ pub async fn get_stats(db: &Database) -> Result<DbStats> {
 mod tests {
     use super::*;
 
+    /// Regression: `insert_memory` must return the rowid of the row it just
+    /// inserted. Before the fix it read `last_insert_rowid()` on a *separate*
+    /// pool query, which on a multi-connection pool could land on another
+    /// connection and return a wrong/zero/duplicate id. We interleave unrelated
+    /// pool queries to churn connection hand-out and assert the invariant.
+    #[tokio::test]
+    async fn insert_memory_returns_correct_distinct_ids() {
+        let path =
+            std::env::temp_dir().join(format!("ironmem-insid-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::new(&path.to_string_lossy()).await.unwrap();
+        db.migrate().await.unwrap();
+        let session = create_session(&db, "/tmp/p").await.unwrap();
+
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            // Unrelated pool query between inserts to encourage the pool to
+            // hand out a different connection (the conditions that exposed the bug).
+            let _ = get_recent_memories(&db, "/tmp/p", 10).await.unwrap();
+            let id = insert_memory(&db, "/tmp/p", &session, &format!("summary {i}"), Some("t"))
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+
+        // All ids are non-zero and distinct.
+        assert!(ids.iter().all(|&id| id > 0), "ids must be non-zero: {ids:?}");
+        let mut distinct = ids.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), ids.len(), "ids must be distinct: {ids:?}");
+
+        // Each returned id maps to exactly the row we inserted under it.
+        for (i, &id) in ids.iter().enumerate() {
+            let m = get_memory_by_id(&db, id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("no memory for returned id {id}"));
+            assert_eq!(m.summary, format!("summary {i}"));
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn sqlite_file_url_formats_windows_and_unix_paths() {
         assert_eq!(
