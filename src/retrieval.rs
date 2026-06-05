@@ -8,6 +8,7 @@ use chrono::Utc;
 use std::collections::HashMap;
 
 use crate::config::Weights;
+use crate::context;
 use crate::db::{self, Database, Memory};
 use crate::embedder::Embedder;
 use crate::vectorstore::VectorStore;
@@ -152,6 +153,36 @@ pub async fn injection_rank(
     }
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     Ok(scored.into_iter().take(limit).map(|(_, m)| m).collect())
+}
+
+/// High-level session-start ranking: derive a query signal from the project's
+/// git state, embed it (when an embedder is available), and rank recent
+/// memories by blended score. With no embedder/git signal this collapses to
+/// recency + importance — the legacy injection order.
+pub async fn rank_for_injection(
+    db: &Database,
+    embedder: Option<&dyn Embedder>,
+    store: &dyn VectorStore,
+    project: &str,
+    weights: &Weights,
+    half_life_days: f64,
+    limit: usize,
+) -> Result<Vec<Memory>> {
+    let query_vec: Option<Vec<f32>> = match (embedder, context::git_query(project)) {
+        (Some(emb), Some(signal)) => embed_one(emb, &signal).await,
+        _ => None,
+    };
+    injection_rank(
+        db,
+        embedder,
+        store,
+        project,
+        query_vec.as_deref(),
+        weights,
+        half_life_days,
+        limit,
+    )
+    .await
 }
 
 /// Embed a single string, returning the vector or `None` on failure/empty.

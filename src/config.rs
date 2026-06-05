@@ -185,3 +185,41 @@ pub fn save(config: &Config) -> Result<()> {
     std::fs::write(settings_path(), json)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = r#"{
+        "port": 37778,
+        "model": "claude-sonnet-4-6",
+        "inject_limit": 5,
+        "max_observation_bytes": 2048,
+        "db_path": "/tmp/mem.db"
+    }"#;
+
+    #[test]
+    fn missing_embedding_key_yields_defaults() {
+        let cfg: Config = serde_json::from_str(BASE).unwrap();
+        assert_eq!(cfg.embedding.provider, "auto");
+        assert_eq!(cfg.embedding.weights.relevance, 0.5);
+        assert_eq!(cfg.embedding.weights.recency, 0.3);
+        assert_eq!(cfg.embedding.weights.importance, 0.2);
+        assert_eq!(cfg.embedding.recency_half_life_days, 30.0);
+        assert_eq!(cfg.embedding.ollama_url, "http://localhost:11434");
+    }
+
+    #[test]
+    fn provider_none_round_trips() {
+        let raw = BASE.replace(
+            "\"db_path\": \"/tmp/mem.db\"",
+            "\"db_path\": \"/tmp/mem.db\", \"embedding\": { \"provider\": \"none\" }",
+        );
+        let cfg: Config = serde_json::from_str(&raw).unwrap();
+        assert_eq!(cfg.embedding.provider, "none");
+        // Round-trip through JSON preserves the explicit provider.
+        let back = serde_json::to_string(&cfg).unwrap();
+        let cfg2: Config = serde_json::from_str(&back).unwrap();
+        assert_eq!(cfg2.embedding.provider, "none");
+    }
+}

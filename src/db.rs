@@ -596,6 +596,18 @@ pub async fn delete_memories_for_project(db: &Database, project: &str) -> Result
     Ok(result.rows_affected())
 }
 
+/// Collect all memory ids for a project (rowid in sqlite / id in pg). Used to
+/// purge each memory's vectors + metadata after a project wipe.
+pub async fn memory_ids_for_project(db: &Database, project: &str) -> Result<Vec<i64>> {
+    let id_col = match db.backend {
+        Backend::Sqlite => "rowid",
+        Backend::Postgres => "id",
+    };
+    let sql = format!("SELECT {id_col} AS id FROM memories WHERE project = $1");
+    let rows = sqlx::query(&sql).bind(project).fetch_all(&db.pool).await?;
+    Ok(rows.into_iter().map(|r| r.get::<i64, _>("id")).collect())
+}
+
 // List sessions
 
 pub async fn list_sessions(db: &Database, limit: i64) -> Result<Vec<Session>> {
@@ -757,6 +769,16 @@ pub async fn delete_embedding(db: &Database, owner_type: &str, owner_id: i64) ->
     Ok(())
 }
 
+/// Remove all memory embeddings for a model (used by `embed --force` before a
+/// full re-index).
+pub async fn clear_embeddings_for_model(db: &Database, model: &str) -> Result<()> {
+    sqlx::query("DELETE FROM embeddings WHERE owner_type = 'memory' AND model = $1")
+        .bind(model)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn upsert_memory_meta(db: &Database, memory_id: i64, importance: f64) -> Result<()> {
     let now = Utc::now().timestamp();
     sqlx::query(
@@ -766,6 +788,23 @@ pub async fn upsert_memory_meta(db: &Database, memory_id: i64, importance: f64) 
     )
     .bind(memory_id)
     .bind(importance)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+/// Insert a default importance row only if none exists. Never overwrites an
+/// importance already recorded by compression (used during embedding backfill).
+pub async fn ensure_memory_meta(db: &Database, memory_id: i64, default_importance: f64) -> Result<()> {
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO memory_meta(memory_id, importance, created_at)
+         VALUES($1, $2, $3)
+         ON CONFLICT(memory_id) DO NOTHING",
+    )
+    .bind(memory_id)
+    .bind(default_importance)
     .bind(now)
     .execute(&db.pool)
     .await?;

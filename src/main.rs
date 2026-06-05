@@ -109,6 +109,19 @@ enum Commands {
         session_id: String,
     },
 
+    /// Backfill semantic embeddings for existing memories
+    Embed {
+        /// Project root path (defaults to all projects)
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Embed across every project (ignore --project)
+        #[arg(short, long)]
+        all: bool,
+        /// Rebuild the index from scratch, re-embedding every memory
+        #[arg(short, long)]
+        force: bool,
+    },
+
     /// Start the MCP server (stdio transport, for Claude Desktop/Code)
     Mcp,
 
@@ -159,6 +172,11 @@ async fn main() -> Result<()> {
         Commands::Wipe { project, force } => run_wipe(&cfg, project.as_deref(), force).await?,
         Commands::Inject { project, limit } => run_inject(&cfg, project.as_deref(), limit).await?,
         Commands::Compress { session_id } => run_compress_cmd(&cfg, &session_id).await?,
+        Commands::Embed {
+            project,
+            all,
+            force,
+        } => run_embed(&cfg, project.as_deref(), all, force).await?,
         Commands::Config => {
             println!("{}", serde_json::to_string_pretty(&cfg)?);
         }
@@ -540,7 +558,15 @@ async fn run_wipe(cfg: &config::Config, project: Option<&str>, force: bool) -> R
 
     let database = db::Database::new(&cfg.effective_database_url()).await?;
     database.migrate().await?;
+
+    let (_embedder, store) = vectorstore::build_semantic(&database, cfg).await;
+    let ids = db::memory_ids_for_project(&database, &project).await?;
     let count = db::delete_memories_for_project(&database, &project).await?;
+    for id in ids {
+        if let Err(e) = vectorstore::purge_memory(&database, store.as_ref(), id).await {
+            tracing::warn!("vector/meta cleanup failed for memory {id}: {e}");
+        }
+    }
 
     // Clean up IRONMEM.md and CLAUDE.md import
     let _ = std::fs::remove_file(std::path::Path::new(&project).join("IRONMEM.md"));
@@ -554,7 +580,18 @@ async fn run_inject(cfg: &config::Config, project: Option<&str>, limit: i64) -> 
     let project = resolve_project(project)?;
     let database = db::Database::new(&cfg.effective_database_url()).await?;
     database.migrate().await?;
-    let memories = db::get_recent_memories(&database, &project, limit).await?;
+
+    let (embedder, store) = vectorstore::build_semantic(&database, cfg).await;
+    let memories = retrieval::rank_for_injection(
+        &database,
+        embedder.as_deref(),
+        store.as_ref(),
+        &project,
+        &cfg.embedding.weights,
+        cfg.embedding.recency_half_life_days,
+        limit as usize,
+    )
+    .await?;
 
     hooks::write_ironmem_file(&project, &memories)?;
     hooks::ensure_claude_md_import(&project)?;
@@ -596,6 +633,40 @@ async fn run_compress_cmd(cfg: &config::Config, session_id: &str) -> Result<()> 
         println!("\nSummary:\n{}", memory.summary);
         println!("\nTags: {}", memory.tags.unwrap_or_default());
     }
+    Ok(())
+}
+
+async fn run_embed(
+    cfg: &config::Config,
+    project: Option<&str>,
+    all: bool,
+    force: bool,
+) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+
+    let embedder = match embedder::resolve_embedder(cfg).await {
+        Some(e) => e,
+        None => anyhow::bail!(
+            "No embedder configured. Set `embedding.provider` in settings, or run a local \
+             Ollama (e.g. `ollama pull nomic-embed-text`), then retry."
+        ),
+    };
+    let store = vectorstore::make_vector_store(&database, embedder.dim()).await;
+
+    let filter = if all { None } else { project };
+    let scope = filter.unwrap_or("all projects");
+    println!(
+        "Embedding memories ({}) with {}{}...",
+        scope,
+        embedder.id(),
+        if force { ", rebuilding index" } else { "" }
+    );
+
+    let count = vectorstore::backfill(&database, embedder.as_ref(), store.as_ref(), filter, force)
+        .await?;
+
+    println!("✅ Embedded {} memory(ies)", count);
     Ok(())
 }
 

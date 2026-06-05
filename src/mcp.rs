@@ -1,8 +1,8 @@
 use crate::config::Config;
-use crate::db::{self, Database};
+use crate::db::{self, Database, Memory};
 use crate::embedder::Embedder;
 use crate::vectorstore::{self, VectorStore};
-use crate::{compress, hooks};
+use crate::{compress, hooks, retrieval};
 use anyhow::Result;
 use axum::extract::Request;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -147,25 +147,27 @@ impl IronMemServer {
             ),
             Tool::new(
                 "search_memories",
-                "Full-text search across session memories.",
+                "Hybrid (keyword + semantic) search across session memories.",
                 schema(serde_json::json!({
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Search query" },
                         "project": { "type": "string", "description": "Project root path" },
-                        "limit": { "type": "integer", "description": "Max results (default 10)" }
+                        "limit": { "type": "integer", "description": "Max results (default 10)" },
+                        "semantic": { "type": "boolean", "description": "Blend semantic vector search with keyword search (default true). Set false for keyword-only." }
                     },
                     "required": ["query", "project"]
                 })),
             ),
             Tool::new(
                 "search_global",
-                "Full-text search across all projects.",
+                "Hybrid (keyword + semantic) search across all projects.",
                 schema(serde_json::json!({
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Search query" },
-                        "limit": { "type": "integer", "description": "Max results (default 10)" }
+                        "limit": { "type": "integer", "description": "Max results (default 10)" },
+                        "semantic": { "type": "boolean", "description": "Blend semantic vector search with keyword search (default true). Set false for keyword-only." }
                     },
                     "required": ["query"]
                 })),
@@ -349,21 +351,16 @@ impl IronMemServer {
             .and_then(|v| v.as_i64())
             .unwrap_or(self.config.inject_limit as i64);
         let query = args.get("query").and_then(|v| v.as_str());
+        let semantic = semantic_arg(args);
 
-        let memories = if let Some(q) = query {
-            if !q.is_empty() {
-                db::search_memories(&self.db, project, q, limit)
-                    .await
-                    .unwrap_or_default()
-            } else {
-                db::get_recent_memories(&self.db, project, limit)
-                    .await
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
-            }
-        } else {
-            db::get_recent_memories(&self.db, project, limit)
+        let memories = match query {
+            Some(q) if !q.is_empty() => self
+                .hybrid(Some(project), q, limit, semantic)
                 .await
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                .unwrap_or_default(),
+            _ => db::get_recent_memories(&self.db, project, limit)
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
         };
 
         let json = serde_json::json!({ "memories": memories });
@@ -416,8 +413,10 @@ impl IronMemServer {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ErrorData::invalid_params("missing 'project'", None))?;
         let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10);
+        let semantic = semantic_arg(args);
 
-        let memories = db::search_memories(&self.db, project, query, limit)
+        let memories = self
+            .hybrid(Some(project), query, limit, semantic)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -433,8 +432,10 @@ impl IronMemServer {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ErrorData::invalid_params("missing 'query'", None))?;
         let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10);
+        let semantic = semantic_arg(args);
 
-        let memories = db::search_all_memories(&self.db, query, limit)
+        let memories = self
+            .hybrid(None, query, limit, semantic)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -484,9 +485,17 @@ impl IronMemServer {
             .and_then(|v| v.as_i64())
             .unwrap_or(self.config.inject_limit as i64);
 
-        let memories = db::get_recent_memories(&self.db, project, limit)
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let memories = retrieval::rank_for_injection(
+            &self.db,
+            self.embedder.as_deref(),
+            self.store.as_ref(),
+            project,
+            &self.config.embedding.weights,
+            self.config.embedding.recency_half_life_days,
+            limit as usize,
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         hooks::write_ironmem_file(project, &memories)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -508,9 +517,18 @@ impl IronMemServer {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ErrorData::invalid_params("missing 'project'", None))?;
 
+        // Capture ids before deletion so we can purge their vectors + metadata.
+        let ids = db::memory_ids_for_project(&self.db, project)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let count = db::delete_memories_for_project(&self.db, project)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        for id in ids {
+            if let Err(e) = vectorstore::purge_memory(&self.db, self.store.as_ref(), id).await {
+                tracing::warn!("vector/meta cleanup failed for memory {id}: {e}");
+            }
+        }
 
         let _ = std::fs::remove_file(std::path::Path::new(project).join("IRONMEM.md"));
         let _ = hooks::remove_claude_md_import(project);
@@ -534,6 +552,36 @@ impl IronMemServer {
         )
         .await
     }
+
+    /// Hybrid (keyword + semantic) search. `semantic=false` forces FTS-only.
+    /// With no embedder configured the result is identical to legacy FTS.
+    async fn hybrid(
+        &self,
+        project: Option<&str>,
+        query: &str,
+        limit: i64,
+        semantic: bool,
+    ) -> anyhow::Result<Vec<Memory>> {
+        let embedder = if semantic {
+            self.embedder.as_deref()
+        } else {
+            None
+        };
+        retrieval::hybrid_search(
+            &self.db,
+            embedder,
+            self.store.as_ref(),
+            project,
+            query,
+            limit as usize,
+        )
+        .await
+    }
+}
+
+/// Read the optional `semantic` tool arg (default true).
+fn semantic_arg(args: &JsonObject) -> bool {
+    args.get("semantic").and_then(|v| v.as_bool()).unwrap_or(true)
 }
 
 impl ServerHandler for IronMemServer {

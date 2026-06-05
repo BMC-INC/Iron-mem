@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::embedder::Embedder;
-use crate::vectorstore::VectorStore;
-use crate::{compress, config::Config, db};
+use crate::vectorstore::{self, VectorStore};
+use crate::{compress, config::Config, db, retrieval};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -18,6 +18,22 @@ pub struct AppState {
     pub config: Config,
     pub embedder: Option<Arc<dyn Embedder>>,
     pub store: Arc<dyn VectorStore>,
+}
+
+impl AppState {
+    /// Hybrid (keyword + semantic) search using this server's embedder + store.
+    async fn hybrid(&self, project: Option<&str>, query: &str, limit: i64) -> Vec<db::Memory> {
+        retrieval::hybrid_search(
+            &self.db,
+            self.embedder.as_deref(),
+            self.store.as_ref(),
+            project,
+            query,
+            limit as usize,
+        )
+        .await
+        .unwrap_or_default()
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -197,20 +213,11 @@ async fn get_context(
 ) -> Result<Json<ContextResponse>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(state.config.inject_limit as i64);
 
-    let memories = if let Some(q) = &params.query {
-        if !q.is_empty() {
-            db::search_memories(&state.db, &params.project, q, limit)
-                .await
-                .unwrap_or_else(|_| vec![])
-        } else {
-            db::get_recent_memories(&state.db, &params.project, limit)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        }
-    } else {
-        db::get_recent_memories(&state.db, &params.project, limit)
+    let memories = match &params.query {
+        Some(q) if !q.is_empty() => state.hybrid(Some(&params.project), q, limit).await,
+        _ => db::get_recent_memories(&state.db, &params.project, limit)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
 
     Ok(Json(ContextResponse { memories }))
@@ -289,26 +296,15 @@ async fn api_list_memories(
 ) -> Result<Json<Vec<db::Memory>>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(50);
 
-    let memories = if let Some(project) = &params.project {
-        if let Some(q) = &params.query {
-            db::search_memories(&state.db, project, q, limit)
-                .await
-                .unwrap_or_default()
-        } else {
-            db::get_recent_memories(&state.db, project, limit)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        }
-    } else {
-        if let Some(q) = &params.query {
-            db::search_all_memories(&state.db, q, limit)
-                .await
-                .unwrap_or_default()
-        } else {
-            db::get_all_memories(&state.db, limit)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        }
+    let memories = match (&params.project, &params.query) {
+        (Some(project), Some(q)) => state.hybrid(Some(project), q, limit).await,
+        (Some(project), None) => db::get_recent_memories(&state.db, project, limit)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        (None, Some(q)) => state.hybrid(None, q, limit).await,
+        (None, None) => db::get_all_memories(&state.db, limit)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
 
     Ok(Json(memories))
@@ -321,6 +317,13 @@ async fn api_delete_memory(
     let deleted = db::delete_memory(&state.db, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if deleted {
+        // Best-effort: never fail the delete because vector cleanup hiccuped.
+        if let Err(e) = vectorstore::purge_memory(&state.db, state.store.as_ref(), id).await {
+            tracing::warn!("vector/meta cleanup failed for memory {id}: {e}");
+        }
+    }
 
     Ok(Json(serde_json::json!({ "deleted": deleted })))
 }
