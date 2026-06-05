@@ -245,11 +245,12 @@ ironmem serve --public --no-auth  # Authless public tunnel for claude.ai persona
 ironmem status              # Health check + DB stats
 ironmem projects            # All projects with stored memories
 ironmem list                # Recent memories for current project
-ironmem search "auth middleware"  # Full-text search across memories
+ironmem search "auth middleware"  # Hybrid (keyword + semantic) search across memories
 ironmem search-global "auth middleware"  # Search across all projects
 ironmem sessions            # Session history for current project
-ironmem inject              # Manually rebuild IRONMEM.md
+ironmem inject              # Manually rebuild IRONMEM.md (relevance-ranked)
 ironmem compress <id>       # Manually compress a session
+ironmem embed               # Backfill semantic embeddings for existing memories
 ironmem wipe                # Delete all memories for current project
 ironmem config              # Print current settings
 ```
@@ -492,11 +493,57 @@ The UI shows sessions, memories, and database stats. You can browse, search, and
   "database_url": null,
   "mcp_transport": "stdio",
   "mcp_sse_port": 37779,
-  "auth_token": null
+  "auth_token": null,
+  "embedding": {
+    "provider": "auto",
+    "model": null,
+    "ollama_url": "http://localhost:11434",
+    "weights": { "relevance": 0.5, "recency": 0.3, "importance": 0.2 },
+    "recency_half_life_days": 30
+  }
 }
 ```
 
-All fields optional. Sensible defaults provided. `auth_token` is generated automatically the first time you run `ironmem serve` without `--no-auth`.
+All fields optional. Sensible defaults provided. `auth_token` is generated automatically the first time you run `ironmem serve` without `--no-auth`. The `embedding` block is optional — omit it entirely and IronMem behaves exactly as before (keyword-only search, recency injection).
+
+### Semantic Search & Embeddings
+
+IronMem can blend **keyword (FTS)** and **semantic (vector)** retrieval using [Reciprocal Rank Fusion](https://en.wikipedia.org/wiki/Reciprocal_rank_fusion), and rank session-start injection by a blend of **relevance + recency + importance**. Embeddings are stored locally in SQLite via [`sqlite-vec`](https://github.com/asg017/sqlite-vec) (or pgvector on Postgres); nothing is sent anywhere unless you explicitly choose an API provider.
+
+**Privacy posture:** this is a governance tool, so the default is **local-first / no data egress**. The `auto` provider prefers a local embedder and silently degrades to keyword-only search if none is available — it never phones home and never hard-fails a command.
+
+| `embedding.provider` | Behavior | Data egress |
+|----------------------|----------|-------------|
+| `"auto"` *(default)* | Use local Ollama if reachable, else the built-in ONNX model (if compiled in), else keyword-only | **None** (unless only an API key is configured) |
+| `"ollama"` | Local [Ollama](https://ollama.com) embeddings | **None** (localhost) |
+| `"onnx"` | In-process ONNX model (requires `--features local-onnx` build) | **None** |
+| `"openai"` | OpenAI embeddings API | Sends memory text to OpenAI |
+| `"google"` | Google embeddings API | Sends memory text to Google |
+| `"none"` | Keyword-only FTS + recency injection (legacy behavior) | **None** |
+
+**Recommended local setup (no egress):**
+
+```bash
+# Install Ollama, then pull an embedding model:
+ollama pull nomic-embed-text
+# IronMem's "auto" provider will detect and use it automatically.
+```
+
+**Built-in ONNX (no Ollama, no network):** compile with the optional feature so embeddings run fully in-process:
+
+```bash
+cargo install --path . --features local-onnx
+```
+
+**Blend weights** (`embedding.weights`) control session-start injection ranking: `relevance` (semantic match to your current git context), `recency` (true half-life decay set by `recency_half_life_days`), and `importance` (an LLM-assigned 1–10 score per memory). They need not sum to 1.
+
+**Backfill existing memories** — after enabling embeddings, index memories created before:
+
+```bash
+ironmem embed              # embed memories missing a vector (all projects)
+ironmem embed --project .  # scope to one project
+ironmem embed --force      # rebuild the whole index from scratch
+```
 
 ### Provider
 

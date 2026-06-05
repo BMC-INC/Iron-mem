@@ -255,7 +255,7 @@ impl Embedder for OnnxEmbedder {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let docs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         let raw = {
-            let mut m = self.model.lock().map_err(|_| anyhow!("onnx model poisoned"))?;
+            let m = self.model.lock().map_err(|_| anyhow!("onnx model poisoned"))?;
             m.embed(docs, None)?
         };
         Ok(raw.iter().map(|v| normalize(v)).collect())

@@ -113,6 +113,10 @@ pub fn blended_score(rel: f64, rec: f64, imp: f64, w: &Weights) -> f64 {
 /// Rank recent memories for session-start injection by blended score.
 /// With no `query_vec`/embedder the relevance term is 0 for every candidate,
 /// so the ordering collapses to recency + importance (legacy-compatible).
+// The knobs (db/embedder/store/project/query/weights/half-life/limit) are all
+// independent inputs; bundling them into a struct would obscure more than it
+// clarifies for a single internal ranking function.
+#[allow(clippy::too_many_arguments)]
 pub async fn injection_rank(
     db: &Database,
     embedder: Option<&dyn Embedder>,

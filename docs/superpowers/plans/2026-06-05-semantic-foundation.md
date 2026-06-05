@@ -19,11 +19,11 @@
 
 ---
 
-## Execution Progress — RESUME HERE
+## Execution Progress — COMPLETE ✅
 
-**Status (2026-06-05):** Chunks 1–4 complete and committed; all 15 tests green. Chunks 5–8 remain.
+**Status (2026-06-05):** All 8 chunks complete and committed. **36 tests green** on default features AND `--features local-onnx`; **clippy `-D warnings` clean** on both; **`cargo build --release` links cleanly** (8.3 MB binary, `embed` subcommand verified). Semantic Foundation (Piece 1 of 6) is DONE on branch `feature/semantic-foundation`.
 
-**Branch:** `feature/semantic-foundation` — commits: chunk1 `fe4e7a5`, chunk2 `8529144`, chunk3 `aa7f758`, chunk4 `c6e7234`.
+**Branch:** `feature/semantic-foundation` — commits: chunk1 `fe4e7a5`, chunk2 `8529144`, chunk3 `aa7f758`, chunk4 `c6e7234`, chunk5 `e988ade`, chunk6 `1f952c8`, chunk7 `8430673`.
 
 **CRITICAL build note:** the repo's `target/` contends with the IDE's rust-analyzer on the cargo build lock and will appear to hang for 30+ min. ALWAYS build/test in an isolated target dir, and never pipe a long cargo command through `tail` (it buffers and looks dead):
 ```
@@ -31,16 +31,21 @@ CARGO_TARGET_DIR=/Users/kingjames/.ironmem/target-build CARGO_TERM_PROGRESS_WHEN
 ```
 
 **Done:**
-- ✅ Chunk 1 — deps (`sqlite-vec`, `async-trait`, `libsqlite3-sys` bundled, optional `fastembed`); `embedding_codec`; sqlite-vec loaded via `sqlite3_auto_extension` (vec0 smoke test = the gate, passes).
-- ✅ Chunk 2 — `embeddings` + `memory_meta` tables; `ensure_ann`/`drop_ann`; embedding/meta accessors + `memory_ids_missing_embedding` / `all_memory_ids_with_text`.
-- ✅ Chunk 3 — `EmbeddingConfig` in config.rs; `Embedder` trait + `Ollama`/`Api`/`Onnx`(feature)/`Fake`; `resolve_embedder` chain with dim probe.
-- ✅ Chunk 4 — `VectorStore` trait + `BruteForce`/`SqliteVec`/`PgVector` + `make_vector_store`. **vec0 created with `distance_metric=cosine`** so similarity = `1 - distance`.
+- ✅ Chunk 1 — deps; `embedding_codec`; sqlite-vec loaded via `sqlite3_auto_extension` (vec0 smoke test gate passes).
+- ✅ Chunk 2 — `embeddings` + `memory_meta` tables; `ensure_ann`/`drop_ann`; embedding/meta accessors.
+- ✅ Chunk 3 — `EmbeddingConfig`; `Embedder` trait + `Ollama`/`Api`/`Onnx`(feature)/`Fake`; `resolve_embedder` chain.
+- ✅ Chunk 4 — `VectorStore` trait + `BruteForce`/`SqliteVec`/`PgVector` + `make_vector_store` (`distance_metric=cosine`).
+- ✅ Chunk 5 — `retrieval.rs` (`rrf_fuse`, `hybrid_search`, `recency_weight`, `blended_score`, `injection_rank`, `rank_for_injection`) + `context.rs` (`git_query`).
+- ✅ Chunk 6 — provider `IMPORTANCE` line + `CompressionResult.importance`; shared `compress::run`/`persist` (embed + meta); **folded in Task 22** (servers hold embedder+store via `vectorstore::build_semantic`).
+- ✅ Chunk 7 — hybrid search behind MCP/REST search+context (`semantic` arg); relevance-ranked injection (MCP + CLI); delete-cleanup via `vectorstore::purge_memory` on all 3 deletion paths; `ironmem embed` backfill (`vectorstore::backfill`); config serde tests.
 
-**Next — Chunk 5:** create `retrieval.rs` (`rrf_fuse`, `hybrid_search`, `recency_weight` = `0.5^(age/hl)`, `blended_score`, `injection_rank`) and `context.rs` (`git_query`). Then Chunk 6 (provider `IMPORTANCE` + `compress::run`), Chunk 7 (wire mcp/server/hooks, `ironmem embed` backfill, Task 24b delete-cleanup, config already added in Chunk 3), Chunk 8 (e2e test, docs, clippy `-D warnings`, release build).
+**Bug found + fixed during Ch8 e2e:** `insert_memory` ran `last_insert_rowid()` as a separate query against a 5-connection pool → could return a wrong/zero id. Now acquires one connection for INSERT + rowid read. Was latent (id previously only logged); load-bearing now for meta/embeddings.
 
-**Expected (non-error) dead-code warnings** until wired up in Ch5/Ch7: `drop_ann`, `all_memory_ids_with_text`, `make_vector_store`, `pg_literal`.
+- ✅ Chunk 8 — inline e2e (`src/e2e.rs`); README + CHANGELOG docs; clippy `-D warnings` clean (default + `local-onnx`); `--features local-onnx` and `--release` builds verified.
 
 **Env note:** `claude mcp add ironmem` is blocked by an enterprise MCP policy on this machine (admin allowlist needed); not a code issue.
+
+**Next piece (future):** Piece 2 of the 6-piece roadmap (resume from the spec's roadmap section).
 
 ---
 

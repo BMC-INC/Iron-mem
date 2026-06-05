@@ -265,6 +265,10 @@ impl Database {
 /// Register the sqlite-vec extension so every new SQLite connection gets the
 /// `vec0` virtual table. Must run before any pool connection is opened.
 /// Registered once; safe to call repeatedly.
+// FFI: transmute a bare fn pointer to sqlite's entry-point signature. The
+// explicit annotation would hard-code platform-specific c_char/c_int widths,
+// so we allow the lint here rather than pin those types.
+#[allow(clippy::missing_transmute_annotations)]
 fn register_sqlite_vec() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -421,6 +425,11 @@ pub async fn insert_memory(
 
     match db.backend {
         Backend::Sqlite => {
+            // `memories` is an FTS5 virtual table (no RETURNING support), and
+            // `last_insert_rowid()` is per-connection — so the INSERT and the
+            // rowid read MUST run on the same pooled connection or a 5-way pool
+            // can hand back a wrong/zero id.
+            let mut conn = db.pool.acquire().await?;
             sqlx::query(
                 "INSERT INTO memories (project, session_id, summary, tags, created_at)
                  VALUES ($1, $2, $3, $4, $5)",
@@ -430,11 +439,11 @@ pub async fn insert_memory(
             .bind(summary)
             .bind(tags)
             .bind(now)
-            .execute(&db.pool)
+            .execute(&mut *conn)
             .await?;
 
             let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() as id")
-                .fetch_one(&db.pool)
+                .fetch_one(&mut *conn)
                 .await?;
             Ok(row.get("id"))
         }
@@ -743,6 +752,9 @@ pub async fn upsert_embedding(
     Ok(())
 }
 
+/// Fetch a stored embedding blob. Currently exercised only by tests; kept as a
+/// first-class accessor for the embeddings table.
+#[cfg(test)]
 pub async fn get_embedding(
     db: &Database,
     owner_type: &str,

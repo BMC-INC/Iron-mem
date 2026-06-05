@@ -2,6 +2,8 @@ mod compress;
 mod config;
 mod context;
 mod db;
+#[cfg(test)]
+mod e2e;
 mod embedder;
 mod embedding_codec;
 mod hooks;
