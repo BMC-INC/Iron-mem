@@ -827,6 +827,33 @@ pub async fn memory_ids_missing_embedding(
         .collect())
 }
 
+/// Fetch a single memory by id (rowid in sqlite / id in pg). Used by hybrid
+/// search to materialize vector-only hits in their fused order.
+pub async fn get_memory_by_id(db: &Database, id: i64) -> Result<Option<Memory>> {
+    let query_str = match db.backend {
+        Backend::Sqlite => {
+            "SELECT rowid as id, project, session_id, summary, tags, created_at
+             FROM memories WHERE rowid = $1"
+        }
+        Backend::Postgres => {
+            "SELECT id, project, session_id, summary, tags, created_at
+             FROM memories WHERE id = $1"
+        }
+    };
+    let row: Option<sqlx::any::AnyRow> = sqlx::query(query_str)
+        .bind(id)
+        .fetch_optional(&db.pool)
+        .await?;
+    Ok(row.map(|r| Memory {
+        id: r.get("id"),
+        project: r.get("project"),
+        session_id: r.get("session_id"),
+        summary: r.get("summary"),
+        tags: r.try_get("tags").ok().flatten(),
+        created_at: r.get("created_at"),
+    }))
+}
+
 /// All memory ids + their text (for `embed --force` full re-index).
 pub async fn all_memory_ids_with_text(
     db: &Database,

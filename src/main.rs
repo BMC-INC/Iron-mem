@@ -1,10 +1,12 @@
 mod config;
+mod context;
 mod db;
 mod embedder;
 mod embedding_codec;
 mod hooks;
 mod mcp;
 mod provider;
+mod retrieval;
 mod server;
 mod vectorstore;
 
