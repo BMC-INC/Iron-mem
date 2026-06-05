@@ -21,6 +21,77 @@ pub struct Config {
     pub mcp_sse_port: u16,
     #[serde(default)]
     pub auth_token: Option<String>,
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
+}
+
+/// Semantic-retrieval configuration. Local-first / no-egress by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingConfig {
+    /// auto | ollama | openai | google | onnx | none
+    #[serde(default = "default_embed_provider")]
+    pub provider: String,
+    /// Override the per-provider default model.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_ollama_url")]
+    pub ollama_url: String,
+    #[serde(default)]
+    pub weights: Weights,
+    #[serde(default = "default_half_life")]
+    pub recency_half_life_days: f64,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_embed_provider(),
+            model: None,
+            ollama_url: default_ollama_url(),
+            weights: Weights::default(),
+            recency_half_life_days: default_half_life(),
+        }
+    }
+}
+
+/// Blend weights for session-start injection ranking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Weights {
+    #[serde(default = "default_w_relevance")]
+    pub relevance: f64,
+    #[serde(default = "default_w_recency")]
+    pub recency: f64,
+    #[serde(default = "default_w_importance")]
+    pub importance: f64,
+}
+
+impl Default for Weights {
+    fn default() -> Self {
+        Self {
+            relevance: default_w_relevance(),
+            recency: default_w_recency(),
+            importance: default_w_importance(),
+        }
+    }
+}
+
+fn default_embed_provider() -> String {
+    "auto".to_string()
+}
+fn default_ollama_url() -> String {
+    "http://localhost:11434".to_string()
+}
+fn default_half_life() -> f64 {
+    30.0
+}
+fn default_w_relevance() -> f64 {
+    0.5
+}
+fn default_w_recency() -> f64 {
+    0.3
+}
+fn default_w_importance() -> f64 {
+    0.2
 }
 
 fn default_mcp_transport() -> String {
@@ -45,6 +116,7 @@ impl Default for Config {
             mcp_transport: default_mcp_transport(),
             mcp_sse_port: default_mcp_sse_port(),
             auth_token: None,
+            embedding: EmbeddingConfig::default(),
         }
     }
 }
