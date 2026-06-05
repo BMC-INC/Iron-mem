@@ -224,7 +224,7 @@ impl Database {
         match self.backend {
             Backend::Sqlite => {
                 sqlx::query(&format!(
-                    "CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(memory_id INTEGER PRIMARY KEY, embedding float[{dim}])"
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(memory_id INTEGER PRIMARY KEY, embedding float[{dim}] distance_metric=cosine)"
                 ))
                 .execute(&self.pool)
                 .await?;

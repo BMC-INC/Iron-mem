@@ -6,6 +6,7 @@ mod hooks;
 mod mcp;
 mod provider;
 mod server;
+mod vectorstore;
 
 use anyhow::Result;
 use chrono::{Local, TimeZone};
