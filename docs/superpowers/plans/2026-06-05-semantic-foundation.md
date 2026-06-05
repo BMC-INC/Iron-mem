@@ -19,6 +19,31 @@
 
 ---
 
+## Execution Progress — RESUME HERE
+
+**Status (2026-06-05):** Chunks 1–4 complete and committed; all 15 tests green. Chunks 5–8 remain.
+
+**Branch:** `feature/semantic-foundation` — commits: chunk1 `fe4e7a5`, chunk2 `8529144`, chunk3 `aa7f758`, chunk4 `c6e7234`.
+
+**CRITICAL build note:** the repo's `target/` contends with the IDE's rust-analyzer on the cargo build lock and will appear to hang for 30+ min. ALWAYS build/test in an isolated target dir, and never pipe a long cargo command through `tail` (it buffers and looks dead):
+```
+CARGO_TARGET_DIR=/Users/kingjames/.ironmem/target-build CARGO_TERM_PROGRESS_WHEN=never cargo test
+```
+
+**Done:**
+- ✅ Chunk 1 — deps (`sqlite-vec`, `async-trait`, `libsqlite3-sys` bundled, optional `fastembed`); `embedding_codec`; sqlite-vec loaded via `sqlite3_auto_extension` (vec0 smoke test = the gate, passes).
+- ✅ Chunk 2 — `embeddings` + `memory_meta` tables; `ensure_ann`/`drop_ann`; embedding/meta accessors + `memory_ids_missing_embedding` / `all_memory_ids_with_text`.
+- ✅ Chunk 3 — `EmbeddingConfig` in config.rs; `Embedder` trait + `Ollama`/`Api`/`Onnx`(feature)/`Fake`; `resolve_embedder` chain with dim probe.
+- ✅ Chunk 4 — `VectorStore` trait + `BruteForce`/`SqliteVec`/`PgVector` + `make_vector_store`. **vec0 created with `distance_metric=cosine`** so similarity = `1 - distance`.
+
+**Next — Chunk 5:** create `retrieval.rs` (`rrf_fuse`, `hybrid_search`, `recency_weight` = `0.5^(age/hl)`, `blended_score`, `injection_rank`) and `context.rs` (`git_query`). Then Chunk 6 (provider `IMPORTANCE` + `compress::run`), Chunk 7 (wire mcp/server/hooks, `ironmem embed` backfill, Task 24b delete-cleanup, config already added in Chunk 3), Chunk 8 (e2e test, docs, clippy `-D warnings`, release build).
+
+**Expected (non-error) dead-code warnings** until wired up in Ch5/Ch7: `drop_ann`, `all_memory_ids_with_text`, `make_vector_store`, `pg_literal`.
+
+**Env note:** `claude mcp add ironmem` is blocked by an enterprise MCP policy on this machine (admin allowlist needed); not a code issue.
+
+---
+
 ## File Structure
 
 | File | Status | Responsibility |
