@@ -37,7 +37,12 @@ impl Provider {
 pub struct CompressionResult {
     pub summary: String,
     pub tags: String,
+    /// LLM-estimated importance, 1 (trivial) – 10 (critical). Defaults to 5.
+    pub importance: u8,
 }
+
+/// Default importance when the model omits or mangles the IMPORTANCE line.
+const DEFAULT_IMPORTANCE: u8 = 5;
 
 // ── Shared prompt builder ───────────────────────────────────────────
 
@@ -75,6 +80,10 @@ fn build_prompt(observations: &[Observation]) -> String {
         "TAGS: [8-12 space-separated lowercase keywords: technologies, file names, concepts]"
             .to_string(),
     );
+    lines.push(
+        "IMPORTANCE: [single integer 1-10 — how important this session is to remember long-term: 1 trivial/exploratory, 10 critical decisions or lasting changes]"
+            .to_string(),
+    );
 
     lines.join("\n")
 }
@@ -82,12 +91,15 @@ fn build_prompt(observations: &[Observation]) -> String {
 fn parse_response(text: &str) -> CompressionResult {
     let mut summary = String::new();
     let mut tags = String::new();
+    let mut importance: Option<u8> = None;
 
     for line in text.lines() {
         if let Some(s) = line.strip_prefix("SUMMARY:") {
             summary = s.trim().to_string();
         } else if let Some(t) = line.strip_prefix("TAGS:") {
             tags = t.trim().to_string();
+        } else if let Some(i) = line.strip_prefix("IMPORTANCE:") {
+            importance = parse_importance(i);
         }
     }
 
@@ -96,7 +108,26 @@ fn parse_response(text: &str) -> CompressionResult {
         tags = "session coding".to_string();
     }
 
-    CompressionResult { summary, tags }
+    CompressionResult {
+        summary,
+        tags,
+        importance: importance.unwrap_or(DEFAULT_IMPORTANCE),
+    }
+}
+
+/// Parse the IMPORTANCE value, taking the first integer found and clamping to
+/// 1..=10. Returns `None` if no integer is present (caller applies the default).
+fn parse_importance(s: &str) -> Option<u8> {
+    let digits: String = s
+        .trim()
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits
+        .parse::<i64>()
+        .ok()
+        .map(|n| n.clamp(1, 10) as u8)
 }
 
 // ── API key resolution ──────────────────────────────────────────────
@@ -337,4 +368,34 @@ async fn compress_google(prompt: &str, model: &str, api_key: &str) -> Result<Com
         .ok_or_else(|| anyhow!("No content in Gemini response"))?;
 
     Ok(parse_response(&text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_importance_line() {
+        let r = parse_response("SUMMARY: did things\nTAGS: a b c\nIMPORTANCE: 8");
+        assert_eq!(r.importance, 8);
+        assert_eq!(r.summary, "did things");
+    }
+
+    #[test]
+    fn missing_importance_defaults_to_five() {
+        let r = parse_response("SUMMARY: did things\nTAGS: a b c");
+        assert_eq!(r.importance, DEFAULT_IMPORTANCE);
+    }
+
+    #[test]
+    fn importance_clamps_out_of_range() {
+        assert_eq!(parse_response("SUMMARY: s\nIMPORTANCE: 0").importance, 1);
+        assert_eq!(parse_response("SUMMARY: s\nIMPORTANCE: 42").importance, 10);
+    }
+
+    #[test]
+    fn importance_tolerates_extra_text() {
+        let r = parse_response("SUMMARY: s\nIMPORTANCE: 7 (lasting change)");
+        assert_eq!(r.importance, 7);
+    }
 }

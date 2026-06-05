@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use sqlx::Row;
 use std::sync::Arc;
 
+use crate::config::Config;
 use crate::db::{self, Backend, Database};
+use crate::embedder::{resolve_embedder, Embedder};
 use crate::embedding_codec::{decode, dot, encode};
 
 /// How many ANN candidates to pull before applying the project filter.
@@ -262,6 +264,22 @@ impl VectorStore for PgVectorStore {
             .execute(&db.pool)
             .await?;
         Ok(())
+    }
+}
+
+/// Resolve the configured embedder (if any) and the matching vector store in
+/// one step. With no embedder (provider="none" or nothing reachable) the store
+/// is brute-force and search degrades to FTS — never an error.
+pub async fn build_semantic(
+    db: &Database,
+    cfg: &Config,
+) -> (Option<Arc<dyn Embedder>>, Arc<dyn VectorStore>) {
+    match resolve_embedder(cfg).await {
+        Some(embedder) => {
+            let store = make_vector_store(db, embedder.dim()).await;
+            (Some(embedder), store)
+        }
+        None => (None, Arc::new(BruteForceStore)),
     }
 }
 

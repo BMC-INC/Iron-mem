@@ -8,12 +8,16 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::{config::Config, db, provider};
+use crate::embedder::Embedder;
+use crate::vectorstore::VectorStore;
+use crate::{compress, config::Config, db};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: db::Database,
     pub config: Config,
+    pub embedder: Option<Arc<dyn Embedder>>,
+    pub store: Arc<dyn VectorStore>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -240,32 +244,14 @@ async fn get_status(
 
 // Shared compression logic
 async fn run_compression(state: &AppState, session_id: &str) -> anyhow::Result<i64> {
-    let session = db::get_session(&state.db, session_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
-
-    let observations = db::get_observations_for_session(&state.db, session_id).await?;
-
-    let result = provider::compress(&observations, &state.config).await?;
-
-    let memory_id = db::insert_memory(
+    compress::run(
         &state.db,
-        &session.project,
+        state.embedder.as_deref(),
+        state.store.as_ref(),
+        &state.config,
         session_id,
-        &result.summary,
-        Some(&result.tags),
     )
-    .await?;
-
-    db::mark_compressed(&state.db, session_id).await?;
-
-    tracing::info!(
-        "Session {} compressed → memory_id={}",
-        session_id,
-        memory_id
-    );
-
-    Ok(memory_id)
+    .await
 }
 
 // ── Web UI ──────────────────────────────────────────────────────────

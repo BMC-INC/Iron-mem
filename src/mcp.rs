@@ -1,6 +1,8 @@
 use crate::config::Config;
 use crate::db::{self, Database};
-use crate::{hooks, provider};
+use crate::embedder::Embedder;
+use crate::vectorstore::{self, VectorStore};
+use crate::{compress, hooks};
 use anyhow::Result;
 use axum::extract::Request;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -55,6 +57,8 @@ fn with_optional_bearer_auth(router: axum::Router, auth_token: Option<String>) -
 pub struct IronMemServer {
     db: Arc<Database>,
     config: Arc<Config>,
+    embedder: Option<Arc<dyn Embedder>>,
+    store: Arc<dyn VectorStore>,
 }
 
 impl IronMemServer {
@@ -521,32 +525,14 @@ impl IronMemServer {
     }
 
     async fn run_compression(&self, session_id: &str) -> anyhow::Result<i64> {
-        let session = db::get_session(&self.db, session_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
-
-        let observations = db::get_observations_for_session(&self.db, session_id).await?;
-
-        let result = provider::compress(&observations, &self.config).await?;
-
-        let memory_id = db::insert_memory(
+        compress::run(
             &self.db,
-            &session.project,
+            self.embedder.as_deref(),
+            self.store.as_ref(),
+            &self.config,
             session_id,
-            &result.summary,
-            Some(&result.tags),
         )
-        .await?;
-
-        db::mark_compressed(&self.db, session_id).await?;
-
-        tracing::info!(
-            "Session {} compressed → memory_id={}",
-            session_id,
-            memory_id
-        );
-
-        Ok(memory_id)
+        .await
     }
 }
 
@@ -593,9 +579,12 @@ impl ServerHandler for IronMemServer {
 }
 
 pub async fn run_stdio(db: Arc<Database>, config: Config) -> Result<()> {
+    let (embedder, store) = vectorstore::build_semantic(&db, &config).await;
     let server = IronMemServer {
         db,
         config: Arc::new(config),
+        embedder,
+        store,
     };
 
     let service = server.serve(rmcp::transport::stdio()).await?;
@@ -608,9 +597,12 @@ pub async fn run_streamable_http(
     config: Config,
     bind: SocketAddr,
 ) -> Result<()> {
+    let (embedder, store) = vectorstore::build_semantic(&db, &config).await;
     let server = IronMemServer {
         db,
         config: Arc::new(config),
+        embedder,
+        store,
     };
     let auth_token = server.config.auth_token.clone();
 

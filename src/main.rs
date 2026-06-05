@@ -1,3 +1,4 @@
+mod compress;
 mod config;
 mod context;
 mod db;
@@ -178,9 +179,12 @@ async fn run_server(cfg: config::Config) -> Result<()> {
     let addr = format!("127.0.0.1:{}", cfg.port);
     tracing::info!("ironmem REST server listening on http://{}", addr);
 
+    let (embedder, store) = vectorstore::build_semantic(&rest_db, &rest_cfg).await;
     let state = server::AppState {
         db: (*rest_db).clone(),
         config: rest_cfg,
+        embedder,
+        store,
     };
     let app = server::router(state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -566,7 +570,8 @@ async fn run_inject(cfg: &config::Config, project: Option<&str>, limit: i64) -> 
 async fn run_compress_cmd(cfg: &config::Config, session_id: &str) -> Result<()> {
     let database = db::Database::new(&cfg.effective_database_url()).await?;
     database.migrate().await?;
-    let session = db::get_session(&database, session_id)
+    // Surface a friendly error early if the session doesn't exist.
+    db::get_session(&database, session_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
@@ -582,20 +587,15 @@ async fn run_compress_cmd(cfg: &config::Config, session_id: &str) -> Result<()> 
         cfg.model
     );
 
-    let result = provider::compress(&observations, cfg).await?;
-    let memory_id = db::insert_memory(
-        &database,
-        &session.project,
-        session_id,
-        &result.summary,
-        Some(&result.tags),
-    )
-    .await?;
-    db::mark_compressed(&database, session_id).await?;
+    let (embedder, store) = vectorstore::build_semantic(&database, cfg).await;
+    let memory_id =
+        compress::run(&database, embedder.as_deref(), store.as_ref(), cfg, session_id).await?;
 
     println!("✅ Memory created (id={})", memory_id);
-    println!("\nSummary:\n{}", result.summary);
-    println!("\nTags: {}", result.tags);
+    if let Some(memory) = db::get_memory_by_id(&database, memory_id).await? {
+        println!("\nSummary:\n{}", memory.summary);
+        println!("\nTags: {}", memory.tags.unwrap_or_default());
+    }
     Ok(())
 }
 
