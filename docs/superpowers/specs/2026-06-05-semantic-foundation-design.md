@@ -167,7 +167,7 @@ Encoding helpers (`embedding_codec`): `encode(&[f32]) -> Vec<u8>` (LE) and `deco
 ### 8.2 Blended injection (session start)
 `injection_rank(db, embedder, store, project, query_vec, limit) -> Vec<Memory>`:
 - `relevance(m)` = `store.knn` similarity for `m` (0 if no vector/embedder).
-- `recency(m)` = `exp(-age_seconds / (half_life_days * 86400))`.
+- `recency(m)` = `0.5 ^ (age_seconds / (half_life_days * 86400))` — a true half-life: weight 1.0 at age 0, exactly 0.5 at one half-life, →0 as age grows.
 - `importance(m)` = `memory_meta.importance` (default 0.5).
 - `score(m) = w_r*relevance + w_t*recency + w_i*importance` (defaults `w_r=0.5, w_t=0.3, w_i=0.2`, `half_life_days=30`; all in config).
 - No embedder / no `query_vec` → `w_r` treated as 0 and ranking falls back to recency+importance (and to pure recency if `memory_meta` is empty) — i.e. today's behavior or better.
