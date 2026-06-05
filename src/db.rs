@@ -66,6 +66,7 @@ pub struct SessionHistoryEntry {
 
 impl Database {
     pub async fn new(url: &str) -> Result<Self> {
+        register_sqlite_vec();
         sqlx::any::install_default_drivers();
         let (db_url, backend) =
             if url.starts_with("postgres://") || url.starts_with("postgresql://") {
@@ -183,6 +184,19 @@ impl Database {
 
         Ok(())
     }
+}
+
+/// Register the sqlite-vec extension so every new SQLite connection gets the
+/// `vec0` virtual table. Must run before any pool connection is opened.
+/// Registered once; safe to call repeatedly.
+fn register_sqlite_vec() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        libsqlite3_sys::sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    });
 }
 
 fn sqlite_file_url(path: &std::path::Path) -> String {
@@ -666,6 +680,30 @@ mod tests {
         let db = Database::new(&db_path_string).await?;
         db.migrate().await?;
         Ok((db, db_path_string))
+    }
+
+    #[tokio::test]
+    async fn sqlite_vec_extension_loads_and_knn_runs() -> Result<()> {
+        let (db, path) = test_db().await?;
+        sqlx::query(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vt_smoke USING vec0(id INTEGER PRIMARY KEY, embedding float[3])",
+        )
+        .execute(&db.pool)
+        .await?;
+        let blob = crate::embedding_codec::encode(&crate::embedding_codec::normalize(&[1.0, 0.0, 0.0]));
+        sqlx::query("INSERT INTO vt_smoke(id, embedding) VALUES (1, ?)")
+            .bind(blob.clone())
+            .execute(&db.pool)
+            .await?;
+        let rows: Vec<sqlx::any::AnyRow> = sqlx::query(
+            "SELECT id, distance FROM vt_smoke WHERE embedding MATCH ? AND k = 1 ORDER BY distance",
+        )
+        .bind(blob)
+        .fetch_all(&db.pool)
+        .await?;
+        assert_eq!(rows.len(), 1);
+        let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[tokio::test]

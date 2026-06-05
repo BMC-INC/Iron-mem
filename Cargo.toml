@@ -46,6 +46,17 @@ dirs = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Embeddings & vector search
+async-trait = "0.1"
+sqlite-vec = "0.1"
+# Must match the libsqlite3-sys that sqlx 0.8 bundles (0.30.x) so there is ONE statically linked sqlite.
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+fastembed = { version = "4", optional = true }
+
+[features]
+default = []
+local-onnx = ["dep:fastembed"]
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 

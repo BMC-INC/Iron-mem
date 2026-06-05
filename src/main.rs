@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod embedding_codec;
 mod hooks;
 mod mcp;
 mod provider;
