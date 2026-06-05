@@ -182,6 +182,82 @@ impl Database {
             }
         }
 
+        // ── Semantic retrieval: canonical embeddings + memory metadata ──
+        let blob_type = match self.backend {
+            Backend::Sqlite => "BLOB",
+            Backend::Postgres => "BYTEA",
+        };
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS embeddings (
+                owner_type TEXT NOT NULL,
+                owner_id   BIGINT NOT NULL,
+                model      TEXT NOT NULL,
+                dim        INTEGER NOT NULL,
+                embedding  {blob_type} NOT NULL,
+                created_at BIGINT NOT NULL,
+                PRIMARY KEY (owner_type, owner_id, model)
+            )"
+        ))
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_embeddings_owner ON embeddings(owner_type, owner_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS memory_meta (
+                memory_id  BIGINT NOT NULL PRIMARY KEY,
+                importance REAL NOT NULL DEFAULT 0.5,
+                created_at BIGINT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Lazily create the per-backend ANN structure sized for `dim`.
+    /// SQLite: a `vec0` virtual table. Postgres: pgvector table + HNSW index.
+    pub async fn ensure_ann(&self, dim: usize) -> Result<()> {
+        match self.backend {
+            Backend::Sqlite => {
+                sqlx::query(&format!(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(memory_id INTEGER PRIMARY KEY, embedding float[{dim}])"
+                ))
+                .execute(&self.pool)
+                .await?;
+            }
+            Backend::Postgres => {
+                // .ok(): degrade to brute-force if the server lacks pgvector / privileges.
+                sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+                    .execute(&self.pool)
+                    .await
+                    .ok();
+                sqlx::query(&format!(
+                    "CREATE TABLE IF NOT EXISTS memory_embeddings (memory_id BIGINT PRIMARY KEY, embedding vector({dim}))"
+                ))
+                .execute(&self.pool)
+                .await?;
+                sqlx::query(
+                    "CREATE INDEX IF NOT EXISTS idx_memory_embeddings_hnsw ON memory_embeddings USING hnsw (embedding vector_cosine_ops)",
+                )
+                .execute(&self.pool)
+                .await
+                .ok();
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop ANN structures (used by `embed --force` on a dim change).
+    pub async fn drop_ann(&self) -> Result<()> {
+        let q = match self.backend {
+            Backend::Sqlite => "DROP TABLE IF EXISTS vec_memories",
+            Backend::Postgres => "DROP TABLE IF EXISTS memory_embeddings",
+        };
+        sqlx::query(q).execute(&self.pool).await?;
         Ok(())
     }
 }
@@ -626,6 +702,161 @@ pub async fn get_all_memories(db: &Database, limit: i64) -> Result<Vec<Memory>> 
         .collect())
 }
 
+// Embeddings & memory metadata
+
+/// Upsert the canonical embedding row for a memory/fact/entity.
+pub async fn upsert_embedding(
+    db: &Database,
+    owner_type: &str,
+    owner_id: i64,
+    model: &str,
+    dim: i64,
+    embedding: &[u8],
+) -> Result<()> {
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO embeddings(owner_type, owner_id, model, dim, embedding, created_at)
+         VALUES($1, $2, $3, $4, $5, $6)
+         ON CONFLICT(owner_type, owner_id, model)
+         DO UPDATE SET embedding = excluded.embedding, dim = excluded.dim, created_at = excluded.created_at",
+    )
+    .bind(owner_type)
+    .bind(owner_id)
+    .bind(model)
+    .bind(dim)
+    .bind(embedding.to_vec())
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_embedding(
+    db: &Database,
+    owner_type: &str,
+    owner_id: i64,
+    model: &str,
+) -> Result<Option<Vec<u8>>> {
+    let row: Option<sqlx::any::AnyRow> = sqlx::query(
+        "SELECT embedding FROM embeddings WHERE owner_type = $1 AND owner_id = $2 AND model = $3",
+    )
+    .bind(owner_type)
+    .bind(owner_id)
+    .bind(model)
+    .fetch_optional(&db.pool)
+    .await?;
+    Ok(row.map(|r| r.get::<Vec<u8>, _>("embedding")))
+}
+
+pub async fn delete_embedding(db: &Database, owner_type: &str, owner_id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM embeddings WHERE owner_type = $1 AND owner_id = $2")
+        .bind(owner_type)
+        .bind(owner_id)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn upsert_memory_meta(db: &Database, memory_id: i64, importance: f64) -> Result<()> {
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO memory_meta(memory_id, importance, created_at)
+         VALUES($1, $2, $3)
+         ON CONFLICT(memory_id) DO UPDATE SET importance = excluded.importance",
+    )
+    .bind(memory_id)
+    .bind(importance)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_memory_meta(db: &Database, memory_id: i64) -> Result<f64> {
+    let row: Option<sqlx::any::AnyRow> =
+        sqlx::query("SELECT importance FROM memory_meta WHERE memory_id = $1")
+            .bind(memory_id)
+            .fetch_optional(&db.pool)
+            .await?;
+    Ok(row.map(|r| r.get::<f64, _>("importance")).unwrap_or(0.5))
+}
+
+pub async fn delete_memory_meta(db: &Database, memory_id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM memory_meta WHERE memory_id = $1")
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+/// Memory ids (rowid in sqlite / id in pg) with no embedding row for `model`,
+/// along with their summary + tags (the text to embed).
+pub async fn memory_ids_missing_embedding(
+    db: &Database,
+    model: &str,
+    project: Option<&str>,
+) -> Result<Vec<(i64, String, Option<String>)>> {
+    let id_col = match db.backend {
+        Backend::Sqlite => "rowid",
+        Backend::Postgres => "id",
+    };
+    let mut sql = format!(
+        "SELECT m.{id_col} AS id, m.summary AS summary, m.tags AS tags FROM memories m
+         WHERE NOT EXISTS (
+            SELECT 1 FROM embeddings e
+            WHERE e.owner_type = 'memory' AND e.owner_id = m.{id_col} AND e.model = $1
+         )"
+    );
+    if project.is_some() {
+        sql.push_str(" AND m.project = $2");
+    }
+    let mut q = sqlx::query(&sql).bind(model);
+    if let Some(p) = project {
+        q = q.bind(p);
+    }
+    let rows = q.fetch_all(&db.pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<i64, _>("id"),
+                r.get::<String, _>("summary"),
+                r.try_get::<Option<String>, _>("tags").ok().flatten(),
+            )
+        })
+        .collect())
+}
+
+/// All memory ids + their text (for `embed --force` full re-index).
+pub async fn all_memory_ids_with_text(
+    db: &Database,
+    project: Option<&str>,
+) -> Result<Vec<(i64, String, Option<String>)>> {
+    let id_col = match db.backend {
+        Backend::Sqlite => "rowid",
+        Backend::Postgres => "id",
+    };
+    let mut sql = format!("SELECT m.{id_col} AS id, m.summary AS summary, m.tags AS tags FROM memories m");
+    if project.is_some() {
+        sql.push_str(" WHERE m.project = $1");
+    }
+    let mut q = sqlx::query(&sql);
+    if let Some(p) = project {
+        q = q.bind(p);
+    }
+    let rows = q.fetch_all(&db.pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<i64, _>("id"),
+                r.get::<String, _>("summary"),
+                r.try_get::<Option<String>, _>("tags").ok().flatten(),
+            )
+        })
+        .collect())
+}
+
 // Stats
 
 pub struct DbStats {
@@ -702,6 +933,43 @@ mod tests {
         .fetch_all(&db.pool)
         .await?;
         assert_eq!(rows.len(), 1);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embeddings_meta_and_ann_roundtrip() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let s = create_session(&db, "/tmp/p").await?;
+        insert_memory(&db, "/tmp/p", &s, "auth middleware fix", Some("auth")).await?;
+
+        let emb = crate::embedding_codec::encode(&crate::embedding_codec::normalize(&[1.0, 0.0, 0.0]));
+        upsert_embedding(&db, "memory", 1, "m", 3, &emb).await?;
+        assert_eq!(get_embedding(&db, "memory", 1, "m").await?, Some(emb.clone()));
+
+        // meta: default when absent, then upsert
+        assert_eq!(get_memory_meta(&db, 999).await?, 0.5);
+        upsert_memory_meta(&db, 1, 0.8).await?;
+        assert!((get_memory_meta(&db, 1).await? - 0.8).abs() < 1e-9);
+
+        // ANN table usable
+        db.ensure_ann(3).await?;
+        sqlx::query("INSERT INTO vec_memories(memory_id, embedding) VALUES (1, ?)")
+            .bind(emb)
+            .execute(&db.pool)
+            .await?;
+
+        // missing-embedding listing keys off the model
+        let missing = memory_ids_missing_embedding(&db, "other", None).await?;
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, 1);
+        assert!(memory_ids_missing_embedding(&db, "m", None).await?.is_empty());
+
+        // delete cleans up
+        delete_embedding(&db, "memory", 1).await?;
+        delete_memory_meta(&db, 1).await?;
+        assert_eq!(get_embedding(&db, "memory", 1, "m").await?, None);
+
         let _ = std::fs::remove_file(path);
         Ok(())
     }
