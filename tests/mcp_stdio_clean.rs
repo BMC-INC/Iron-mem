@@ -14,9 +14,21 @@ fn mcp_stdio_stdout_is_pure_json() {
     let db = std::env::temp_dir().join(format!("ironmem-stdio-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&db);
 
+    // Build a sqlx-valid sqlite URL on BOTH platforms (mirrors db::sqlite_file_url):
+    // a Unix abs path already starts with '/', but a Windows `C:\…` path needs an
+    // extra leading '/' and forward slashes → `sqlite:///C:/…`. Passing the raw
+    // `C:\…` (two slashes) makes sqlx treat the drive as the URL authority and the
+    // server fails to open the DB, producing empty stdout.
+    let p = db.to_string_lossy().replace('\\', "/");
+    let url = if p.as_bytes().get(1) == Some(&b':') {
+        format!("sqlite:///{p}?mode=rwc")
+    } else {
+        format!("sqlite://{p}?mode=rwc")
+    };
+
     let mut child = Command::new(bin)
         .arg("mcp")
-        .env("DATABASE_URL", format!("sqlite://{}?mode=rwc", db.display()))
+        .env("DATABASE_URL", &url)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
