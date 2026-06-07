@@ -11,6 +11,7 @@ mod mcp;
 mod provider;
 mod retrieval;
 mod server;
+mod strutil;
 mod vectorstore;
 
 use anyhow::Result;

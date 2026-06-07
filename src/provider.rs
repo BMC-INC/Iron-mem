@@ -56,20 +56,16 @@ fn build_prompt(observations: &[Observation]) -> String {
     for (i, obs) in observations.iter().enumerate() {
         lines.push(format!("{}. Tool: {}", i + 1, obs.tool));
         if let Some(input) = &obs.input {
-            let display = if input.len() > 500 {
-                format!("{}... [truncated]", &input[..500])
-            } else {
-                input.clone()
-            };
-            lines.push(format!("   Input: {}", display));
+            lines.push(format!(
+                "   Input: {}",
+                crate::strutil::safe_truncate(input, 500)
+            ));
         }
         if let Some(output) = &obs.output {
-            let display = if output.len() > 300 {
-                format!("{}... [truncated]", &output[..300])
-            } else {
-                output.clone()
-            };
-            lines.push(format!("   Output: {}", display));
+            lines.push(format!(
+                "   Output: {}",
+                crate::strutil::safe_truncate(output, 300)
+            ));
         }
     }
 
