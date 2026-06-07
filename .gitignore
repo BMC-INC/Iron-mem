@@ -4,3 +4,12 @@ LAUNCH_ANNOUNCEMENT.md
 SOCIAL_MEDIA_PLAN.md
 /launch/
 IRONMEM.md
+
+# Local isolated build dirs (avoid rust-analyzer target/ lock contention)
+/target-test
+/target-onnx
+
+# iCloud Drive sync-conflict duplicates ("<name> 2.<ext>", "<name> 2/")
+* 2.*
+* 2
+* 2/

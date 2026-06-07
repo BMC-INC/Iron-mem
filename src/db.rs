@@ -351,14 +351,10 @@ pub async fn insert_observation(
 ) -> Result<i64> {
     let now = Utc::now().timestamp();
 
-    // Truncate output to max_bytes
-    let truncated_output = output.map(|o| {
-        if o.len() > max_bytes {
-            format!("{}... [truncated]", &o[..max_bytes])
-        } else {
-            o.to_string()
-        }
-    });
+    // Truncate output to max_bytes on a UTF-8 char boundary. A raw `&o[..n]`
+    // slice panics when `n` lands inside a multibyte char — and under the
+    // release profile's `panic="abort"` that takes the whole MCP server down.
+    let truncated_output = output.map(|o| crate::strutil::safe_truncate(o, max_bytes));
 
     let row: sqlx::any::AnyRow = sqlx::query(
         "INSERT INTO observations (session_id, project, tool, input, output, created_at)
@@ -1164,6 +1160,28 @@ mod tests {
         assert_eq!(sessions[0].tags.as_deref(), Some("auth,docs"));
 
         let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn insert_observation_truncates_multibyte_without_panicking() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let s = create_session(&db, "/tmp/p").await?;
+
+        // 'a'..'g' = 7 ASCII bytes, then '✓' (3 bytes) starts at byte 7, so a
+        // cap of 8 lands in the MIDDLE of '✓'. The old `&o[..8]` slice panicked
+        // here; under release `panic="abort"` that kills the MCP process.
+        let output = "abcdefg✓✓✓✓✓ tail";
+        let id = insert_observation(&db, &s, "/tmp/p", "Read", None, Some(output), 8).await?;
+        assert!(id > 0, "insert must succeed, not panic");
+
+        let obs = get_observations_for_session(&db, &s).await?;
+        assert_eq!(obs.len(), 1);
+        let stored = obs[0].output.as_deref().unwrap();
+        assert!(stored.starts_with("abcdefg"));
+        assert!(stored.ends_with("… [truncated]"));
+
+        let _ = std::fs::remove_file(path);
         Ok(())
     }
 }
