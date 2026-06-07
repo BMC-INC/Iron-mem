@@ -723,6 +723,13 @@ This starts IronMem with Streamable HTTP on `http://localhost:37779/mcp` and Pos
 - [x] Windows native support — `install.ps1`, platform-aware install messages, robust home dir detection
 - [x] Web UI memory browser — `http://localhost:37778/ui` when REST server is running
 
+### In progress / next
+
+- [x] **Semantic foundation** — hybrid FTS + vector (RRF) retrieval, local-first embeddings, and relevance-ranked session-start injection (see CHANGELOG `[Unreleased]`)
+- [x] **Reliability & security hardening** — stdio MCP stream is no longer corrupted by log output, UTF-8-safe truncation prevents a crash on multibyte tool output, and 7 dependency advisories were patched
+- [ ] **CCR — losslessly reversible memory** (Headroom pattern): a content-addressed blob store + byte-exact per-content-type compression + a `retrieve_original` tool, so the verbatim original behind any compressed memory is always recoverable — no more lossy truncation. [Design »](docs/superpowers/plans/2026-06-07-ironmem-ccr-supermemory.md)
+- [ ] **Memory scoping & types** (Supermemory patterns): project vs. user (cross-project) scope, typed memories (error-solution / preference / architecture / learned-pattern), and an always-injected user profile
+
 ---
 
 ## Contributing
