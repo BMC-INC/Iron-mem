@@ -146,11 +146,18 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Logs MUST go to stderr, never stdout: in `ironmem mcp` (stdio transport)
+    // stdout carries the JSON-RPC stream, so a single log line there corrupts it
+    // — the MCP client sees the `2026-…` timestamp and rejects the message
+    // ("Unexpected token … is not valid JSON"). ANSI off so captured logs
+    // (server.log via launchd) stay free of escape codes too.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("ironmem=info".parse().unwrap()),
         )
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
         .init();
 
     let cli = Cli::parse();
