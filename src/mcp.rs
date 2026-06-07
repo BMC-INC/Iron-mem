@@ -654,11 +654,11 @@ pub async fn run_streamable_http(
     };
     let auth_token = server.config.auth_token.clone();
 
-    let http_config = StreamableHttpServerConfig {
-        json_response: true,
-        stateful_mode: false,
-        ..Default::default()
-    };
+    // rmcp >=1.4 marks StreamableHttpServerConfig #[non_exhaustive], so it can no
+    // longer be built with a struct literal — start from Default and set fields.
+    let mut http_config = StreamableHttpServerConfig::default();
+    http_config.json_response = true;
+    http_config.stateful_mode = false;
 
     let session_manager = Arc::new(LocalSessionManager::default());
     let service =
