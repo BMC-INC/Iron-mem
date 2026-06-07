@@ -27,7 +27,7 @@
 
 **CRITICAL build note:** the repo's `target/` contends with the IDE's rust-analyzer on the cargo build lock and will appear to hang for 30+ min. ALWAYS build/test in an isolated target dir, and never pipe a long cargo command through `tail` (it buffers and looks dead):
 ```
-CARGO_TARGET_DIR=/Users/kingjames/.ironmem/target-build CARGO_TERM_PROGRESS_WHEN=never cargo test
+CARGO_TARGET_DIR=~/.ironmem/target-build CARGO_TERM_PROGRESS_WHEN=never cargo test
 ```
 
 **Done:**

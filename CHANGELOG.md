@@ -21,7 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MCP stdio transport corrupted by log output** — `tracing` wrote to stdout, but in `ironmem mcp` stdout *is* the JSON-RPC stream, so a startup log line (e.g. `Embedder: none`) made clients reject the connection with `Unexpected token … is not valid JSON`. Logs now go to stderr with ANSI disabled.
+- **Crash on multibyte tool output** — observation and prompt truncation sliced strings on raw byte offsets; a multibyte character on the cap boundary panicked, and under the release profile's `panic = "abort"` that took down the entire MCP process mid-session. All truncation now backs up to a UTF-8 char boundary via `strutil::safe_truncate`.
 - `insert_memory` now reads the new rowid on the same pooled connection as the INSERT, fixing a latent bug where a 5-connection pool could return a wrong/zero id (previously harmless when the id was only logged; now load-bearing for embeddings + metadata).
+
+### Security
+
+- Patched 7 Dependabot advisories: **rmcp** 1.2 → 1.7 (GHSA-89vp-x53w-74fx, high), **rustls-webpki** 0.103.10 → 0.103.13 (GHSA-82j2-j2ch-gfr8 high, plus GHSA-965h-392x-2mh5 / GHSA-xgp8-3hg3-c2mh), and **rand** → 0.8.6 / 0.9.3 / 0.10.1 (GHSA-cq8v-f236-94qc).
 
 ## [0.1.0] - 2026-03-20
 
