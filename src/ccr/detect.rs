@@ -12,6 +12,20 @@ pub enum ContentType {
     Binary,
 }
 
+impl ContentType {
+    /// Stable lowercase tag persisted in the `blobs.content_type` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentType::Json => "json",
+            ContentType::Code => "code",
+            ContentType::Log => "log",
+            ContentType::Diff => "diff",
+            ContentType::Text => "text",
+            ContentType::Binary => "binary",
+        }
+    }
+}
+
 /// Detect the content type of `bytes`.
 ///
 /// `path_hint` is an optional file extension (without the leading dot, e.g.
