@@ -44,6 +44,7 @@ pub fn router(state: AppState) -> Router {
         .route("/compress", post(compress_session))
         .route("/context", get(get_context))
         .route("/status", get(get_status))
+        .route("/retrieve_original", post(retrieve_original))
         // Web UI routes
         .route("/ui", get(web_ui))
         .route("/api/projects", get(api_list_projects))
@@ -170,6 +171,56 @@ async fn record_event(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(EventResponse { id }))
+}
+
+// POST /retrieve_original  (CCR: pull back the verbatim original)
+#[derive(Deserialize)]
+pub struct RetrieveOriginalRequest {
+    pub observation_id: Option<i64>,
+    pub hash: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct RetrieveOriginalResponse {
+    pub hash: String,
+    pub bytes: usize,
+    pub original: String,
+}
+
+async fn retrieve_original(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RetrieveOriginalRequest>,
+) -> Result<Json<RetrieveOriginalResponse>, (StatusCode, String)> {
+    let hash = match body.hash {
+        Some(h) => h,
+        None => match body.observation_id {
+            Some(oid) => db::get_observation_output_blob(&state.db, oid)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!("observation {oid} has no stored original"),
+                    )
+                })?,
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "provide 'observation_id' or 'hash'".to_string(),
+                ))
+            }
+        },
+    };
+
+    let bytes = crate::ccr::load_blob(&state.db, &hash)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    Ok(Json(RetrieveOriginalResponse {
+        hash,
+        bytes: bytes.len(),
+        original: String::from_utf8_lossy(&bytes).into_owned(),
+    }))
 }
 
 // POST /compress  (manual trigger)

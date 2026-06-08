@@ -22,6 +22,15 @@ fn schema(val: serde_json::Value) -> Arc<JsonObject> {
     Arc::new(val.as_object().expect("schema must be an object").clone())
 }
 
+/// A successful tool result whose payload reports a graceful, non-fatal error
+/// (e.g. unknown id / missing blob) — distinct from an MCP protocol error.
+fn error_result(message: impl Into<String>) -> CallToolResult {
+    let json = serde_json::json!({ "ok": false, "error": message.into() });
+    CallToolResult::success(vec![Content::text(
+        serde_json::to_string_pretty(&json).unwrap(),
+    )])
+}
+
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
@@ -131,6 +140,17 @@ impl IronMemServer {
                 schema(serde_json::json!({
                     "type": "object",
                     "properties": {}
+                })),
+            ),
+            Tool::new(
+                "retrieve_original",
+                "Retrieve the verbatim original behind a compressed/truncated observation. Provide observation_id (preferred) or a blob hash.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "observation_id": { "type": "integer", "description": "Observation id whose full original output to retrieve" },
+                        "hash": { "type": "string", "description": "Blob content hash (alternative to observation_id)" }
+                    }
                 })),
             ),
             Tool::new(
@@ -319,6 +339,50 @@ impl IronMemServer {
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
+    }
+
+    async fn handle_retrieve_original(
+        &self,
+        args: &JsonObject,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Resolve the blob hash from an explicit `hash`, or via `observation_id`.
+        let hash = match args.get("hash").and_then(|v| v.as_str()) {
+            Some(h) => h.to_string(),
+            None => match args.get("observation_id").and_then(|v| v.as_i64()) {
+                Some(oid) => {
+                    match db::get_observation_output_blob(&self.db, oid)
+                        .await
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                    {
+                        Some(h) => h,
+                        None => return Ok(error_result(format!(
+                            "observation {oid} has no stored original (output fit under the preview cap, or the id is unknown)"
+                        ))),
+                    }
+                }
+                None => {
+                    return Err(ErrorData::invalid_params(
+                        "provide 'observation_id' or 'hash'",
+                        None,
+                    ))
+                }
+            },
+        };
+
+        match crate::ccr::load_blob(&self.db, &hash).await {
+            Ok(bytes) => {
+                let json = serde_json::json!({
+                    "ok": true,
+                    "hash": hash,
+                    "bytes": bytes.len(),
+                    "original": String::from_utf8_lossy(&bytes),
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&json).unwrap(),
+                )]))
+            }
+            Err(e) => Ok(error_result(e.to_string())),
+        }
     }
 
     async fn handle_compress_session(
@@ -611,6 +675,7 @@ impl ServerHandler for IronMemServer {
             "compress_session" => self.handle_compress_session(&args).await,
             "get_context" => self.handle_get_context(&args).await,
             "get_status" => self.handle_get_status().await,
+            "retrieve_original" => self.handle_retrieve_original(&args).await,
             "list_memories" => self.handle_list_memories(&args).await,
             "search_memories" => self.handle_search_memories(&args).await,
             "search_global" => self.handle_search_global(&args).await,
@@ -757,5 +822,102 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── retrieve_original (CCR) ──────────────────────────────────────────────
+
+    async fn test_server() -> (IronMemServer, String) {
+        let db_path =
+            std::env::temp_dir().join(format!("ironmem-mcp-{}.db", uuid::Uuid::new_v4()));
+        let db_path_string = db_path.to_string_lossy().to_string();
+        let db = Database::new(&db_path_string).await.unwrap();
+        db.migrate().await.unwrap();
+        let db = Arc::new(db);
+        let mut config = Config::default();
+        config.embedding.provider = "none".to_string(); // no embedder probe in tests
+        let config = Arc::new(config);
+        let (embedder, store) = vectorstore::build_semantic(&db, &config).await;
+        (
+            IronMemServer {
+                db,
+                config,
+                embedder,
+                store,
+            },
+            db_path_string,
+        )
+    }
+
+    fn result_text(r: &CallToolResult) -> String {
+        let v = serde_json::to_value(r).unwrap();
+        v["content"][0]["text"]
+            .as_str()
+            .expect("text content")
+            .to_string()
+    }
+
+    #[test]
+    fn tool_list_includes_retrieve_original() {
+        let tools = IronMemServer::build_tool_list();
+        let t = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "retrieve_original")
+            .expect("retrieve_original tool registered");
+        let v = serde_json::to_value(t).unwrap();
+        let props = &v["inputSchema"]["properties"];
+        assert!(props.get("observation_id").is_some(), "schema has observation_id");
+        assert!(props.get("hash").is_some(), "schema has hash");
+    }
+
+    #[tokio::test]
+    async fn retrieve_original_by_observation_id_returns_full_output() {
+        let (server, path) = test_server().await;
+        let s = db::create_session(&server.db, "/tmp/p").await.unwrap();
+        let big = "x✓".repeat(40_000); // ~160 KB, multibyte, well over the cap
+        let id = db::insert_observation(&server.db, &s, "/tmp/p", "Read", None, Some(&big), 2048)
+            .await
+            .unwrap();
+
+        let mut args = JsonObject::new();
+        args.insert("observation_id".into(), serde_json::json!(id));
+        let result = server.handle_retrieve_original(&args).await.unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["original"].as_str().unwrap(), big);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn retrieve_original_by_hash_returns_blob() {
+        let (server, path) = test_server().await;
+        let r = crate::ccr::store_blob(&server.db, b"verbatim bytes addressed by hash", None)
+            .await
+            .unwrap();
+
+        let mut args = JsonObject::new();
+        args.insert("hash".into(), serde_json::json!(r.hash));
+        let result = server.handle_retrieve_original(&args).await.unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["original"].as_str().unwrap(), "verbatim bytes addressed by hash");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn retrieve_original_unknown_id_is_graceful() {
+        let (server, path) = test_server().await;
+        let mut args = JsonObject::new();
+        args.insert("observation_id".into(), serde_json::json!(999_999));
+        let result = server.handle_retrieve_original(&args).await.unwrap();
+
+        // Graceful (not an MCP protocol error): a success result with ok=false.
+        let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(v["ok"], false);
+
+        let _ = std::fs::remove_file(path);
     }
 }

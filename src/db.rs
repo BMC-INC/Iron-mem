@@ -142,6 +142,24 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
+        // CCR: lossless pointer to the verbatim full output (when the inline
+        // `output` is only a truncated FTS preview). Additive + backward-
+        // compatible — existing DBs gain the column on next migrate. SQLite has
+        // no ADD COLUMN IF NOT EXISTS, so the duplicate-column error is ignored
+        // on re-run; Postgres uses the native idempotent form.
+        match self.backend {
+            Backend::Sqlite => {
+                let _ = sqlx::query("ALTER TABLE observations ADD COLUMN output_blob TEXT")
+                    .execute(&self.pool)
+                    .await;
+            }
+            Backend::Postgres => {
+                sqlx::query("ALTER TABLE observations ADD COLUMN IF NOT EXISTS output_blob TEXT")
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+
         // Memories table (branched for FTS5 vs tsvector)
         match self.backend {
             Backend::Sqlite => {
@@ -212,6 +230,25 @@ impl Database {
                 created_at BIGINT NOT NULL
             )",
         )
+        .execute(&self.pool)
+        .await?;
+
+        // ── CCR: content-addressed reversible blob store ──
+        // Tool outputs / session transcripts are stored whole, deduplicated by
+        // the sha256 of their ORIGINAL bytes, and compressed by a byte-exact
+        // reversible codec. `refcount` tracks live references for GC (Chunk 3).
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS blobs (
+                hash         TEXT PRIMARY KEY,
+                content_type TEXT NOT NULL,
+                codec        TEXT NOT NULL,
+                orig_len     BIGINT NOT NULL,
+                comp_len     BIGINT NOT NULL,
+                data         {blob_type} NOT NULL,
+                refcount     BIGINT NOT NULL DEFAULT 0,
+                created_at   BIGINT NOT NULL
+            )"
+        ))
         .execute(&self.pool)
         .await?;
 
@@ -356,9 +393,19 @@ pub async fn insert_observation(
     // release profile's `panic="abort"` that takes the whole MCP server down.
     let truncated_output = output.map(|o| crate::strutil::safe_truncate(o, max_bytes));
 
+    // CCR: when truncation would lose bytes, preserve the verbatim original in
+    // the content-addressed blob store and keep only the short FTS preview
+    // inline. Below the cap there is nothing to lose, so we skip the blob.
+    let output_blob: Option<String> = match output {
+        Some(o) if o.len() > max_bytes => {
+            Some(crate::ccr::store_blob(db, o.as_bytes(), None).await?.hash)
+        }
+        _ => None,
+    };
+
     let row: sqlx::any::AnyRow = sqlx::query(
-        "INSERT INTO observations (session_id, project, tool, input, output, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        "INSERT INTO observations (session_id, project, tool, input, output, output_blob, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING id",
     )
     .bind(session_id)
@@ -366,6 +413,7 @@ pub async fn insert_observation(
     .bind(tool)
     .bind(input)
     .bind(truncated_output.as_deref())
+    .bind(output_blob.as_deref())
     .bind(now)
     .fetch_one(&db.pool)
     .await?;
@@ -406,6 +454,21 @@ pub async fn observation_count_for_session(db: &Database, session_id: &str) -> R
             .fetch_one(&db.pool)
             .await?;
     Ok(row.get("cnt"))
+}
+
+/// The CCR blob hash backing an observation's verbatim full output, if one was
+/// stored (only set when the inline output was truncated). Returns `None` for
+/// an unknown id or an observation that fit under the preview cap.
+pub async fn get_observation_output_blob(
+    db: &Database,
+    observation_id: i64,
+) -> Result<Option<String>> {
+    let row: Option<sqlx::any::AnyRow> =
+        sqlx::query("SELECT output_blob FROM observations WHERE id = $1")
+            .bind(observation_id)
+            .fetch_optional(&db.pool)
+            .await?;
+    Ok(row.and_then(|r| r.try_get::<Option<String>, _>("output_blob").ok().flatten()))
 }
 
 // Memories
@@ -836,6 +899,97 @@ pub async fn delete_memory_meta(db: &Database, memory_id: i64) -> Result<()> {
     Ok(())
 }
 
+// ── CCR blob store accessors ──────────────────────────────────────────────────
+
+/// A row from the content-addressed `blobs` table.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields consumed by load_blob / retrieve_original (Task 1.4+)
+pub struct BlobRow {
+    pub hash: String,
+    pub content_type: String,
+    pub codec: String,
+    pub orig_len: i64,
+    pub comp_len: i64,
+    pub data: Vec<u8>,
+    pub refcount: i64,
+    pub created_at: i64,
+}
+
+/// Insert a compressed blob, content-addressed by `hash` (hex sha256 of the
+/// ORIGINAL bytes). Idempotent: re-inserting the same hash does not duplicate
+/// the row or rewrite its bytes — it just bumps the reference count. A fresh
+/// row starts at `refcount = 1` (the caller that stored it holds one reference).
+#[allow(dead_code)]
+pub async fn insert_blob(
+    db: &Database,
+    hash: &str,
+    content_type: &str,
+    codec: &str,
+    orig_len: i64,
+    comp_len: i64,
+    data: &[u8],
+) -> Result<()> {
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO blobs(hash, content_type, codec, orig_len, comp_len, data, refcount, created_at)
+         VALUES($1, $2, $3, $4, $5, $6, 1, $7)
+         ON CONFLICT(hash) DO UPDATE SET refcount = refcount + 1",
+    )
+    .bind(hash)
+    .bind(content_type)
+    .bind(codec)
+    .bind(orig_len)
+    .bind(comp_len)
+    .bind(data.to_vec())
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch a blob row by its content hash.
+#[allow(dead_code)]
+pub async fn get_blob(db: &Database, hash: &str) -> Result<Option<BlobRow>> {
+    let row: Option<sqlx::any::AnyRow> = sqlx::query(
+        "SELECT hash, content_type, codec, orig_len, comp_len, data, refcount, created_at
+         FROM blobs WHERE hash = $1",
+    )
+    .bind(hash)
+    .fetch_optional(&db.pool)
+    .await?;
+    Ok(row.map(|r| BlobRow {
+        hash: r.get::<String, _>("hash"),
+        content_type: r.get::<String, _>("content_type"),
+        codec: r.get::<String, _>("codec"),
+        orig_len: r.get::<i64, _>("orig_len"),
+        comp_len: r.get::<i64, _>("comp_len"),
+        data: r.get::<Vec<u8>, _>("data"),
+        refcount: r.get::<i64, _>("refcount"),
+        created_at: r.get::<i64, _>("created_at"),
+    }))
+}
+
+/// Increment a blob's reference count (a new linker points at existing bytes).
+#[allow(dead_code)]
+pub async fn incref_blob(db: &Database, hash: &str) -> Result<()> {
+    sqlx::query("UPDATE blobs SET refcount = refcount + 1 WHERE hash = $1")
+        .bind(hash)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+/// Decrement a blob's reference count, floored at zero. A blob at `refcount = 0`
+/// is left in place for `gc` to reclaim (Chunk 3); it is never deleted here.
+#[allow(dead_code)]
+pub async fn decref_blob(db: &Database, hash: &str) -> Result<()> {
+    sqlx::query("UPDATE blobs SET refcount = refcount - 1 WHERE hash = $1 AND refcount > 0")
+        .bind(hash)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
 /// Memory ids (rowid in sqlite / id in pg) with no embedding row for `model`,
 /// along with their summary + tags (the text to embed).
 pub async fn memory_ids_missing_embedding(
@@ -1092,6 +1246,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blobs_insert_is_idempotent_and_refcounts() -> Result<()> {
+        let (db, path) = test_db().await?;
+
+        // First insert creates the row at refcount 1 and stores all fields.
+        insert_blob(&db, "abc123", "text", "zstd", 10, 4, b"\x01\x02\x03\x04").await?;
+        let row = get_blob(&db, "abc123").await?.expect("row exists after insert");
+        assert_eq!(row.hash, "abc123");
+        assert_eq!(row.content_type, "text");
+        assert_eq!(row.codec, "zstd");
+        assert_eq!(row.orig_len, 10);
+        assert_eq!(row.comp_len, 4);
+        assert_eq!(row.data, b"\x01\x02\x03\x04");
+        assert_eq!(row.refcount, 1);
+
+        // Re-inserting the same hash dedups (single row) and bumps the refcount.
+        insert_blob(&db, "abc123", "text", "zstd", 10, 4, b"\x01\x02\x03\x04").await?;
+        assert_eq!(get_blob(&db, "abc123").await?.unwrap().refcount, 2);
+
+        // incref / decref adjust the count; decref to 0 leaves the row for GC.
+        incref_blob(&db, "abc123").await?; // 3
+        decref_blob(&db, "abc123").await?; // 2
+        decref_blob(&db, "abc123").await?; // 1
+        decref_blob(&db, "abc123").await?; // 0
+        let row = get_blob(&db, "abc123")
+            .await?
+            .expect("row still present at refcount 0 (left for GC)");
+        assert_eq!(row.refcount, 0);
+
+        // Decref is floored at zero — never goes negative.
+        decref_blob(&db, "abc123").await?;
+        assert_eq!(get_blob(&db, "abc123").await?.unwrap().refcount, 0);
+
+        // Unknown hash → None.
+        assert!(get_blob(&db, "does-not-exist").await?.is_none());
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn project_discovery_queries_return_cross_project_results() -> Result<()> {
         let (db, db_path) = test_db().await?;
 
@@ -1180,6 +1374,52 @@ mod tests {
         let stored = obs[0].output.as_deref().unwrap();
         assert!(stored.starts_with("abcdefg"));
         assert!(stored.ends_with("… [truncated]"));
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn insert_observation_backs_large_output_with_lossless_blob() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let s = create_session(&db, "/tmp/p").await?;
+
+        // ~66 KB of varied multibyte content; cap the inline preview at 2048 B.
+        let big = "héllo ✓ wörld 日本語 🦀 ".repeat(2000);
+        assert!(big.len() > 50_000);
+        let id = insert_observation(&db, &s, "/tmp/p", "Read", None, Some(&big), 2048).await?;
+
+        // Inline output is just a truncated preview, not the full original.
+        let obs = get_observations_for_session(&db, &s).await?;
+        let preview = obs[0].output.as_deref().unwrap();
+        assert!(preview.len() < big.len());
+        assert!(preview.ends_with("… [truncated]"));
+
+        // output_blob resolves via CCR to the byte-exact full original.
+        let blob_hash: Option<String> =
+            sqlx::query("SELECT output_blob FROM observations WHERE id = $1")
+                .bind(id)
+                .fetch_one(&db.pool)
+                .await?
+                .try_get("output_blob")
+                .ok()
+                .flatten();
+        let blob_hash = blob_hash.expect("large output must record an output_blob");
+        let restored = crate::ccr::load_blob(&db, &blob_hash).await?;
+        assert_eq!(restored, big.as_bytes(), "CCR must return the exact original");
+
+        // A small output below the cap stores no blob (no overhead).
+        let small_id =
+            insert_observation(&db, &s, "/tmp/p", "Read", None, Some("tiny"), 2048).await?;
+        let small_blob: Option<String> =
+            sqlx::query("SELECT output_blob FROM observations WHERE id = $1")
+                .bind(small_id)
+                .fetch_one(&db.pool)
+                .await?
+                .try_get("output_blob")
+                .ok()
+                .flatten();
+        assert!(small_blob.is_none(), "small output should not allocate a blob");
 
         let _ = std::fs::remove_file(path);
         Ok(())
