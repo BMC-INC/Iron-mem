@@ -63,6 +63,11 @@ pub struct Weights {
     pub recency: f64,
     #[serde(default = "default_w_importance")]
     pub importance: f64,
+    /// Optional per-`kind` score multipliers that override the built-in priors
+    /// in [`Weights::kind_multiplier`]. Absent in legacy settings → empty map →
+    /// built-in defaults apply. Keys are memory kinds (e.g. `"preference"`).
+    #[serde(default)]
+    pub kind_boosts: std::collections::HashMap<String, f64>,
 }
 
 impl Default for Weights {
@@ -71,6 +76,27 @@ impl Default for Weights {
             relevance: default_w_relevance(),
             recency: default_w_recency(),
             importance: default_w_importance(),
+            kind_boosts: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl Weights {
+    /// Score multiplier for a memory `kind`. A configured `kind_boosts` entry
+    /// wins; otherwise built-in priors gently lift durable, high-signal kinds
+    /// (profile/error_solution/preference) over plain session summaries. Unknown
+    /// kinds are neutral (1.0).
+    pub fn kind_multiplier(&self, kind: &str) -> f64 {
+        if let Some(&m) = self.kind_boosts.get(kind) {
+            return m;
+        }
+        match kind {
+            "profile" => 1.4,
+            "error_solution" => 1.3,
+            "preference" => 1.25,
+            "architecture" | "learned_pattern" => 1.15,
+            "project_config" => 1.1,
+            _ => 1.0,
         }
     }
 }

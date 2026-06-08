@@ -955,6 +955,10 @@ pub async fn ensure_memory_meta(db: &Database, memory_id: i64, default_importanc
     Ok(())
 }
 
+/// Importance-only accessor. Production ranking reads importance + scope + kind
+/// together via [`get_memory_meta_full`]; this single-value form is retained for
+/// test assertions (mirrors the `#[cfg(test)]` `get_embedding`).
+#[cfg(test)]
 pub async fn get_memory_meta(db: &Database, memory_id: i64) -> Result<f64> {
     let row: Option<sqlx::any::AnyRow> =
         sqlx::query("SELECT importance FROM memory_meta WHERE memory_id = $1")
@@ -1001,9 +1005,11 @@ pub fn clamp_scope(scope: &str) -> &'static str {
 /// (importance 0.5, scope `project`, kind `session`) apply when no row exists
 /// or a legacy row predates the column.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields consumed by scope-aware injection in Task 4.3
 pub struct MemoryMetaInfo {
     pub importance: f64,
+    // Populated + test-verified, but production scope selection happens at the
+    // SQL layer (get_recent_memories_scoped), so nothing reads this field yet.
+    #[allow(dead_code)]
     pub scope: String,
     pub kind: String,
 }
@@ -1020,7 +1026,6 @@ impl Default for MemoryMetaInfo {
 
 /// Read a memory's importance + scope + kind in one query. Missing rows / null
 /// columns fall back to the defaults in [`MemoryMetaInfo::default`].
-#[allow(dead_code)] // wired into scope-aware injection in Task 4.3
 pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<MemoryMetaInfo> {
     let row: Option<sqlx::any::AnyRow> =
         sqlx::query("SELECT importance, scope, kind FROM memory_meta WHERE memory_id = $1")
@@ -1073,7 +1078,6 @@ pub async fn set_memory_scope_kind(
 /// `project` argument is ignored); `project`-scope returns the project's
 /// memories — including legacy rows with no meta or a null scope, which read as
 /// `project` via COALESCE so existing data keeps surfacing.
-#[allow(dead_code)] // wired into scope-aware injection in Task 4.3
 pub async fn get_recent_memories_scoped(
     db: &Database,
     scope: &str,

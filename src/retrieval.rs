@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::config::Weights;
 use crate::context;
@@ -127,9 +127,18 @@ pub async fn injection_rank(
     half_life_days: f64,
     limit: usize,
 ) -> Result<Vec<Memory>> {
-    // Pull a generous recent window, then re-rank it by the blend.
+    // Pull a generous recent window, then re-rank it by the blend. Candidates =
+    // this project's memories ∪ the user's global (cross-project) memories, so a
+    // user-scope preference surfaces even in a brand-new project. The two scopes
+    // are disjoint by construction; dedup defensively all the same.
     let window = ((limit as i64) * 10).max(50);
-    let candidates = db::get_recent_memories(db, project, window).await?;
+    let mut candidates = db::get_recent_memories_scoped(db, "project", Some(project), window).await?;
+    let mut seen: HashSet<i64> = candidates.iter().map(|m| m.id).collect();
+    for m in db::get_recent_memories_scoped(db, "user", None, window).await? {
+        if seen.insert(m.id) {
+            candidates.push(m);
+        }
+    }
     if candidates.is_empty() {
         return Ok(candidates);
     }
@@ -152,8 +161,11 @@ pub async fn injection_rank(
     for m in candidates {
         let rel = relevance.get(&m.id).copied().unwrap_or(0.0);
         let rec = recency_weight((now - m.created_at).max(0) as f64, half_life_days);
-        let imp = db::get_memory_meta(db, m.id).await?;
-        scored.push((blended_score(rel, rec, imp, weights), m));
+        // Importance + kind in one query; kind applies a typed prior on top of
+        // the relevance/recency/importance blend.
+        let info = db::get_memory_meta_full(db, m.id).await?;
+        let base = blended_score(rel, rec, info.importance, weights);
+        scored.push((base * weights.kind_multiplier(&info.kind), m));
     }
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     Ok(scored.into_iter().take(limit).map(|(_, m)| m).collect())
@@ -235,6 +247,7 @@ mod tests {
             relevance: 0.5,
             recency: 0.3,
             importance: 0.2,
+            ..Weights::default()
         };
         let s = blended_score(1.0, 1.0, 1.0, &w);
         assert!((s - 1.0).abs() < 1e-9);
@@ -326,6 +339,78 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ranked[0].id, 3, "semantically nearest ranks first");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn kind_multiplier_boosts_durable_kinds_and_honors_overrides() {
+        let w = Weights::default();
+        assert!((w.kind_multiplier("session") - 1.0).abs() < 1e-9);
+        assert!((w.kind_multiplier("unknown-kind") - 1.0).abs() < 1e-9);
+        assert!(w.kind_multiplier("preference") > 1.0);
+        assert!(w.kind_multiplier("error_solution") > 1.0);
+        assert!(w.kind_multiplier("profile") >= w.kind_multiplier("preference"));
+
+        // A configured override wins over the built-in prior.
+        let mut w2 = Weights::default();
+        w2.kind_boosts.insert("session".to_string(), 3.0);
+        assert!((w2.kind_multiplier("session") - 3.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn injection_includes_cross_project_user_memory() {
+        let (db, path) = seeded_db().await; // 3 project memories under /tmp/p
+        // A user-scope preference created from a DIFFERENT project.
+        let s2 = create_session(&db, "/tmp/other").await.unwrap();
+        let uid = insert_memory(&db, "/tmp/other", &s2, "user prefers tabs over spaces", Some("pref"))
+            .await
+            .unwrap();
+        db::set_memory_scope_kind(&db, uid, "user", "preference").await.unwrap();
+
+        let store = crate::vectorstore::BruteForceStore;
+        let weights = Weights::default();
+
+        // Inject into a FRESH project with zero project-scoped memories.
+        let ranked = rank_for_injection(&db, None, &store, "/tmp/fresh", &weights, 30.0, 5)
+            .await
+            .unwrap();
+        assert!(
+            ranked.iter().any(|m| m.id == uid),
+            "user-scope memory must inject into a fresh project: {ranked:?}"
+        );
+        // Project isolation: /tmp/p's project-scoped memories must NOT leak in.
+        assert!(
+            !ranked.iter().any(|m| [1, 2, 3].contains(&m.id)),
+            "another project's memories must not inject: {ranked:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn kind_boost_lifts_preference_over_newer_session() {
+        let path = std::env::temp_dir().join(format!("ironmem-kb-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::new(&path.to_string_lossy()).await.unwrap();
+        db.migrate().await.unwrap();
+        let s = create_session(&db, "/tmp/p").await.unwrap();
+
+        // Preference inserted FIRST (older), session SECOND (newer). Equal
+        // importance. Without the kind prior the newer session would win on
+        // recency; the preference boost must flip it.
+        let pref = insert_memory(&db, "/tmp/p", &s, "a durable preference", Some("x"))
+            .await
+            .unwrap();
+        db::set_memory_scope_kind(&db, pref, "project", "preference").await.unwrap();
+        let sess = insert_memory(&db, "/tmp/p", &s, "a plain session note", Some("x"))
+            .await
+            .unwrap();
+        db::set_memory_scope_kind(&db, sess, "project", "session").await.unwrap();
+
+        let store = crate::vectorstore::BruteForceStore;
+        let weights = Weights::default();
+        let ranked = injection_rank(&db, None, &store, "/tmp/p", None, &weights, 30.0, 2)
+            .await
+            .unwrap();
+        assert_eq!(ranked[0].id, pref, "kind-boosted preference must rank first: {ranked:?}");
         let _ = std::fs::remove_file(path);
     }
 
