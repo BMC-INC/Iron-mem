@@ -111,6 +111,55 @@ pub async fn persist(
     Ok(memory_id)
 }
 
+/// Store an explicit, user-curated memory (the Supermemory "add memory" pattern):
+/// insert the memory + meta, tag it with scope/kind (both clamped to the known
+/// sets), and best-effort embed it for semantic recall. Unlike compression there
+/// is no session to summarize — `text` is stored verbatim as the memory.
+/// `scope="user"` makes it a cross-project fact; `kind` classifies it. Returns
+/// the new memory id.
+#[allow(clippy::too_many_arguments)] // each arg is an independent field of the memory
+pub async fn remember(
+    db: &Database,
+    embedder: Option<&dyn Embedder>,
+    store: &dyn VectorStore,
+    project: &str,
+    scope: &str,
+    kind: &str,
+    text: &str,
+    tags: Option<&str>,
+) -> Result<i64> {
+    // Explicit memories aren't tied to a compressed session; mark the origin so
+    // they're distinguishable in session-history joins (no FK to sessions).
+    let memory_id = db::insert_memory(db, project, "remember", text, tags).await?;
+    // Deliberately curated → slightly above the neutral default importance.
+    db::upsert_memory_meta(db, memory_id, 0.7).await?;
+    db::set_memory_scope_kind(db, memory_id, scope, kind).await?;
+
+    if let Some(emb) = embedder {
+        let embed_text = match tags {
+            Some(t) if !t.is_empty() => format!("{text} {t}"),
+            _ => text.to_string(),
+        };
+        match emb.embed(&[embed_text]).await {
+            Ok(mut vecs) => {
+                if let Some(vec) = vecs.drain(..).next() {
+                    if let Err(e) = store.upsert(db, memory_id, emb.id(), emb.dim(), &vec).await {
+                        tracing::warn!("remember embed upsert failed (memory {memory_id}): {e}");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("remember embed failed (memory {memory_id}): {e}"),
+        }
+    }
+
+    tracing::info!(
+        "Remembered {}/{} memory → memory_id={memory_id} project={project}",
+        db::clamp_scope(scope),
+        db::clamp_kind(kind),
+    );
+    Ok(memory_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +223,58 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn remember_writes_typed_memory_and_embeds() {
+        let path = std::env::temp_dir().join(format!("ironmem-rem-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::new(&path.to_string_lossy()).await.unwrap();
+        db.migrate().await.unwrap();
+        db.ensure_ann(8).await.unwrap();
+        let emb = FakeEmbedder::new(8);
+        let store = SqliteVecStore;
+
+        // A user-scope preference stored from project A.
+        let id = remember(
+            &db,
+            Some(&emb),
+            &store,
+            "/tmp/projA",
+            "user",
+            "preference",
+            "prefers tabs over spaces",
+            Some("style editor"),
+        )
+        .await
+        .unwrap();
+
+        // scope/kind landed; importance bumped above the neutral default.
+        let info = db::get_memory_meta_full(&db, id).await.unwrap();
+        assert_eq!((info.scope.as_str(), info.kind.as_str()), ("user", "preference"));
+        assert!((info.importance - 0.7).abs() < 1e-9);
+        // Embedding written under the embedder's model id.
+        assert!(db::get_embedding(&db, "memory", id, emb.id())
+            .await
+            .unwrap()
+            .is_some());
+        // Retrievable via the global user scope, irrespective of which project
+        // it was created in (the cross-project guarantee).
+        let users = db::get_recent_memories_scoped(&db, "user", None, 10).await.unwrap();
+        assert!(users.iter().any(|m| m.id == id), "user memory must be globally visible");
+        // It must NOT appear under another project's project-scope view.
+        let proj_b = db::get_recent_memories_scoped(&db, "project", Some("/tmp/projB"), 10)
+            .await
+            .unwrap();
+        assert!(!proj_b.iter().any(|m| m.id == id));
+
+        // Unknown scope/kind clamp to the safe defaults; no embedder is fine.
+        let id2 = remember(&db, None, &store, "/tmp/projB", "bogus", "bogus", "x", None)
+            .await
+            .unwrap();
+        let info2 = db::get_memory_meta_full(&db, id2).await.unwrap();
+        assert_eq!((info2.scope.as_str(), info2.kind.as_str()), ("project", "session"));
+
         let _ = std::fs::remove_file(path);
     }
 

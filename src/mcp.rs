@@ -228,6 +228,21 @@ impl IronMemServer {
                 })),
             ),
             Tool::new(
+                "remember",
+                "Store an explicit, durable memory. Use scope='user' for facts/preferences about the user that apply across every project; scope='project' (default) for this project only. kind classifies it: session | error_solution | preference | architecture | learned_pattern | project_config | profile.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project": { "type": "string", "description": "Project root path" },
+                        "text": { "type": "string", "description": "The memory content to store verbatim" },
+                        "scope": { "type": "string", "description": "'project' (default) or 'user' (cross-project)" },
+                        "kind": { "type": "string", "description": "session | error_solution | preference | architecture | learned_pattern | project_config | profile (default preference)" },
+                        "tags": { "type": "string", "description": "Optional space-separated keywords" }
+                    },
+                    "required": ["project", "text"]
+                })),
+            ),
+            Tool::new(
                 "wipe_project",
                 "Delete all memories for a project.",
                 schema(serde_json::json!({
@@ -587,6 +602,46 @@ impl IronMemServer {
         )]))
     }
 
+    async fn handle_remember(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
+        let project = args
+            .get("project")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ErrorData::invalid_params("missing 'project'", None))?;
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ErrorData::invalid_params("missing 'text'", None))?;
+        if text.trim().is_empty() {
+            return Ok(error_result("'text' must not be empty"));
+        }
+        let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("project");
+        let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("preference");
+        let tags = args.get("tags").and_then(|v| v.as_str());
+
+        let memory_id = compress::remember(
+            &self.db,
+            self.embedder.as_deref(),
+            self.store.as_ref(),
+            project,
+            scope,
+            kind,
+            text,
+            tags,
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json = serde_json::json!({
+            "ok": true,
+            "memory_id": memory_id,
+            "scope": db::clamp_scope(scope),
+            "kind": db::clamp_kind(kind),
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json).unwrap(),
+        )]))
+    }
+
     async fn handle_wipe_project(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
         let project = args
             .get("project")
@@ -699,6 +754,7 @@ impl ServerHandler for IronMemServer {
             "list_projects" => self.handle_list_projects(&args).await,
             "list_sessions" => self.handle_list_sessions(&args).await,
             "inject_context" => self.handle_inject_context(&args).await,
+            "remember" => self.handle_remember(&args).await,
             "wipe_project" => self.handle_wipe_project(&args).await,
             _ => Err(ErrorData::invalid_params(
                 format!("unknown tool: {}", request.name),
@@ -884,6 +940,54 @@ mod tests {
         let props = &v["inputSchema"]["properties"];
         assert!(props.get("observation_id").is_some(), "schema has observation_id");
         assert!(props.get("hash").is_some(), "schema has hash");
+    }
+
+    #[tokio::test]
+    async fn remember_stores_user_scoped_memory_retrievable_cross_project() {
+        let (server, path) = test_server().await;
+        let mut args = JsonObject::new();
+        args.insert("project".into(), serde_json::json!("/tmp/projX"));
+        args.insert("text".into(), serde_json::json!("user prefers vim keybindings"));
+        args.insert("scope".into(), serde_json::json!("user"));
+        args.insert("kind".into(), serde_json::json!("preference"));
+        args.insert("tags".into(), serde_json::json!("editor pref"));
+
+        let v: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_remember(&args).await.unwrap()))
+                .unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["scope"], "user");
+        assert_eq!(v["kind"], "preference");
+        let mid = v["memory_id"].as_i64().unwrap();
+
+        // Visible via the global user scope (i.e. from any other project).
+        let users = db::get_recent_memories_scoped(&server.db, "user", None, 10)
+            .await
+            .unwrap();
+        assert!(users.iter().any(|m| m.id == mid));
+
+        // Empty text is rejected gracefully (ok:false, not a protocol error).
+        let mut bad = JsonObject::new();
+        bad.insert("project".into(), serde_json::json!("/tmp/projX"));
+        bad.insert("text".into(), serde_json::json!("   "));
+        let v2: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_remember(&bad).await.unwrap()))
+                .unwrap();
+        assert_eq!(v2["ok"], false);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tool_list_includes_remember() {
+        let tools = IronMemServer::build_tool_list();
+        let t = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "remember")
+            .expect("remember tool registered");
+        let v = serde_json::to_value(t).unwrap();
+        let props = &v["inputSchema"]["properties"];
+        assert!(props.get("scope").is_some() && props.get("kind").is_some());
     }
 
     #[tokio::test]

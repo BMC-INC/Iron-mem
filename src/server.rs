@@ -45,6 +45,7 @@ pub fn router(state: AppState) -> Router {
         .route("/context", get(get_context))
         .route("/status", get(get_status))
         .route("/retrieve_original", post(retrieve_original))
+        .route("/remember", post(remember))
         // Web UI routes
         .route("/ui", get(web_ui))
         .route("/api/projects", get(api_list_projects))
@@ -229,6 +230,53 @@ async fn retrieve_original(
         hash,
         bytes: bytes.len(),
         original: String::from_utf8_lossy(&bytes).into_owned(),
+    }))
+}
+
+// POST /remember  (Supermemory: store an explicit typed/scoped memory)
+#[derive(Deserialize)]
+pub struct RememberRequest {
+    pub project: String,
+    pub text: String,
+    pub scope: Option<String>,
+    pub kind: Option<String>,
+    pub tags: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct RememberResponse {
+    pub memory_id: i64,
+    pub scope: String,
+    pub kind: String,
+}
+
+async fn remember(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RememberRequest>,
+) -> Result<Json<RememberResponse>, (StatusCode, String)> {
+    if body.text.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "'text' must not be empty".to_string()));
+    }
+    let scope = body.scope.as_deref().unwrap_or("project");
+    let kind = body.kind.as_deref().unwrap_or("preference");
+
+    let memory_id = compress::remember(
+        &state.db,
+        state.embedder.as_deref(),
+        state.store.as_ref(),
+        &body.project,
+        scope,
+        kind,
+        &body.text,
+        body.tags.as_deref(),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(RememberResponse {
+        memory_id,
+        scope: db::clamp_scope(scope).to_string(),
+        kind: db::clamp_kind(kind).to_string(),
     }))
 }
 

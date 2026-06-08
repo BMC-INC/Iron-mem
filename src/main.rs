@@ -107,6 +107,24 @@ enum Commands {
         limit: i64,
     },
 
+    /// Store an explicit memory (use --scope user for cross-project facts)
+    Remember {
+        /// The memory text to store
+        text: String,
+        /// Project root path (defaults to current directory)
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Scope: project (default) or user (cross-project)
+        #[arg(short, long, default_value = "project")]
+        scope: String,
+        /// Kind: session|error_solution|preference|architecture|learned_pattern|project_config|profile
+        #[arg(short, long, default_value = "preference")]
+        kind: String,
+        /// Optional space-separated tags
+        #[arg(short, long)]
+        tags: Option<String>,
+    },
+
     /// Manually compress a session
     Compress {
         /// Session ID to compress
@@ -185,6 +203,23 @@ async fn main() -> Result<()> {
         }
         Commands::Wipe { project, force } => run_wipe(&cfg, project.as_deref(), force).await?,
         Commands::Inject { project, limit } => run_inject(&cfg, project.as_deref(), limit).await?,
+        Commands::Remember {
+            text,
+            project,
+            scope,
+            kind,
+            tags,
+        } => {
+            run_remember(
+                &cfg,
+                &text,
+                project.as_deref(),
+                &scope,
+                &kind,
+                tags.as_deref(),
+            )
+            .await?
+        }
         Commands::Compress { session_id } => run_compress_cmd(&cfg, &session_id).await?,
         Commands::Gc => run_gc(&cfg).await?,
         Commands::Embed {
@@ -622,6 +657,44 @@ async fn run_inject(cfg: &config::Config, project: Option<&str>, limit: i64) -> 
     println!(
         "Injected {} memories into IRONMEM.md for {}",
         memories.len(),
+        project
+    );
+    Ok(())
+}
+
+async fn run_remember(
+    cfg: &config::Config,
+    text: &str,
+    project: Option<&str>,
+    scope: &str,
+    kind: &str,
+    tags: Option<&str>,
+) -> Result<()> {
+    if text.trim().is_empty() {
+        anyhow::bail!("memory text must not be empty");
+    }
+    let project = resolve_project(project)?;
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+
+    let (embedder, store) = vectorstore::build_semantic(&database, cfg).await;
+    let id = compress::remember(
+        &database,
+        embedder.as_deref(),
+        store.as_ref(),
+        &project,
+        scope,
+        kind,
+        text,
+        tags,
+    )
+    .await?;
+
+    println!(
+        "✅ Remembered memory id={} (scope={}, kind={}) for {}",
+        id,
+        db::clamp_scope(scope),
+        db::clamp_kind(kind),
         project
     );
     Ok(())

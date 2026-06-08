@@ -968,7 +968,6 @@ pub async fn get_memory_meta(db: &Database, memory_id: i64) -> Result<f64> {
 
 /// Canonical typed-memory kinds. `session` is the default for auto-compressed
 /// memories; the rest classify explicitly-curated or mined memories.
-#[allow(dead_code)] // wired into the compression prompt in Task 4.4
 pub const MEMORY_KINDS: &[&str] = &[
     "session",
     "error_solution",
@@ -981,7 +980,6 @@ pub const MEMORY_KINDS: &[&str] = &[
 
 /// Clamp an arbitrary kind string to the known set, case-insensitively.
 /// Anything unrecognized collapses to `session` (the safe default).
-#[allow(dead_code)] // wired into remember (4.2) + compression (4.4)
 pub fn clamp_kind(kind: &str) -> &'static str {
     let k = kind.trim().to_ascii_lowercase();
     MEMORY_KINDS
@@ -992,7 +990,6 @@ pub fn clamp_kind(kind: &str) -> &'static str {
 }
 
 /// Clamp a scope string to `project` (default) or `user`.
-#[allow(dead_code)] // wired into remember (4.2) + scoped accessors
 pub fn clamp_scope(scope: &str) -> &'static str {
     match scope.trim().to_ascii_lowercase().as_str() {
         "user" => "user",
@@ -1051,7 +1048,6 @@ pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<Memor
 /// Set a memory's scope + kind, clamping both to the known sets. Upserts the
 /// meta row so it works whether or not `upsert_memory_meta` ran first; a fresh
 /// row gets the default importance and never clobbers an existing one.
-#[allow(dead_code)] // wired into remember (4.2) + compression (4.4)
 pub async fn set_memory_scope_kind(
     db: &Database,
     memory_id: i64,
