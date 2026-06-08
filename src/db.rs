@@ -293,6 +293,38 @@ impl Database {
             }
         }
 
+        // Supermemory model: scope (project|user) + kind (typed) on memory_meta.
+        // Additive with constant non-null defaults, so every existing row reads
+        // back as a project-scoped session memory — legacy behavior unchanged.
+        // SQLite has no ADD COLUMN IF NOT EXISTS, so the duplicate-column error
+        // on re-run is ignored; Postgres uses the native idempotent form.
+        match self.backend {
+            Backend::Sqlite => {
+                let _ = sqlx::query(
+                    "ALTER TABLE memory_meta ADD COLUMN scope TEXT NOT NULL DEFAULT 'project'",
+                )
+                .execute(&self.pool)
+                .await;
+                let _ = sqlx::query(
+                    "ALTER TABLE memory_meta ADD COLUMN kind TEXT NOT NULL DEFAULT 'session'",
+                )
+                .execute(&self.pool)
+                .await;
+            }
+            Backend::Postgres => {
+                sqlx::query(
+                    "ALTER TABLE memory_meta ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'project'",
+                )
+                .execute(&self.pool)
+                .await?;
+                sqlx::query(
+                    "ALTER TABLE memory_meta ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'session'",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+
         Ok(())
     }
 
@@ -932,6 +964,163 @@ pub async fn get_memory_meta(db: &Database, memory_id: i64) -> Result<f64> {
     Ok(row.map(|r| r.get::<f64, _>("importance")).unwrap_or(0.5))
 }
 
+// ── Memory model: scope + kind ────────────────────────────────────────────────
+
+/// Canonical typed-memory kinds. `session` is the default for auto-compressed
+/// memories; the rest classify explicitly-curated or mined memories.
+#[allow(dead_code)] // wired into the compression prompt in Task 4.4
+pub const MEMORY_KINDS: &[&str] = &[
+    "session",
+    "error_solution",
+    "preference",
+    "architecture",
+    "learned_pattern",
+    "project_config",
+    "profile",
+];
+
+/// Clamp an arbitrary kind string to the known set, case-insensitively.
+/// Anything unrecognized collapses to `session` (the safe default).
+#[allow(dead_code)] // wired into remember (4.2) + compression (4.4)
+pub fn clamp_kind(kind: &str) -> &'static str {
+    let k = kind.trim().to_ascii_lowercase();
+    MEMORY_KINDS
+        .iter()
+        .copied()
+        .find(|&v| v == k)
+        .unwrap_or("session")
+}
+
+/// Clamp a scope string to `project` (default) or `user`.
+#[allow(dead_code)] // wired into remember (4.2) + scoped accessors
+pub fn clamp_scope(scope: &str) -> &'static str {
+    match scope.trim().to_ascii_lowercase().as_str() {
+        "user" => "user",
+        _ => "project",
+    }
+}
+
+/// Full metadata for a memory: importance plus its scope + kind. Defaults
+/// (importance 0.5, scope `project`, kind `session`) apply when no row exists
+/// or a legacy row predates the column.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields consumed by scope-aware injection in Task 4.3
+pub struct MemoryMetaInfo {
+    pub importance: f64,
+    pub scope: String,
+    pub kind: String,
+}
+
+impl Default for MemoryMetaInfo {
+    fn default() -> Self {
+        Self {
+            importance: 0.5,
+            scope: "project".to_string(),
+            kind: "session".to_string(),
+        }
+    }
+}
+
+/// Read a memory's importance + scope + kind in one query. Missing rows / null
+/// columns fall back to the defaults in [`MemoryMetaInfo::default`].
+#[allow(dead_code)] // wired into scope-aware injection in Task 4.3
+pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<MemoryMetaInfo> {
+    let row: Option<sqlx::any::AnyRow> =
+        sqlx::query("SELECT importance, scope, kind FROM memory_meta WHERE memory_id = $1")
+            .bind(memory_id)
+            .fetch_optional(&db.pool)
+            .await?;
+    Ok(match row {
+        Some(r) => MemoryMetaInfo {
+            importance: r.try_get::<f64, _>("importance").unwrap_or(0.5),
+            scope: r
+                .try_get::<Option<String>, _>("scope")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "project".to_string()),
+            kind: r
+                .try_get::<Option<String>, _>("kind")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "session".to_string()),
+        },
+        None => MemoryMetaInfo::default(),
+    })
+}
+
+/// Set a memory's scope + kind, clamping both to the known sets. Upserts the
+/// meta row so it works whether or not `upsert_memory_meta` ran first; a fresh
+/// row gets the default importance and never clobbers an existing one.
+#[allow(dead_code)] // wired into remember (4.2) + compression (4.4)
+pub async fn set_memory_scope_kind(
+    db: &Database,
+    memory_id: i64,
+    scope: &str,
+    kind: &str,
+) -> Result<()> {
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO memory_meta(memory_id, importance, created_at, scope, kind)
+         VALUES($1, 0.5, $2, $3, $4)
+         ON CONFLICT(memory_id) DO UPDATE SET scope = excluded.scope, kind = excluded.kind",
+    )
+    .bind(memory_id)
+    .bind(now)
+    .bind(clamp_scope(scope))
+    .bind(clamp_kind(kind))
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+/// Recent memories filtered by scope. `user`-scope memories are global (the
+/// `project` argument is ignored); `project`-scope returns the project's
+/// memories — including legacy rows with no meta or a null scope, which read as
+/// `project` via COALESCE so existing data keeps surfacing.
+#[allow(dead_code)] // wired into scope-aware injection in Task 4.3
+pub async fn get_recent_memories_scoped(
+    db: &Database,
+    scope: &str,
+    project: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Memory>> {
+    let id_col = match db.backend {
+        Backend::Sqlite => "m.rowid",
+        Backend::Postgres => "m.id",
+    };
+    let mut sql = format!(
+        "SELECT {id_col} AS id, m.project, m.session_id, m.summary, m.tags, m.created_at
+         FROM memories m
+         LEFT JOIN memory_meta mm ON mm.memory_id = {id_col}
+         WHERE COALESCE(mm.scope, 'project') = $1"
+    );
+    let limit_ph = if project.is_some() {
+        sql.push_str(" AND m.project = $2");
+        "$3"
+    } else {
+        "$2"
+    };
+    sql.push_str(&format!(" ORDER BY m.created_at DESC LIMIT {limit_ph}"));
+
+    let mut q = sqlx::query(&sql).bind(clamp_scope(scope));
+    if let Some(p) = project {
+        q = q.bind(p);
+    }
+    let rows: Vec<sqlx::any::AnyRow> = q.bind(limit).fetch_all(&db.pool).await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r: sqlx::any::AnyRow| Memory {
+            id: r.get("id"),
+            project: r.get("project"),
+            session_id: r.get("session_id"),
+            summary: r.get("summary"),
+            tags: r.try_get("tags").ok().flatten(),
+            created_at: r.get("created_at"),
+        })
+        .collect())
+}
+
 pub async fn delete_memory_meta(db: &Database, memory_id: i64) -> Result<()> {
     sqlx::query("DELETE FROM memory_meta WHERE memory_id = $1")
         .bind(memory_id)
@@ -1557,6 +1746,77 @@ mod tests {
         let json = stats.ccr_json();
         assert_eq!(json["blobs"], 2);
         assert_eq!(json["bytes_saved"], 500 - 90);
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn clamp_kind_and_scope_normalize_to_known_sets() {
+        assert_eq!(clamp_kind("error_solution"), "error_solution");
+        assert_eq!(clamp_kind("  PREFERENCE  "), "preference");
+        assert_eq!(clamp_kind("not-a-kind"), "session");
+        assert_eq!(clamp_kind(""), "session");
+        assert_eq!(clamp_scope("user"), "user");
+        assert_eq!(clamp_scope("USER"), "user");
+        assert_eq!(clamp_scope("project"), "project");
+        assert_eq!(clamp_scope("garbage"), "project");
+    }
+
+    #[tokio::test]
+    async fn memory_scope_kind_defaults_roundtrip_and_filter() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let alpha = "/tmp/alpha";
+        let beta = "/tmp/beta";
+        let sa = create_session(&db, alpha).await?;
+        let sb = create_session(&db, beta).await?;
+
+        // m1: alpha, explicit meta row → defaults project/session.
+        let m1 = insert_memory(&db, alpha, &sa, "alpha session work", Some("a")).await?;
+        upsert_memory_meta(&db, m1, 0.5).await?;
+        // m2: alpha, promoted to a user-scope preference.
+        let m2 = insert_memory(&db, alpha, &sa, "user prefers tabs", Some("pref")).await?;
+        set_memory_scope_kind(&db, m2, "user", "preference").await?;
+        // m3: beta, user-scope profile.
+        let m3 = insert_memory(&db, beta, &sb, "user is a rust dev", Some("profile")).await?;
+        set_memory_scope_kind(&db, m3, "user", "profile").await?;
+        // m4: beta, NO meta row at all (legacy) → must read as project scope.
+        let m4 = insert_memory(&db, beta, &sb, "beta legacy memory", None).await?;
+
+        // Defaults: a plain upsert_memory_meta row is project/session.
+        let i1 = get_memory_meta_full(&db, m1).await?;
+        assert_eq!((i1.scope.as_str(), i1.kind.as_str()), ("project", "session"));
+        // Round-trip of explicit scope/kind.
+        let i2 = get_memory_meta_full(&db, m2).await?;
+        assert_eq!((i2.scope.as_str(), i2.kind.as_str()), ("user", "preference"));
+        // set_memory_scope_kind upserted a row even though none existed before,
+        // with the default importance preserved.
+        assert!((i2.importance - 0.5).abs() < 1e-9);
+        // Missing row → defaults.
+        let none = get_memory_meta_full(&db, 9999).await?;
+        assert_eq!((none.scope.as_str(), none.kind.as_str()), ("project", "session"));
+
+        // User-scope query is global (ignores project) → m2 + m3.
+        let users = get_recent_memories_scoped(&db, "user", None, 50).await?;
+        let user_ids: Vec<i64> = users.iter().map(|m| m.id).collect();
+        assert!(user_ids.contains(&m2) && user_ids.contains(&m3), "{user_ids:?}");
+        assert!(!user_ids.contains(&m1) && !user_ids.contains(&m4), "{user_ids:?}");
+
+        // Project-scope for beta → m4 (legacy, no meta) but NOT m3 (user-scope).
+        let beta_proj = get_recent_memories_scoped(&db, "project", Some(beta), 50).await?;
+        let beta_ids: Vec<i64> = beta_proj.iter().map(|m| m.id).collect();
+        assert!(beta_ids.contains(&m4), "legacy memory must count as project: {beta_ids:?}");
+        assert!(!beta_ids.contains(&m3), "user-scope excluded from project: {beta_ids:?}");
+
+        // Project-scope for alpha → m1 only (m2 is user-scope).
+        let alpha_proj = get_recent_memories_scoped(&db, "project", Some(alpha), 50).await?;
+        let alpha_ids: Vec<i64> = alpha_proj.iter().map(|m| m.id).collect();
+        assert!(alpha_ids.contains(&m1) && !alpha_ids.contains(&m2), "{alpha_ids:?}");
+
+        // set_memory_scope_kind clamps unknown values.
+        set_memory_scope_kind(&db, m1, "bogus-scope", "bogus-kind").await?;
+        let i1b = get_memory_meta_full(&db, m1).await?;
+        assert_eq!((i1b.scope.as_str(), i1b.kind.as_str()), ("project", "session"));
 
         let _ = std::fs::remove_file(path);
         Ok(())
