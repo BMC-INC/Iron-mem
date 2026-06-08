@@ -4,10 +4,6 @@
 //! the codec used for all content types in Chunk 1; Chunk 2 introduces
 //! per-type codecs that still satisfy the same reversibility contract.
 
-// Used by the codec registry + tests now, and by `store_blob`/`load_blob` once
-// CCR is wired in (Task 1.4+).
-#![allow(dead_code)]
-
 use crate::ccr::codec::Codec;
 
 /// Lossless zstd codec. `level` controls compression effort (1..=22); it does

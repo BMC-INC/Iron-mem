@@ -1,6 +1,3 @@
-// Private helpers are used by tests now and by later CCR tasks at runtime.
-#![allow(dead_code)]
-
 /// Content-type categories used by the CCR codec selection logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentType {

@@ -6,10 +6,6 @@
 //! and, at runtime, by `load_blob` re-hashing the decompressed bytes against
 //! the content-address key.
 
-// Registry items are consumed by `store_blob`/`load_blob` once CCR is wired in
-// (Task 1.4+); allow until then.
-#![allow(dead_code)]
-
 use crate::ccr::detect::ContentType;
 use crate::ccr::zstd_codec::ZstdCodec;
 

@@ -7,17 +7,11 @@
 //! is the runtime half of the reversibility contract — a corrupted or tampered
 //! row can never silently return wrong bytes.
 
-// store_blob/load_blob are consumed by record_event + retrieve_original
-// (Task 1.5/1.6); allow until those land.
-#![allow(dead_code)]
-
 pub mod codec;
 pub mod detect;
 pub mod zstd_codec;
 
-#[allow(unused_imports)]
 pub use codec::{codec_by_id, codec_for, Codec};
-#[allow(unused_imports)]
 pub use detect::ContentType;
 
 use crate::db::{get_blob, insert_blob, Database};
@@ -26,6 +20,7 @@ use std::fmt::Write as _;
 
 /// Handle to a stored blob, returned by [`store_blob`].
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // descriptive fields (codec/lens) are part of the API surface
 pub struct BlobRef {
     /// Hex sha256 of the ORIGINAL (uncompressed) bytes — the content address.
     pub hash: String,
