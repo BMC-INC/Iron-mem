@@ -188,7 +188,7 @@ pub async fn rank_for_injection(
         (Some(emb), Some(signal)) => embed_one(emb, &signal).await,
         _ => None,
     };
-    injection_rank(
+    let mut ranked = injection_rank(
         db,
         embedder,
         store,
@@ -198,7 +198,18 @@ pub async fn rank_for_injection(
         half_life_days,
         limit,
     )
-    .await
+    .await?;
+
+    // The user profile is always injected first (a single high-signal row),
+    // ahead of the blended ranking — it's the durable "who is this user" context.
+    if let Some(profile) = db::get_profile_memory(db).await? {
+        ranked.retain(|m| m.id != profile.id);
+        ranked.insert(0, profile);
+        if limit > 0 {
+            ranked.truncate(limit);
+        }
+    }
+    Ok(ranked)
 }
 
 /// Embed a single string, returning the vector or `None` on failure/empty.
@@ -383,6 +394,33 @@ mod tests {
             !ranked.iter().any(|m| [1, 2, 3].contains(&m.id)),
             "another project's memories must not inject: {ranked:?}"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn profile_is_always_injected_first() {
+        let (db, path) = seeded_db().await; // /tmp/p with 3 project memories
+        let s = create_session(&db, "/tmp/u").await.unwrap();
+        let pid = insert_memory(
+            &db,
+            "ironmem:profile",
+            &s,
+            "# User Profile\n- prefers rust",
+            Some("profile user"),
+        )
+        .await
+        .unwrap();
+        db::set_memory_scope_kind(&db, pid, "user", "profile").await.unwrap();
+
+        let store = crate::vectorstore::BruteForceStore;
+        let weights = Weights::default();
+        let ranked = rank_for_injection(&db, None, &store, "/tmp/p", &weights, 30.0, 3)
+            .await
+            .unwrap();
+        assert_eq!(ranked[0].id, pid, "profile must inject first: {ranked:?}");
+        assert!(ranked.len() <= 3, "limit is respected even with the profile");
+        // Exactly one copy (deduped, not duplicated by the user-scope candidate).
+        assert_eq!(ranked.iter().filter(|m| m.id == pid).count(), 1);
         let _ = std::fs::remove_file(path);
     }
 
