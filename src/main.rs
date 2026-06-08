@@ -126,6 +126,13 @@ enum Commands {
         tags: Option<String>,
     },
 
+    /// Show the user profile (durable cross-project facts + recent activity)
+    Profile {
+        /// Regenerate the profile from user memories before showing it
+        #[arg(short, long)]
+        refresh: bool,
+    },
+
     /// Manually compress a session
     Compress {
         /// Session ID to compress
@@ -221,6 +228,7 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Commands::Profile { refresh } => run_profile(&cfg, refresh).await?,
         Commands::Compress { session_id } => run_compress_cmd(&cfg, &session_id).await?,
         Commands::Gc => run_gc(&cfg).await?,
         Commands::Embed {
@@ -698,6 +706,30 @@ async fn run_remember(
         db::clamp_kind(kind),
         project
     );
+    Ok(())
+}
+
+async fn run_profile(cfg: &config::Config, refresh: bool) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let (embedder, store) = vectorstore::build_semantic(&database, cfg).await;
+
+    if refresh {
+        match profile::regenerate(&database, embedder.as_deref(), store.as_ref(), Some(cfg)).await? {
+            Some(_) => println!("✅ Profile regenerated."),
+            None => {
+                println!("No user-scope memories yet — nothing to profile.");
+                return Ok(());
+            }
+        }
+    }
+
+    match db::get_profile_memory(&database).await? {
+        Some(m) => println!("\n{}", m.summary),
+        None => println!(
+            "(no profile yet — add facts with `ironmem remember --scope user ...`, then `ironmem profile --refresh`)"
+        ),
+    }
     Ok(())
 }
 

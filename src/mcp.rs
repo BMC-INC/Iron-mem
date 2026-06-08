@@ -243,6 +243,22 @@ impl IronMemServer {
                 })),
             ),
             Tool::new(
+                "get_profile",
+                "Get the current user profile (durable cross-project facts + recent activity), if one has been generated.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                })),
+            ),
+            Tool::new(
+                "refresh_profile",
+                "Regenerate the user profile from scope=user memories (uses the LLM when available, else a deterministic local rollup) and return it.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                })),
+            ),
+            Tool::new(
                 "wipe_project",
                 "Delete all memories for a project.",
                 schema(serde_json::json!({
@@ -642,6 +658,39 @@ impl IronMemServer {
         )]))
     }
 
+    async fn handle_get_profile(&self) -> Result<CallToolResult, ErrorData> {
+        let profile = db::get_profile_memory(&self.db)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::json!({ "ok": true, "profile": profile });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json).unwrap(),
+        )]))
+    }
+
+    async fn handle_refresh_profile(&self) -> Result<CallToolResult, ErrorData> {
+        let id = crate::profile::regenerate(
+            &self.db,
+            self.embedder.as_deref(),
+            self.store.as_ref(),
+            Some(&self.config),
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let profile = db::get_profile_memory(&self.db)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::json!({
+            "ok": true,
+            "regenerated": id.is_some(),
+            "profile": profile,
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json).unwrap(),
+        )]))
+    }
+
     async fn handle_wipe_project(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
         let project = args
             .get("project")
@@ -755,6 +804,8 @@ impl ServerHandler for IronMemServer {
             "list_sessions" => self.handle_list_sessions(&args).await,
             "inject_context" => self.handle_inject_context(&args).await,
             "remember" => self.handle_remember(&args).await,
+            "get_profile" => self.handle_get_profile().await,
+            "refresh_profile" => self.handle_refresh_profile().await,
             "wipe_project" => self.handle_wipe_project(&args).await,
             _ => Err(ErrorData::invalid_params(
                 format!("unknown tool: {}", request.name),
@@ -976,6 +1027,61 @@ mod tests {
         assert_eq!(v2["ok"], false);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn get_and_refresh_profile_tools() {
+        // Use a provider whose key resolves from the env only (no ~/.ironmem
+        // file fallback) and leave it unset, so refresh uses the deterministic
+        // local rollup — no network call in tests, on any machine.
+        let db_path =
+            std::env::temp_dir().join(format!("ironmem-pmcp-{}.db", uuid::Uuid::new_v4()));
+        let dbs = db_path.to_string_lossy().to_string();
+        let db = Database::new(&dbs).await.unwrap();
+        db.migrate().await.unwrap();
+        let db = Arc::new(db);
+        let mut config = Config {
+            provider: crate::provider::Provider::Openai,
+            ..Config::default()
+        };
+        config.embedding.provider = "none".to_string();
+        let config = Arc::new(config);
+        let (embedder, store) = vectorstore::build_semantic(&db, &config).await;
+        let server = IronMemServer {
+            db,
+            config,
+            embedder,
+            store,
+        };
+
+        // No profile yet.
+        let v: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_get_profile().await.unwrap())).unwrap();
+        assert!(v["profile"].is_null());
+
+        // Seed a user memory, then refresh.
+        let s = db::create_session(&server.db, "/tmp/p").await.unwrap();
+        let uid = db::insert_memory(&server.db, "/tmp/p", &s, "user prefers dark mode", Some("pref"))
+            .await
+            .unwrap();
+        db::set_memory_scope_kind(&server.db, uid, "user", "preference").await.unwrap();
+
+        let rv: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_refresh_profile().await.unwrap()))
+                .unwrap();
+        assert_eq!(rv["ok"], true);
+        assert_eq!(rv["regenerated"], true);
+        assert!(rv["profile"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("dark mode"));
+
+        // get_profile now returns it.
+        let v2: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_get_profile().await.unwrap())).unwrap();
+        assert!(!v2["profile"].is_null());
+
+        let _ = std::fs::remove_file(db_path);
     }
 
     #[test]

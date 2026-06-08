@@ -46,6 +46,8 @@ pub fn router(state: AppState) -> Router {
         .route("/status", get(get_status))
         .route("/retrieve_original", post(retrieve_original))
         .route("/remember", post(remember))
+        .route("/profile", get(get_profile))
+        .route("/refresh_profile", post(refresh_profile))
         // Web UI routes
         .route("/ui", get(web_ui))
         .route("/api/projects", get(api_list_projects))
@@ -277,6 +279,47 @@ async fn remember(
         memory_id,
         scope: db::clamp_scope(scope).to_string(),
         kind: db::clamp_kind(kind).to_string(),
+    }))
+}
+
+// GET /profile  +  POST /refresh_profile  (Supermemory user profile)
+#[derive(Serialize)]
+pub struct ProfileResponse {
+    pub profile: Option<db::Memory>,
+}
+
+async fn get_profile(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ProfileResponse>, (StatusCode, String)> {
+    let profile = db::get_profile_memory(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(ProfileResponse { profile }))
+}
+
+#[derive(Serialize)]
+pub struct RefreshProfileResponse {
+    pub regenerated: bool,
+    pub profile: Option<db::Memory>,
+}
+
+async fn refresh_profile(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<RefreshProfileResponse>, (StatusCode, String)> {
+    let id = crate::profile::regenerate(
+        &state.db,
+        state.embedder.as_deref(),
+        state.store.as_ref(),
+        Some(&state.config),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let profile = db::get_profile_memory(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(RefreshProfileResponse {
+        regenerated: id.is_some(),
+        profile,
     }))
 }
 
