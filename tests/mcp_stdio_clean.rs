@@ -4,9 +4,10 @@
 //! `Unexpected token ', "2026-0"... is not valid JSON` the moment it connects.
 //! This test spawns the real binary and asserts stdout is pure JSON.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 #[test]
 fn mcp_stdio_stdout_is_pure_json() {
@@ -35,6 +36,29 @@ fn mcp_stdio_stdout_is_pure_json() {
         .spawn()
         .expect("spawn `ironmem mcp`");
 
+    // Drain stdout on a reader thread so we can wait for the response by content
+    // rather than by a fixed sleep — the embedder probe on boot makes startup
+    // latency wildly variable across CI runners (a fixed sleep raced on slow
+    // Windows boxes). We succeed as soon as the init response arrives.
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        let mut br = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match br.read_line(&mut line) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    if tx.send(line.clone()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     let init = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
     child
         .stdin
@@ -43,25 +67,46 @@ fn mcp_stdio_stdout_is_pure_json() {
         .write_all(format!("{init}\n").as_bytes())
         .unwrap();
 
-    // Let it start up (embedder init logs here) and answer initialize. Debug
-    // builds probe the embedder provider on boot, so give it generous headroom.
-    std::thread::sleep(Duration::from_millis(3000));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut lines: Vec<String> = Vec::new();
+    let mut saw_init_response = false;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(l) => {
+                let is_init = serde_json::from_str::<serde_json::Value>(l.trim())
+                    .ok()
+                    .map(|v| {
+                        v.get("id").and_then(|x| x.as_i64()) == Some(0)
+                            && v.get("result").is_some()
+                    })
+                    .unwrap_or(false);
+                lines.push(l);
+                if is_init {
+                    saw_init_response = true;
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
     let _ = child.kill();
-    let out = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let _ = child.wait();
+    while let Ok(l) = rx.try_recv() {
+        lines.push(l);
+    }
+    let _ = reader.join();
     let _ = std::fs::remove_file(&db);
 
     // Every non-empty stdout line must be valid JSON — no log/banner leakage.
-    let mut saw_init_response = false;
-    for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
-        let parsed: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("stdout must be pure JSON-RPC, found non-JSON line ({e}): {line:?}"));
-        if parsed.get("id").and_then(|v| v.as_i64()) == Some(0) && parsed.get("result").is_some() {
-            saw_init_response = true;
-        }
+    for line in lines.iter().filter(|l| !l.trim().is_empty()) {
+        serde_json::from_str::<serde_json::Value>(line.trim()).unwrap_or_else(|e| {
+            panic!("stdout must be pure JSON-RPC, found non-JSON line ({e}): {line:?}")
+        });
     }
     assert!(
         saw_init_response,
-        "expected an initialize response on stdout; got: {stdout:?}"
+        "expected an initialize response on stdout; got: {lines:?}"
     );
 }
