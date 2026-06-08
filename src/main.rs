@@ -9,6 +9,7 @@ mod embedder;
 mod embedding_codec;
 mod hooks;
 mod mcp;
+mod profile;
 mod provider;
 mod retrieval;
 mod server;

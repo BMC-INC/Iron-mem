@@ -178,6 +178,19 @@ pub async fn compress(
     }
 }
 
+/// Raw single-prompt completion against the configured provider, returning the
+/// model's verbatim text. Used by features that need free-form output (e.g. the
+/// user-profile generator) rather than the structured compression format.
+pub async fn complete(prompt: &str, config: &Config) -> Result<String> {
+    let api_key = resolve_api_key(config.provider)?;
+    let model = &config.model;
+    match config.provider {
+        Provider::Anthropic => anthropic_text(prompt, model, &api_key).await,
+        Provider::Openai => openai_text(prompt, model, &api_key).await,
+        Provider::Google => google_text(prompt, model, &api_key).await,
+    }
+}
+
 // ── Anthropic ───────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -206,6 +219,10 @@ struct AnthropicResponse {
 }
 
 async fn compress_anthropic(prompt: &str, model: &str, api_key: &str) -> Result<CompressionResult> {
+    Ok(parse_response(&anthropic_text(prompt, model, api_key).await?))
+}
+
+async fn anthropic_text(prompt: &str, model: &str, api_key: &str) -> Result<String> {
     let client = reqwest::Client::new();
     let req = AnthropicRequest {
         model: model.to_string(),
@@ -232,14 +249,11 @@ async fn compress_anthropic(prompt: &str, model: &str, api_key: &str) -> Result<
     }
 
     let data: AnthropicResponse = resp.json().await?;
-    let text = data
-        .content
+    data.content
         .into_iter()
         .find(|b| b.block_type == "text")
         .and_then(|b| b.text)
-        .ok_or_else(|| anyhow!("No text content in Anthropic response"))?;
-
-    Ok(parse_response(&text))
+        .ok_or_else(|| anyhow!("No text content in Anthropic response"))
 }
 
 // ── OpenAI ──────────────────────────────────────────────────────────
@@ -267,6 +281,10 @@ struct OpenAiResponse {
 }
 
 async fn compress_openai(prompt: &str, model: &str, api_key: &str) -> Result<CompressionResult> {
+    Ok(parse_response(&openai_text(prompt, model, api_key).await?))
+}
+
+async fn openai_text(prompt: &str, model: &str, api_key: &str) -> Result<String> {
     let client = reqwest::Client::new();
     let req = OpenAiRequest {
         model: model.to_string(),
@@ -292,14 +310,11 @@ async fn compress_openai(prompt: &str, model: &str, api_key: &str) -> Result<Com
     }
 
     let data: OpenAiResponse = resp.json().await?;
-    let text = data
-        .choices
+    data.choices
         .into_iter()
         .next()
         .and_then(|c| c.message.content)
-        .ok_or_else(|| anyhow!("No content in OpenAI response"))?;
-
-    Ok(parse_response(&text))
+        .ok_or_else(|| anyhow!("No content in OpenAI response"))
 }
 
 // ── Google Gemini ───────────────────────────────────────────────────
@@ -340,6 +355,10 @@ struct GeminiPartResp {
 }
 
 async fn compress_google(prompt: &str, model: &str, api_key: &str) -> Result<CompressionResult> {
+    Ok(parse_response(&google_text(prompt, model, api_key).await?))
+}
+
+async fn google_text(prompt: &str, model: &str, api_key: &str) -> Result<String> {
     let client = reqwest::Client::new();
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
@@ -368,14 +387,11 @@ async fn compress_google(prompt: &str, model: &str, api_key: &str) -> Result<Com
     }
 
     let data: GeminiResponse = resp.json().await?;
-    let text = data
-        .candidates
+    data.candidates
         .and_then(|c| c.into_iter().next())
         .and_then(|c| c.content.parts.into_iter().next())
         .and_then(|p| p.text)
-        .ok_or_else(|| anyhow!("No content in Gemini response"))?;
-
-    Ok(parse_response(&text))
+        .ok_or_else(|| anyhow!("No content in Gemini response"))
 }
 
 #[cfg(test)]

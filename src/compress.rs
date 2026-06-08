@@ -160,6 +160,20 @@ pub async fn remember(
         db::clamp_scope(scope),
         db::clamp_kind(kind),
     );
+
+    // Best-effort: keep the user profile fresh as cross-project memories grow.
+    // Uses the deterministic local rollup (cfg=None → no network), so it never
+    // blocks remember and never makes a surprise API call.
+    if db::clamp_scope(scope) == "user" {
+        let n = db::count_user_memories(db).await.unwrap_or(0);
+        let no_profile = matches!(db::get_profile_memory(db).await, Ok(None));
+        if no_profile || (n > 0 && n % crate::profile::PROFILE_REFRESH_EVERY == 0) {
+            if let Err(e) = crate::profile::regenerate(db, embedder, store, None).await {
+                tracing::warn!("profile auto-refresh failed: {e}");
+            }
+        }
+    }
+
     Ok(memory_id)
 }
 

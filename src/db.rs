@@ -1121,6 +1121,48 @@ pub async fn get_recent_memories_scoped(
         .collect())
 }
 
+/// The singleton user profile memory (scope=user, kind=profile), newest first if
+/// duplicates somehow exist. `None` when no profile has been generated yet.
+pub async fn get_profile_memory(db: &Database) -> Result<Option<Memory>> {
+    let id_col = match db.backend {
+        Backend::Sqlite => "m.rowid",
+        Backend::Postgres => "m.id",
+    };
+    let sql = format!(
+        "SELECT {id_col} AS id, m.project, m.session_id, m.summary, m.tags, m.created_at
+         FROM memories m
+         JOIN memory_meta mm ON mm.memory_id = {id_col}
+         WHERE mm.scope = 'user' AND mm.kind = 'profile'
+         ORDER BY m.created_at DESC LIMIT 1"
+    );
+    let row: Option<sqlx::any::AnyRow> = sqlx::query(&sql).fetch_optional(&db.pool).await?;
+    Ok(row.map(|r: sqlx::any::AnyRow| Memory {
+        id: r.get("id"),
+        project: r.get("project"),
+        session_id: r.get("session_id"),
+        summary: r.get("summary"),
+        tags: r.try_get("tags").ok().flatten(),
+        created_at: r.get("created_at"),
+    }))
+}
+
+/// Count user-scoped memories that are NOT the profile itself — the signal for
+/// when to regenerate the profile.
+pub async fn count_user_memories(db: &Database) -> Result<i64> {
+    let id_col = match db.backend {
+        Backend::Sqlite => "m.rowid",
+        Backend::Postgres => "m.id",
+    };
+    let sql = format!(
+        "SELECT COUNT(*) AS cnt
+         FROM memories m
+         JOIN memory_meta mm ON mm.memory_id = {id_col}
+         WHERE mm.scope = 'user' AND mm.kind <> 'profile'"
+    );
+    let row: sqlx::any::AnyRow = sqlx::query(&sql).fetch_one(&db.pool).await?;
+    Ok(row.get("cnt"))
+}
+
 pub async fn delete_memory_meta(db: &Database, memory_id: i64) -> Result<()> {
     sqlx::query("DELETE FROM memory_meta WHERE memory_id = $1")
         .bind(memory_id)
