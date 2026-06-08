@@ -456,6 +456,21 @@ pub async fn observation_count_for_session(db: &Database, session_id: &str) -> R
     Ok(row.get("cnt"))
 }
 
+/// The CCR blob hash backing an observation's verbatim full output, if one was
+/// stored (only set when the inline output was truncated). Returns `None` for
+/// an unknown id or an observation that fit under the preview cap.
+pub async fn get_observation_output_blob(
+    db: &Database,
+    observation_id: i64,
+) -> Result<Option<String>> {
+    let row: Option<sqlx::any::AnyRow> =
+        sqlx::query("SELECT output_blob FROM observations WHERE id = $1")
+            .bind(observation_id)
+            .fetch_optional(&db.pool)
+            .await?;
+    Ok(row.and_then(|r| r.try_get::<Option<String>, _>("output_blob").ok().flatten()))
+}
+
 // Memories
 
 pub async fn insert_memory(
