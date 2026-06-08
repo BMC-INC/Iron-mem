@@ -46,6 +46,10 @@ dirs = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# CCR: content-addressed reversible blob store
+zstd = "0.13"
+sha2 = "0.10"
+
 # Embeddings & vector search
 async-trait = "0.1"
 sqlite-vec = "0.1"
