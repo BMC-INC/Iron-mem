@@ -39,6 +39,9 @@ pub struct CompressionResult {
     pub tags: String,
     /// LLM-estimated importance, 1 (trivial) – 10 (critical). Defaults to 5.
     pub importance: u8,
+    /// Typed classification of the session, clamped to [`crate::db::MEMORY_KINDS`].
+    /// Defaults to `session`.
+    pub kind: String,
 }
 
 /// Default importance when the model omits or mangles the IMPORTANCE line.
@@ -80,6 +83,10 @@ fn build_prompt(observations: &[Observation]) -> String {
         "IMPORTANCE: [single integer 1-10 — how important this session is to remember long-term: 1 trivial/exploratory, 10 critical decisions or lasting changes]"
             .to_string(),
     );
+    lines.push(
+        "KIND: [single word classifying this session: session | error_solution | preference | architecture | learned_pattern | project_config — default 'session']"
+            .to_string(),
+    );
 
     lines.join("\n")
 }
@@ -88,6 +95,7 @@ fn parse_response(text: &str) -> CompressionResult {
     let mut summary = String::new();
     let mut tags = String::new();
     let mut importance: Option<u8> = None;
+    let mut kind: Option<String> = None;
 
     for line in text.lines() {
         if let Some(s) = line.strip_prefix("SUMMARY:") {
@@ -96,6 +104,9 @@ fn parse_response(text: &str) -> CompressionResult {
             tags = t.trim().to_string();
         } else if let Some(i) = line.strip_prefix("IMPORTANCE:") {
             importance = parse_importance(i);
+        } else if let Some(k) = line.strip_prefix("KIND:") {
+            // Clamp to the known set; unrecognized values collapse to `session`.
+            kind = Some(crate::db::clamp_kind(k).to_string());
         }
     }
 
@@ -108,6 +119,7 @@ fn parse_response(text: &str) -> CompressionResult {
         summary,
         tags,
         importance: importance.unwrap_or(DEFAULT_IMPORTANCE),
+        kind: kind.unwrap_or_else(|| "session".to_string()),
     }
 }
 
@@ -393,5 +405,27 @@ mod tests {
     fn importance_tolerates_extra_text() {
         let r = parse_response("SUMMARY: s\nIMPORTANCE: 7 (lasting change)");
         assert_eq!(r.importance, 7);
+    }
+
+    #[test]
+    fn parses_kind_line() {
+        let r = parse_response("SUMMARY: s\nTAGS: a\nIMPORTANCE: 5\nKIND: error_solution");
+        assert_eq!(r.kind, "error_solution");
+    }
+
+    #[test]
+    fn missing_kind_defaults_to_session() {
+        let r = parse_response("SUMMARY: s\nTAGS: a b c");
+        assert_eq!(r.kind, "session");
+    }
+
+    #[test]
+    fn invalid_kind_clamps_to_session() {
+        assert_eq!(parse_response("SUMMARY: s\nKIND: nonsense").kind, "session");
+        // Case-insensitive + whitespace tolerant.
+        assert_eq!(
+            parse_response("SUMMARY: s\nKIND:   Architecture  ").kind,
+            "architecture"
+        );
     }
 }

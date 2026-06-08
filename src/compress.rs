@@ -92,6 +92,9 @@ pub async fn persist(
         db::insert_memory(db, project, session_id, &result.summary, Some(&result.tags)).await?;
     db::mark_compressed(db, session_id).await?;
     db::upsert_memory_meta(db, memory_id, result.importance as f64 / 10.0).await?;
+    // Compressed sessions are project-scoped; record the LLM-classified kind
+    // (importance is preserved — set_memory_scope_kind only touches scope+kind).
+    db::set_memory_scope_kind(db, memory_id, "project", &result.kind).await?;
 
     if let Some(emb) = embedder {
         let text = format!("{} {}", result.summary, result.tags);
@@ -181,6 +184,7 @@ mod tests {
             summary: "implemented retrieval".into(),
             tags: "rust retrieval rrf".into(),
             importance: 8,
+            kind: "architecture".into(),
         };
 
         let id = persist(&db, Some(&emb), &store, "/tmp/p", &session, result)
@@ -189,8 +193,11 @@ mod tests {
 
         // Memory row exists.
         assert!(db::get_memory_by_id(&db, id).await.unwrap().is_some());
-        // Importance persisted as 0.8 (8/10).
-        assert!((db::get_memory_meta(&db, id).await.unwrap() - 0.8).abs() < 1e-9);
+        // Importance persisted as 0.8 (8/10), and the classified kind landed on
+        // the meta row at the default project scope.
+        let info = db::get_memory_meta_full(&db, id).await.unwrap();
+        assert!((info.importance - 0.8).abs() < 1e-9);
+        assert_eq!((info.scope.as_str(), info.kind.as_str()), ("project", "architecture"));
         // Embedding persisted under the embedder's model id.
         assert!(db::get_embedding(&db, "memory", id, emb.id())
             .await
@@ -211,6 +218,7 @@ mod tests {
             summary: "no embedder path".into(),
             tags: "fts only".into(),
             importance: 3,
+            kind: "session".into(),
         };
 
         let id = persist(&db, None, &store, "/tmp/p", &session, result)
@@ -298,6 +306,7 @@ mod tests {
             summary: "s".into(),
             tags: "t".into(),
             importance: 5,
+            kind: "session".into(),
         };
         let memory_id = persist(&db, None, &store, "/tmp/p", &session, result)
             .await

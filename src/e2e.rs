@@ -44,6 +44,7 @@ async fn semantic_pipeline_end_to_end() {
             summary: "implemented sqlite-vec ANN search".into(),
             tags: "rust sqlite vector ann".into(),
             importance: 9,
+            kind: "architecture".into(),
         },
     )
     .await
@@ -59,6 +60,7 @@ async fn semantic_pipeline_end_to_end() {
             summary: "tweaked frontend css layout".into(),
             tags: "css frontend layout".into(),
             importance: 2,
+            kind: "session".into(),
         },
     )
     .await
