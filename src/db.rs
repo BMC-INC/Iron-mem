@@ -632,12 +632,36 @@ pub async fn get_recent_memories(db: &Database, project: &str, limit: i64) -> Re
         .collect())
 }
 
+/// Build a safe FTS5 MATCH expression from free-text.
+///
+/// FTS5 reads bare punctuation (`?`, `:`, `*`, quotes, parens) as query syntax,
+/// so an unsanitized question like "When did X happen?" raises a syntax error —
+/// which callers swallow into an empty result, silently breaking retrieval.
+/// We extract word tokens, quote each (FTS5 then treats them as literals), and
+/// OR them for keyword recall; the vector side + RRF fusion handle precision.
+/// Returns an empty string when the input has no word characters.
+fn fts5_match_query(raw: &str) -> String {
+    raw.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 pub async fn search_memories(
     db: &Database,
     project: &str,
     query: &str,
     limit: i64,
 ) -> Result<Vec<Memory>> {
+    // FTS5 needs sanitizing; Postgres plainto_tsquery already parses safely.
+    let match_query = match db.backend {
+        Backend::Sqlite => fts5_match_query(query),
+        Backend::Postgres => query.to_string(),
+    };
+    if matches!(db.backend, Backend::Sqlite) && match_query.is_empty() {
+        return Ok(Vec::new());
+    }
     let query_str = match db.backend {
         Backend::Sqlite => {
             "SELECT rowid as id, project, session_id, summary, tags, created_at
@@ -652,7 +676,7 @@ pub async fn search_memories(
     };
 
     let rows: Vec<sqlx::any::AnyRow> = sqlx::query(query_str)
-        .bind(query)
+        .bind(match_query)
         .bind(project)
         .bind(limit)
         .fetch_all(&db.pool)
@@ -672,6 +696,13 @@ pub async fn search_memories(
 }
 
 pub async fn search_all_memories(db: &Database, query: &str, limit: i64) -> Result<Vec<Memory>> {
+    let match_query = match db.backend {
+        Backend::Sqlite => fts5_match_query(query),
+        Backend::Postgres => query.to_string(),
+    };
+    if matches!(db.backend, Backend::Sqlite) && match_query.is_empty() {
+        return Ok(Vec::new());
+    }
     let query_str = match db.backend {
         Backend::Sqlite => {
             "SELECT rowid as id, project, session_id, summary, tags, created_at
@@ -686,7 +717,7 @@ pub async fn search_all_memories(db: &Database, query: &str, limit: i64) -> Resu
     };
 
     let rows: Vec<sqlx::any::AnyRow> = sqlx::query(query_str)
-        .bind(query)
+        .bind(match_query)
         .bind(limit)
         .fetch_all(&db.pool)
         .await?;
@@ -1638,6 +1669,40 @@ mod tests {
             sqlite_file_url(std::path::Path::new(r"C:\Users\runneradmin\ironmem.db")),
             "sqlite:///C:/Users/runneradmin/ironmem.db?mode=rwc"
         );
+    }
+
+    #[test]
+    fn fts5_match_query_sanitizes_punctuation() {
+        assert_eq!(
+            fts5_match_query("When did Caroline go to the LGBTQ group?"),
+            "\"When\" OR \"did\" OR \"Caroline\" OR \"go\" OR \"to\" OR \"the\" OR \"LGBTQ\" OR \"group\""
+        );
+        // All-punctuation input yields an empty match (callers short-circuit).
+        assert_eq!(fts5_match_query("???"), "");
+        assert_eq!(fts5_match_query(""), "");
+    }
+
+    /// Regression: a natural question with a trailing '?' used to raise an FTS5
+    /// syntax error (swallowed into an empty result), silently breaking search.
+    #[tokio::test]
+    async fn search_memories_tolerates_question_punctuation() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let s = create_session(&db, "/p").await?;
+        insert_memory(
+            &db,
+            "/p",
+            &s,
+            "Caroline joined the LGBTQ support group on 7 May 2023",
+            Some("t"),
+        )
+        .await?;
+        let hits = search_memories(&db, "/p", "When did Caroline join the LGBTQ group?", 10).await?;
+        assert!(
+            hits.iter().any(|m| m.summary.contains("LGBTQ")),
+            "expected the LGBTQ memory, got {hits:?}"
+        );
+        let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     async fn test_db() -> Result<(Database, String)> {
