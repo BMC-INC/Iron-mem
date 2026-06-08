@@ -252,6 +252,32 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // CCR: content-addressed dictionaries for per-content-type codecs. Each
+        // blob records which dict compressed it (blobs.dict_hash) so dicts can be
+        // (re)trained freely without ever breaking an existing blob's round-trip.
+        match self.backend {
+            Backend::Sqlite => {
+                let _ = sqlx::query("ALTER TABLE blobs ADD COLUMN dict_hash TEXT")
+                    .execute(&self.pool)
+                    .await;
+            }
+            Backend::Postgres => {
+                sqlx::query("ALTER TABLE blobs ADD COLUMN IF NOT EXISTS dict_hash TEXT")
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS ccr_dicts (
+                hash         TEXT PRIMARY KEY,
+                content_type TEXT NOT NULL,
+                data         {blob_type} NOT NULL,
+                created_at   BIGINT NOT NULL
+            )"
+        ))
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -903,7 +929,7 @@ pub async fn delete_memory_meta(db: &Database, memory_id: i64) -> Result<()> {
 
 /// A row from the content-addressed `blobs` table.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields consumed by load_blob / retrieve_original (Task 1.4+)
+#[allow(dead_code)] // some fields consumed only by tests / later chunks
 pub struct BlobRow {
     pub hash: String,
     pub content_type: String,
@@ -913,13 +939,15 @@ pub struct BlobRow {
     pub data: Vec<u8>,
     pub refcount: i64,
     pub created_at: i64,
+    /// Content hash of the dictionary used to compress `data`, if any.
+    pub dict_hash: Option<String>,
 }
 
 /// Insert a compressed blob, content-addressed by `hash` (hex sha256 of the
 /// ORIGINAL bytes). Idempotent: re-inserting the same hash does not duplicate
 /// the row or rewrite its bytes — it just bumps the reference count. A fresh
 /// row starts at `refcount = 1` (the caller that stored it holds one reference).
-#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)] // one bind per blobs column; a wrapper struct would just add ceremony
 pub async fn insert_blob(
     db: &Database,
     hash: &str,
@@ -928,11 +956,12 @@ pub async fn insert_blob(
     orig_len: i64,
     comp_len: i64,
     data: &[u8],
+    dict_hash: Option<&str>,
 ) -> Result<()> {
     let now = Utc::now().timestamp();
     sqlx::query(
-        "INSERT INTO blobs(hash, content_type, codec, orig_len, comp_len, data, refcount, created_at)
-         VALUES($1, $2, $3, $4, $5, $6, 1, $7)
+        "INSERT INTO blobs(hash, content_type, codec, orig_len, comp_len, data, refcount, created_at, dict_hash)
+         VALUES($1, $2, $3, $4, $5, $6, 1, $7, $8)
          ON CONFLICT(hash) DO UPDATE SET refcount = refcount + 1",
     )
     .bind(hash)
@@ -942,16 +971,16 @@ pub async fn insert_blob(
     .bind(comp_len)
     .bind(data.to_vec())
     .bind(now)
+    .bind(dict_hash)
     .execute(&db.pool)
     .await?;
     Ok(())
 }
 
 /// Fetch a blob row by its content hash.
-#[allow(dead_code)]
 pub async fn get_blob(db: &Database, hash: &str) -> Result<Option<BlobRow>> {
     let row: Option<sqlx::any::AnyRow> = sqlx::query(
-        "SELECT hash, content_type, codec, orig_len, comp_len, data, refcount, created_at
+        "SELECT hash, content_type, codec, orig_len, comp_len, data, refcount, created_at, dict_hash
          FROM blobs WHERE hash = $1",
     )
     .bind(hash)
@@ -966,7 +995,55 @@ pub async fn get_blob(db: &Database, hash: &str) -> Result<Option<BlobRow>> {
         data: r.get::<Vec<u8>, _>("data"),
         refcount: r.get::<i64, _>("refcount"),
         created_at: r.get::<i64, _>("created_at"),
+        dict_hash: r.try_get::<Option<String>, _>("dict_hash").ok().flatten(),
     }))
+}
+
+/// Store a content-addressed dictionary (idempotent by hash). Dictionaries are
+/// stored verbatim (not compressed) so they can always be reconstructed.
+#[allow(dead_code)] // wired into store_blob/load_blob in Task 2.4
+pub async fn insert_dict(
+    db: &Database,
+    hash: &str,
+    content_type: &str,
+    data: &[u8],
+) -> Result<()> {
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO ccr_dicts(hash, content_type, data, created_at)
+         VALUES($1, $2, $3, $4)
+         ON CONFLICT(hash) DO NOTHING",
+    )
+    .bind(hash)
+    .bind(content_type)
+    .bind(data.to_vec())
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch dictionary bytes by content hash.
+#[allow(dead_code)] // wired into load_blob in Task 2.4
+pub async fn get_dict(db: &Database, hash: &str) -> Result<Option<Vec<u8>>> {
+    let row: Option<sqlx::any::AnyRow> =
+        sqlx::query("SELECT data FROM ccr_dicts WHERE hash = $1")
+            .bind(hash)
+            .fetch_optional(&db.pool)
+            .await?;
+    Ok(row.map(|r| r.get::<Vec<u8>, _>("data")))
+}
+
+/// The hash of the most recent dictionary trained for `content_type`, if any.
+#[allow(dead_code)] // wired into store_blob in Task 2.4
+pub async fn latest_dict_hash(db: &Database, content_type: &str) -> Result<Option<String>> {
+    let row: Option<sqlx::any::AnyRow> = sqlx::query(
+        "SELECT hash FROM ccr_dicts WHERE content_type = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(content_type)
+    .fetch_optional(&db.pool)
+    .await?;
+    Ok(row.map(|r| r.get::<String, _>("hash")))
 }
 
 /// Increment a blob's reference count (a new linker points at existing bytes).
@@ -1250,7 +1327,7 @@ mod tests {
         let (db, path) = test_db().await?;
 
         // First insert creates the row at refcount 1 and stores all fields.
-        insert_blob(&db, "abc123", "text", "zstd", 10, 4, b"\x01\x02\x03\x04").await?;
+        insert_blob(&db, "abc123", "text", "zstd", 10, 4, b"\x01\x02\x03\x04", None).await?;
         let row = get_blob(&db, "abc123").await?.expect("row exists after insert");
         assert_eq!(row.hash, "abc123");
         assert_eq!(row.content_type, "text");
@@ -1261,7 +1338,7 @@ mod tests {
         assert_eq!(row.refcount, 1);
 
         // Re-inserting the same hash dedups (single row) and bumps the refcount.
-        insert_blob(&db, "abc123", "text", "zstd", 10, 4, b"\x01\x02\x03\x04").await?;
+        insert_blob(&db, "abc123", "text", "zstd", 10, 4, b"\x01\x02\x03\x04", None).await?;
         assert_eq!(get_blob(&db, "abc123").await?.unwrap().refcount, 2);
 
         // incref / decref adjust the count; decref to 0 leaves the row for GC.
@@ -1280,6 +1357,30 @@ mod tests {
 
         // Unknown hash → None.
         assert!(get_blob(&db, "does-not-exist").await?.is_none());
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ccr_dicts_store_fetch_and_blob_dict_hash() -> Result<()> {
+        let (db, path) = test_db().await?;
+
+        insert_dict(&db, "h1", "json", b"dictionary-bytes-1").await?;
+        assert_eq!(get_dict(&db, "h1").await?, Some(b"dictionary-bytes-1".to_vec()));
+        assert!(get_dict(&db, "missing").await?.is_none());
+        assert_eq!(latest_dict_hash(&db, "json").await?, Some("h1".to_string()));
+        assert_eq!(latest_dict_hash(&db, "log").await?, None);
+
+        // A blob records which dictionary compressed it.
+        insert_blob(&db, "b1", "json", "dict+zstd", 100, 40, b"zzz", Some("h1")).await?;
+        assert_eq!(
+            get_blob(&db, "b1").await?.unwrap().dict_hash,
+            Some("h1".to_string())
+        );
+        // A dict-less blob has no dict_hash.
+        insert_blob(&db, "b2", "text", "zstd", 10, 8, b"plain", None).await?;
+        assert_eq!(get_blob(&db, "b2").await?.unwrap().dict_hash, None);
 
         let _ = std::fs::remove_file(path);
         Ok(())

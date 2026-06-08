@@ -9,6 +9,7 @@
 
 pub mod codec;
 pub mod detect;
+pub mod dict;
 pub mod zstd_codec;
 
 pub use codec::{codec_by_id, codec_for, Codec};
@@ -68,6 +69,7 @@ pub async fn store_blob(
         bytes.len() as i64,
         compressed.len() as i64,
         &compressed,
+        None,
     )
     .await?;
     Ok(BlobRef {
@@ -156,7 +158,7 @@ mod tests {
         // load_blob will decompress to "B", whose hash != key => must error.
         let key = sha256_hex(b"A");
         let wrong = codec_for(ContentType::Text).compress(b"B")?;
-        insert_blob(&db, &key, "text", "zstd", 1, wrong.len() as i64, &wrong).await?;
+        insert_blob(&db, &key, "text", "zstd", 1, wrong.len() as i64, &wrong, None).await?;
 
         let err = load_blob(&db, &key).await.unwrap_err();
         assert!(
