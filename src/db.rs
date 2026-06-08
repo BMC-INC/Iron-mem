@@ -142,6 +142,24 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
+        // CCR: lossless pointer to the verbatim full output (when the inline
+        // `output` is only a truncated FTS preview). Additive + backward-
+        // compatible — existing DBs gain the column on next migrate. SQLite has
+        // no ADD COLUMN IF NOT EXISTS, so the duplicate-column error is ignored
+        // on re-run; Postgres uses the native idempotent form.
+        match self.backend {
+            Backend::Sqlite => {
+                let _ = sqlx::query("ALTER TABLE observations ADD COLUMN output_blob TEXT")
+                    .execute(&self.pool)
+                    .await;
+            }
+            Backend::Postgres => {
+                sqlx::query("ALTER TABLE observations ADD COLUMN IF NOT EXISTS output_blob TEXT")
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+
         // Memories table (branched for FTS5 vs tsvector)
         match self.backend {
             Backend::Sqlite => {
@@ -375,9 +393,19 @@ pub async fn insert_observation(
     // release profile's `panic="abort"` that takes the whole MCP server down.
     let truncated_output = output.map(|o| crate::strutil::safe_truncate(o, max_bytes));
 
+    // CCR: when truncation would lose bytes, preserve the verbatim original in
+    // the content-addressed blob store and keep only the short FTS preview
+    // inline. Below the cap there is nothing to lose, so we skip the blob.
+    let output_blob: Option<String> = match output {
+        Some(o) if o.len() > max_bytes => {
+            Some(crate::ccr::store_blob(db, o.as_bytes(), None).await?.hash)
+        }
+        _ => None,
+    };
+
     let row: sqlx::any::AnyRow = sqlx::query(
-        "INSERT INTO observations (session_id, project, tool, input, output, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        "INSERT INTO observations (session_id, project, tool, input, output, output_blob, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING id",
     )
     .bind(session_id)
@@ -385,6 +413,7 @@ pub async fn insert_observation(
     .bind(tool)
     .bind(input)
     .bind(truncated_output.as_deref())
+    .bind(output_blob.as_deref())
     .bind(now)
     .fetch_one(&db.pool)
     .await?;
@@ -1330,6 +1359,52 @@ mod tests {
         let stored = obs[0].output.as_deref().unwrap();
         assert!(stored.starts_with("abcdefg"));
         assert!(stored.ends_with("… [truncated]"));
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn insert_observation_backs_large_output_with_lossless_blob() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let s = create_session(&db, "/tmp/p").await?;
+
+        // ~66 KB of varied multibyte content; cap the inline preview at 2048 B.
+        let big = "héllo ✓ wörld 日本語 🦀 ".repeat(2000);
+        assert!(big.len() > 50_000);
+        let id = insert_observation(&db, &s, "/tmp/p", "Read", None, Some(&big), 2048).await?;
+
+        // Inline output is just a truncated preview, not the full original.
+        let obs = get_observations_for_session(&db, &s).await?;
+        let preview = obs[0].output.as_deref().unwrap();
+        assert!(preview.len() < big.len());
+        assert!(preview.ends_with("… [truncated]"));
+
+        // output_blob resolves via CCR to the byte-exact full original.
+        let blob_hash: Option<String> =
+            sqlx::query("SELECT output_blob FROM observations WHERE id = $1")
+                .bind(id)
+                .fetch_one(&db.pool)
+                .await?
+                .try_get("output_blob")
+                .ok()
+                .flatten();
+        let blob_hash = blob_hash.expect("large output must record an output_blob");
+        let restored = crate::ccr::load_blob(&db, &blob_hash).await?;
+        assert_eq!(restored, big.as_bytes(), "CCR must return the exact original");
+
+        // A small output below the cap stores no blob (no overhead).
+        let small_id =
+            insert_observation(&db, &s, "/tmp/p", "Read", None, Some("tiny"), 2048).await?;
+        let small_blob: Option<String> =
+            sqlx::query("SELECT output_blob FROM observations WHERE id = $1")
+                .bind(small_id)
+                .fetch_one(&db.pool)
+                .await?
+                .try_get("output_blob")
+                .ok()
+                .flatten();
+        assert!(small_blob.is_none(), "small output should not allocate a blob");
 
         let _ = std::fs::remove_file(path);
         Ok(())
