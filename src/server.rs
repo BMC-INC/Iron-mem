@@ -177,6 +177,7 @@ async fn record_event(
 #[derive(Deserialize)]
 pub struct RetrieveOriginalRequest {
     pub observation_id: Option<i64>,
+    pub memory_id: Option<i64>,
     pub hash: Option<String>,
 }
 
@@ -191,25 +192,33 @@ async fn retrieve_original(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RetrieveOriginalRequest>,
 ) -> Result<Json<RetrieveOriginalResponse>, (StatusCode, String)> {
-    let hash = match body.hash {
-        Some(h) => h,
-        None => match body.observation_id {
-            Some(oid) => db::get_observation_output_blob(&state.db, oid)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-                .ok_or_else(|| {
-                    (
-                        StatusCode::NOT_FOUND,
-                        format!("observation {oid} has no stored original"),
-                    )
-                })?,
-            None => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "provide 'observation_id' or 'hash'".to_string(),
-                ))
-            }
-        },
+    let hash = if let Some(h) = body.hash {
+        h
+    } else if let Some(oid) = body.observation_id {
+        db::get_observation_output_blob(&state.db, oid)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("observation {oid} has no stored original"),
+                )
+            })?
+    } else if let Some(mid) = body.memory_id {
+        db::get_memory_session_blob(&state.db, mid)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("memory {mid} has no stored session transcript"),
+                )
+            })?
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "provide 'observation_id', 'memory_id', or 'hash'".to_string(),
+        ));
     };
 
     let bytes = crate::ccr::load_blob(&state.db, &hash)

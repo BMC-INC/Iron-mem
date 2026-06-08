@@ -278,6 +278,21 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // CCR: link a memory to the verbatim pre-LLM session transcript blob
+        // behind its lossy summary. Additive + backward-compatible.
+        match self.backend {
+            Backend::Sqlite => {
+                let _ = sqlx::query("ALTER TABLE memory_meta ADD COLUMN session_blob TEXT")
+                    .execute(&self.pool)
+                    .await;
+            }
+            Backend::Postgres => {
+                sqlx::query("ALTER TABLE memory_meta ADD COLUMN IF NOT EXISTS session_blob TEXT")
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+
         Ok(())
     }
 
@@ -923,6 +938,26 @@ pub async fn delete_memory_meta(db: &Database, memory_id: i64) -> Result<()> {
         .execute(&db.pool)
         .await?;
     Ok(())
+}
+
+/// Link a memory to its verbatim pre-LLM session transcript blob (CCR).
+pub async fn set_memory_session_blob(db: &Database, memory_id: i64, hash: &str) -> Result<()> {
+    sqlx::query("UPDATE memory_meta SET session_blob = $1 WHERE memory_id = $2")
+        .bind(hash)
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+/// The CCR blob hash of a memory's session transcript, if one was stored.
+pub async fn get_memory_session_blob(db: &Database, memory_id: i64) -> Result<Option<String>> {
+    let row: Option<sqlx::any::AnyRow> =
+        sqlx::query("SELECT session_blob FROM memory_meta WHERE memory_id = $1")
+            .bind(memory_id)
+            .fetch_optional(&db.pool)
+            .await?;
+    Ok(row.and_then(|r| r.try_get::<Option<String>, _>("session_blob").ok().flatten()))
 }
 
 // ── CCR blob store accessors ──────────────────────────────────────────────────

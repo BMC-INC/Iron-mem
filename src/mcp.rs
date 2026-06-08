@@ -144,12 +144,13 @@ impl IronMemServer {
             ),
             Tool::new(
                 "retrieve_original",
-                "Retrieve the verbatim original behind a compressed/truncated observation. Provide observation_id (preferred) or a blob hash.",
+                "Retrieve the verbatim original behind a compressed/truncated memory. Provide observation_id (full tool output), memory_id (full pre-LLM session transcript), or a blob hash.",
                 schema(serde_json::json!({
                     "type": "object",
                     "properties": {
                         "observation_id": { "type": "integer", "description": "Observation id whose full original output to retrieve" },
-                        "hash": { "type": "string", "description": "Blob content hash (alternative to observation_id)" }
+                        "memory_id": { "type": "integer", "description": "Memory id whose verbatim pre-LLM session transcript to retrieve" },
+                        "hash": { "type": "string", "description": "Blob content hash (alternative to observation_id / memory_id)" }
                     }
                 })),
             ),
@@ -346,27 +347,37 @@ impl IronMemServer {
         args: &JsonObject,
     ) -> Result<CallToolResult, ErrorData> {
         // Resolve the blob hash from an explicit `hash`, or via `observation_id`.
-        let hash = match args.get("hash").and_then(|v| v.as_str()) {
-            Some(h) => h.to_string(),
-            None => match args.get("observation_id").and_then(|v| v.as_i64()) {
-                Some(oid) => {
-                    match db::get_observation_output_blob(&self.db, oid)
-                        .await
-                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
-                    {
-                        Some(h) => h,
-                        None => return Ok(error_result(format!(
-                            "observation {oid} has no stored original (output fit under the preview cap, or the id is unknown)"
-                        ))),
-                    }
-                }
+        let hash = if let Some(h) = args.get("hash").and_then(|v| v.as_str()) {
+            h.to_string()
+        } else if let Some(oid) = args.get("observation_id").and_then(|v| v.as_i64()) {
+            match db::get_observation_output_blob(&self.db, oid)
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            {
+                Some(h) => h,
                 None => {
-                    return Err(ErrorData::invalid_params(
-                        "provide 'observation_id' or 'hash'",
-                        None,
-                    ))
+                    return Ok(error_result(format!(
+                        "observation {oid} has no stored original (output fit under the preview cap, or the id is unknown)"
+                    )))
                 }
-            },
+            }
+        } else if let Some(mid) = args.get("memory_id").and_then(|v| v.as_i64()) {
+            match db::get_memory_session_blob(&self.db, mid)
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            {
+                Some(h) => h,
+                None => {
+                    return Ok(error_result(format!(
+                        "memory {mid} has no stored session transcript"
+                    )))
+                }
+            }
+        } else {
+            return Err(ErrorData::invalid_params(
+                "provide 'observation_id', 'memory_id', or 'hash'",
+                None,
+            ));
         };
 
         match crate::ccr::load_blob(&self.db, &hash).await {
@@ -916,6 +927,41 @@ mod tests {
 
         // Graceful (not an MCP protocol error): a success result with ok=false.
         let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(v["ok"], false);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn retrieve_original_by_memory_id_returns_transcript() {
+        let (server, path) = test_server().await;
+        let s = db::create_session(&server.db, "/tmp/p").await.unwrap();
+        let mem_id = db::insert_memory(&server.db, "/tmp/p", &s, "summary", Some("t"))
+            .await
+            .unwrap();
+        db::upsert_memory_meta(&server.db, mem_id, 0.5).await.unwrap();
+
+        let transcript = "## Read\ninput: x\noutput: y\n\n";
+        let r = crate::ccr::store_blob(&server.db, transcript.as_bytes(), None)
+            .await
+            .unwrap();
+        db::set_memory_session_blob(&server.db, mem_id, &r.hash)
+            .await
+            .unwrap();
+
+        let mut args = JsonObject::new();
+        args.insert("memory_id".into(), serde_json::json!(mem_id));
+        let result = server.handle_retrieve_original(&args).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["original"].as_str().unwrap(), transcript);
+
+        // Unknown memory id → graceful ok:false.
+        let mut args = JsonObject::new();
+        args.insert("memory_id".into(), serde_json::json!(987_654));
+        let v: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_retrieve_original(&args).await.unwrap()))
+                .unwrap();
         assert_eq!(v["ok"], false);
 
         let _ = std::fs::remove_file(path);

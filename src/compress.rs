@@ -27,7 +27,54 @@ pub async fn run(
     let observations = db::get_observations_for_session(db, session_id).await?;
     let result = provider::compress(&observations, cfg).await?;
 
-    persist(db, embedder, store, &session.project, session_id, result).await
+    let memory_id = persist(db, embedder, store, &session.project, session_id, result).await?;
+
+    // CCR: preserve the verbatim pre-LLM transcript behind the lossy summary so
+    // it can be retrieved later. Best-effort — never fail a successful
+    // compression because the transcript blob could not be stored.
+    if let Err(e) = store_session_transcript(db, memory_id, &observations).await {
+        tracing::warn!("CCR session transcript store failed (memory {memory_id}): {e}");
+    }
+    Ok(memory_id)
+}
+
+/// Render observations into a plain-text transcript (the pre-LLM session view).
+fn build_transcript(observations: &[db::Observation]) -> String {
+    let mut s = String::new();
+    for o in observations {
+        s.push_str("## ");
+        s.push_str(&o.tool);
+        s.push('\n');
+        if let Some(input) = &o.input {
+            s.push_str("input: ");
+            s.push_str(input);
+            s.push('\n');
+        }
+        if let Some(output) = &o.output {
+            s.push_str("output: ");
+            s.push_str(output);
+            s.push('\n');
+        }
+        s.push('\n');
+    }
+    s
+}
+
+/// Store the verbatim session transcript as a CCR blob and link it to `memory_id`
+/// via `memory_meta.session_blob`. Returns the blob hash, or `None` when there
+/// were no observations to record.
+pub async fn store_session_transcript(
+    db: &Database,
+    memory_id: i64,
+    observations: &[db::Observation],
+) -> Result<Option<String>> {
+    let transcript = build_transcript(observations);
+    if transcript.is_empty() {
+        return Ok(None);
+    }
+    let hash = crate::ccr::store_blob(db, transcript.as_bytes(), None).await?.hash;
+    db::set_memory_session_blob(db, memory_id, &hash).await?;
+    Ok(Some(hash))
 }
 
 /// Persist an already-computed compression result. Inserts the memory, marks
@@ -127,6 +174,55 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn store_session_transcript_round_trips() {
+        let path = std::env::temp_dir().join(format!("ironmem-cmp3-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::new(&path.to_string_lossy()).await.unwrap();
+        db.migrate().await.unwrap();
+        let session = create_session(&db, "/tmp/p").await.unwrap();
+        let store = crate::vectorstore::BruteForceStore;
+
+        db::insert_observation(&db, &session, "/tmp/p", "Read", Some("src/main.rs"), Some("fn main(){}"), 2048)
+            .await
+            .unwrap();
+        db::insert_observation(&db, &session, "/tmp/p", "Bash", Some("cargo test"), Some("ok"), 2048)
+            .await
+            .unwrap();
+        let observations = db::get_observations_for_session(&db, &session).await.unwrap();
+
+        let result = CompressionResult {
+            summary: "s".into(),
+            tags: "t".into(),
+            importance: 5,
+        };
+        let memory_id = persist(&db, None, &store, "/tmp/p", &session, result)
+            .await
+            .unwrap();
+
+        let hash = store_session_transcript(&db, memory_id, &observations)
+            .await
+            .unwrap()
+            .expect("transcript stored");
+
+        // Linked on the memory and retrievable byte-exact.
+        assert_eq!(
+            db::get_memory_session_blob(&db, memory_id).await.unwrap(),
+            Some(hash.clone())
+        );
+        let restored = crate::ccr::load_blob(&db, &hash).await.unwrap();
+        let expected = build_transcript(&observations);
+        assert_eq!(String::from_utf8(restored).unwrap(), expected);
+        assert!(expected.contains("## Read"));
+
+        // No observations → nothing stored.
+        assert!(store_session_transcript(&db, memory_id, &[])
+            .await
+            .unwrap()
+            .is_none());
+
         let _ = std::fs::remove_file(path);
     }
 }
