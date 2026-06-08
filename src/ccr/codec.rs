@@ -18,8 +18,8 @@ pub trait Codec: Send + Sync {
     fn decompress(&self, input: &[u8]) -> anyhow::Result<Vec<u8>>;
 }
 
-/// The default zstd compression level for the floor codec.
-const ZSTD_LEVEL: i32 = 19;
+/// The default zstd compression level for the floor + dictionary codecs.
+pub(crate) const ZSTD_LEVEL: i32 = 19;
 
 /// Select the codec to use when **storing** a blob of the given content type.
 ///
