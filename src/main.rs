@@ -2,6 +2,7 @@ mod ccr;
 mod compress;
 mod config;
 mod context;
+mod corrections;
 mod db;
 #[cfg(test)]
 mod e2e;
@@ -133,6 +134,19 @@ enum Commands {
         refresh: bool,
     },
 
+    /// List mined error→fix corrections (kind=error_solution)
+    Corrections {
+        /// Project root path (defaults to current directory; use --all for every project)
+        #[arg(short, long)]
+        project: Option<String>,
+        /// List corrections across every project
+        #[arg(short, long)]
+        all: bool,
+        /// Max results
+        #[arg(short, long, default_value = "10")]
+        limit: i64,
+    },
+
     /// Manually compress a session
     Compress {
         /// Session ID to compress
@@ -229,6 +243,11 @@ async fn main() -> Result<()> {
             .await?
         }
         Commands::Profile { refresh } => run_profile(&cfg, refresh).await?,
+        Commands::Corrections {
+            project,
+            all,
+            limit,
+        } => run_corrections(&cfg, project.as_deref(), all, limit).await?,
         Commands::Compress { session_id } => run_compress_cmd(&cfg, &session_id).await?,
         Commands::Gc => run_gc(&cfg).await?,
         Commands::Embed {
@@ -729,6 +748,38 @@ async fn run_profile(cfg: &config::Config, refresh: bool) -> Result<()> {
         None => println!(
             "(no profile yet — add facts with `ironmem remember --scope user ...`, then `ironmem profile --refresh`)"
         ),
+    }
+    Ok(())
+}
+
+async fn run_corrections(
+    cfg: &config::Config,
+    project: Option<&str>,
+    all: bool,
+    limit: i64,
+) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+
+    let filter = if all {
+        None
+    } else {
+        Some(resolve_project(project)?)
+    };
+    let corrections =
+        db::get_memories_by_kind(&database, filter.as_deref(), "error_solution", limit).await?;
+
+    if corrections.is_empty() {
+        match &filter {
+            Some(p) => println!("No corrections recorded for {p}."),
+            None => println!("No corrections recorded."),
+        }
+        return Ok(());
+    }
+
+    println!("{} correction(s):", corrections.len());
+    for c in &corrections {
+        println!("\n• {}", c.summary);
     }
     Ok(())
 }

@@ -35,6 +35,15 @@ pub async fn run(
     if let Err(e) = store_session_transcript(db, memory_id, &observations).await {
         tracing::warn!("CCR session transcript store failed (memory {memory_id}): {e}");
     }
+
+    // Feedback loop: mine error→fix corrections into error_solution memories.
+    // Best-effort — never fail compression because mining hiccuped.
+    if let Err(e) =
+        crate::corrections::mine_and_store(db, embedder, store, &session.project, session_id, &observations)
+            .await
+    {
+        tracing::warn!("correction mining failed (session {session_id}): {e}");
+    }
     Ok(memory_id)
 }
 
