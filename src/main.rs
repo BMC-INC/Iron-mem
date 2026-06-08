@@ -113,6 +113,9 @@ enum Commands {
         session_id: String,
     },
 
+    /// Garbage-collect unreferenced CCR blobs (reclaim space after wipes)
+    Gc,
+
     /// Backfill semantic embeddings for existing memories
     Embed {
         /// Project root path (defaults to all projects)
@@ -183,6 +186,7 @@ async fn main() -> Result<()> {
         Commands::Wipe { project, force } => run_wipe(&cfg, project.as_deref(), force).await?,
         Commands::Inject { project, limit } => run_inject(&cfg, project.as_deref(), limit).await?,
         Commands::Compress { session_id } => run_compress_cmd(&cfg, &session_id).await?,
+        Commands::Gc => run_gc(&cfg).await?,
         Commands::Embed {
             project,
             all,
@@ -399,6 +403,14 @@ async fn run_cloudflare_tunnel(port: u16, auth_token: Option<String>) {
 
         let _ = child.wait().await;
     }
+}
+
+async fn run_gc(cfg: &config::Config) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let (count, bytes) = db::gc_blobs(&database).await?;
+    println!("🧹 CCR gc: removed {count} unreferenced blob(s), freed {bytes} compressed bytes");
+    Ok(())
 }
 
 async fn run_status(cfg: &config::Config) -> Result<()> {

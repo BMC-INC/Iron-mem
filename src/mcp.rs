@@ -455,6 +455,7 @@ impl IronMemServer {
             "memories": stats.total_memories,
             "observations": stats.total_observations,
             "db_path": self.config.db_path,
+            "ccr": stats.ccr_json(),
         });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
@@ -600,6 +601,11 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         for id in ids {
+            // Release the CCR session-transcript reference before purge_memory
+            // deletes the memory_meta row that records it.
+            if let Err(e) = db::decref_memory_session_blob(&self.db, id).await {
+                tracing::warn!("CCR decref failed for memory {id}: {e}");
+            }
             if let Err(e) = vectorstore::purge_memory(&self.db, self.store.as_ref(), id).await {
                 tracing::warn!("vector/meta cleanup failed for memory {id}: {e}");
             }

@@ -291,6 +291,7 @@ pub struct StatusResponse {
     pub memories: i64,
     pub observations: i64,
     pub db_path: String,
+    pub ccr: serde_json::Value,
 }
 
 async fn get_status(
@@ -306,6 +307,7 @@ async fn get_status(
         memories: stats.total_memories,
         observations: stats.total_observations,
         db_path: state.config.db_path.clone(),
+        ccr: stats.ccr_json(),
     }))
 }
 
@@ -379,7 +381,10 @@ async fn api_delete_memory(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if deleted {
-        // Best-effort: never fail the delete because vector cleanup hiccuped.
+        // Best-effort: never fail the delete because cleanup hiccuped.
+        if let Err(e) = db::decref_memory_session_blob(&state.db, id).await {
+            tracing::warn!("CCR decref failed for memory {id}: {e}");
+        }
         if let Err(e) = vectorstore::purge_memory(&state.db, state.store.as_ref(), id).await {
             tracing::warn!("vector/meta cleanup failed for memory {id}: {e}");
         }

@@ -1095,25 +1095,39 @@ pub async fn recent_blob_hashes_by_type(
     Ok(rows.into_iter().map(|r| r.get::<String, _>("hash")).collect())
 }
 
-/// Increment a blob's reference count (a new linker points at existing bytes).
-#[allow(dead_code)]
-pub async fn incref_blob(db: &Database, hash: &str) -> Result<()> {
-    sqlx::query("UPDATE blobs SET refcount = refcount + 1 WHERE hash = $1")
-        .bind(hash)
-        .execute(&db.pool)
-        .await?;
-    Ok(())
-}
-
 /// Decrement a blob's reference count, floored at zero. A blob at `refcount = 0`
-/// is left in place for `gc` to reclaim (Chunk 3); it is never deleted here.
-#[allow(dead_code)]
+/// is left in place for `gc_blobs` to reclaim; it is never deleted here.
 pub async fn decref_blob(db: &Database, hash: &str) -> Result<()> {
     sqlx::query("UPDATE blobs SET refcount = refcount - 1 WHERE hash = $1 AND refcount > 0")
         .bind(hash)
         .execute(&db.pool)
         .await?;
     Ok(())
+}
+
+/// Release a memory's session-transcript blob reference (if any). Must be called
+/// while the memory_meta row still exists, i.e. before purging it.
+pub async fn decref_memory_session_blob(db: &Database, memory_id: i64) -> Result<()> {
+    if let Some(hash) = get_memory_session_blob(db, memory_id).await? {
+        decref_blob(db, &hash).await?;
+    }
+    Ok(())
+}
+
+/// Delete every blob with no remaining references. Returns
+/// `(blobs_removed, compressed_bytes_freed)`.
+pub async fn gc_blobs(db: &Database) -> Result<(i64, i64)> {
+    let r: sqlx::any::AnyRow = sqlx::query(
+        "SELECT COUNT(*) AS cnt, COALESCE(SUM(comp_len), 0) AS bytes FROM blobs WHERE refcount <= 0",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    let count: i64 = r.get("cnt");
+    let bytes: i64 = r.get("bytes");
+    sqlx::query("DELETE FROM blobs WHERE refcount <= 0")
+        .execute(&db.pool)
+        .await?;
+    Ok((count, bytes))
 }
 
 /// Memory ids (rowid in sqlite / id in pg) with no embedding row for `model`,
@@ -1217,6 +1231,41 @@ pub struct DbStats {
     pub total_sessions: i64,
     pub total_memories: i64,
     pub total_observations: i64,
+    /// Distinct CCR blobs stored.
+    pub ccr_blobs: i64,
+    /// Sum of original (uncompressed) bytes across distinct blobs.
+    pub ccr_orig_bytes: i64,
+    /// Sum of stored compressed bytes across distinct blobs.
+    pub ccr_comp_bytes: i64,
+    /// Sum of original bytes weighted by refcount — what would have been stored
+    /// uncompressed and without dedup. `logical / orig` is the dedup factor.
+    pub ccr_logical_bytes: i64,
+}
+
+impl DbStats {
+    /// CCR storage stats as JSON: blob count, original vs stored bytes,
+    /// compression %, dedup factor, and total bytes saved vs naive storage.
+    pub fn ccr_json(&self) -> serde_json::Value {
+        let comp_pct = if self.ccr_orig_bytes > 0 {
+            100.0 * (1.0 - self.ccr_comp_bytes as f64 / self.ccr_orig_bytes as f64)
+        } else {
+            0.0
+        };
+        let dedup_factor = if self.ccr_orig_bytes > 0 {
+            self.ccr_logical_bytes as f64 / self.ccr_orig_bytes as f64
+        } else {
+            1.0
+        };
+        serde_json::json!({
+            "blobs": self.ccr_blobs,
+            "original_bytes": self.ccr_orig_bytes,
+            "stored_bytes": self.ccr_comp_bytes,
+            "logical_bytes": self.ccr_logical_bytes,
+            "compression_pct": (comp_pct * 10.0).round() / 10.0,
+            "dedup_factor": (dedup_factor * 100.0).round() / 100.0,
+            "bytes_saved": self.ccr_logical_bytes - self.ccr_comp_bytes,
+        })
+    }
 }
 
 pub async fn get_stats(db: &Database) -> Result<DbStats> {
@@ -1235,10 +1284,24 @@ pub async fn get_stats(db: &Database) -> Result<DbStats> {
         .await?;
     let observations: i64 = r.get("cnt");
 
+    let r: sqlx::any::AnyRow = sqlx::query(
+        "SELECT COUNT(*) AS cnt,
+                COALESCE(SUM(orig_len), 0) AS orig,
+                COALESCE(SUM(comp_len), 0) AS comp,
+                COALESCE(SUM(orig_len * refcount), 0) AS logical
+         FROM blobs",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+
     Ok(DbStats {
         total_sessions: sessions,
         total_memories: memories,
         total_observations: observations,
+        ccr_blobs: r.get("cnt"),
+        ccr_orig_bytes: r.get("orig"),
+        ccr_comp_bytes: r.get("comp"),
+        ccr_logical_bytes: r.get("logical"),
     })
 }
 
@@ -1390,9 +1453,7 @@ mod tests {
         insert_blob(&db, "abc123", "text", "zstd", 10, 4, b"\x01\x02\x03\x04", None).await?;
         assert_eq!(get_blob(&db, "abc123").await?.unwrap().refcount, 2);
 
-        // incref / decref adjust the count; decref to 0 leaves the row for GC.
-        incref_blob(&db, "abc123").await?; // 3
-        decref_blob(&db, "abc123").await?; // 2
+        // decref to 0 leaves the row in place for gc_blobs to reclaim.
         decref_blob(&db, "abc123").await?; // 1
         decref_blob(&db, "abc123").await?; // 0
         let row = get_blob(&db, "abc123")
@@ -1430,6 +1491,72 @@ mod tests {
         // A dict-less blob has no dict_hash.
         insert_blob(&db, "b2", "text", "zstd", 10, 8, b"plain", None).await?;
         assert_eq!(get_blob(&db, "b2").await?.unwrap().dict_hash, None);
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gc_reclaims_only_unreferenced_blobs() -> Result<()> {
+        let (db, path) = test_db().await?;
+        insert_blob(&db, "g1", "text", "zstd", 5, 3, b"abc", None).await?; // rc 1
+        insert_blob(&db, "g2", "text", "zstd", 5, 3, b"xyz", None).await?; // rc 1
+        insert_blob(&db, "shared", "text", "zstd", 5, 3, b"sha", None).await?; // rc 1
+        insert_blob(&db, "shared", "text", "zstd", 5, 3, b"sha", None).await?; // rc 2
+
+        assert_eq!(gc_blobs(&db).await?.0, 0);
+
+        decref_blob(&db, "g1").await?;
+        assert_eq!(gc_blobs(&db).await?.0, 1);
+        assert!(get_blob(&db, "g1").await?.is_none());
+        assert!(get_blob(&db, "g2").await?.is_some());
+
+        // Shared blob survives until the last reference is released.
+        decref_blob(&db, "shared").await?;
+        assert_eq!(gc_blobs(&db).await?.0, 0);
+        assert!(get_blob(&db, "shared").await?.is_some());
+        decref_blob(&db, "shared").await?;
+        assert_eq!(gc_blobs(&db).await?.0, 1);
+        assert!(get_blob(&db, "shared").await?.is_none());
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_memory_releases_its_session_blob() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let s = create_session(&db, "/tmp/p").await?;
+        let mid = insert_memory(&db, "/tmp/p", &s, "sum", None).await?;
+        upsert_memory_meta(&db, mid, 0.5).await?;
+        insert_blob(&db, "tx", "text", "zstd", 10, 5, b"hello", None).await?; // rc 1
+        set_memory_session_blob(&db, mid, "tx").await?;
+        assert_eq!(get_memory_session_blob(&db, mid).await?, Some("tx".to_string()));
+
+        decref_memory_session_blob(&db, mid).await?;
+        assert_eq!(gc_blobs(&db).await?.0, 1);
+        assert!(get_blob(&db, "tx").await?.is_none());
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ccr_stats_report_blob_totals_and_dedup() -> Result<()> {
+        let (db, path) = test_db().await?;
+        insert_blob(&db, "s1", "json", "zstd", 100, 40, b"....", None).await?; // rc 1
+        insert_blob(&db, "s2", "json", "zstd", 200, 50, b"....", None).await?; // rc 1
+        insert_blob(&db, "s2", "json", "zstd", 200, 50, b"....", None).await?; // dedup → rc 2
+
+        let stats = get_stats(&db).await?;
+        assert_eq!(stats.ccr_blobs, 2);
+        assert_eq!(stats.ccr_orig_bytes, 300);
+        assert_eq!(stats.ccr_comp_bytes, 90);
+        assert_eq!(stats.ccr_logical_bytes, 100 + 200 * 2); // refcount-weighted
+
+        let json = stats.ccr_json();
+        assert_eq!(json["blobs"], 2);
+        assert_eq!(json["bytes_saved"], 500 - 90);
 
         let _ = std::fs::remove_file(path);
         Ok(())
