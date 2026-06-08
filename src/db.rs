@@ -1163,6 +1163,51 @@ pub async fn count_user_memories(db: &Database) -> Result<i64> {
     Ok(row.get("cnt"))
 }
 
+/// Recent memories of a given `kind` (clamped), newest first. With `project`
+/// set, restricts to that project; otherwise returns matches across all
+/// projects. Used to surface typed memories like `error_solution` corrections.
+pub async fn get_memories_by_kind(
+    db: &Database,
+    project: Option<&str>,
+    kind: &str,
+    limit: i64,
+) -> Result<Vec<Memory>> {
+    let id_col = match db.backend {
+        Backend::Sqlite => "m.rowid",
+        Backend::Postgres => "m.id",
+    };
+    let mut sql = format!(
+        "SELECT {id_col} AS id, m.project, m.session_id, m.summary, m.tags, m.created_at
+         FROM memories m
+         JOIN memory_meta mm ON mm.memory_id = {id_col}
+         WHERE mm.kind = $1"
+    );
+    let limit_ph = if project.is_some() {
+        sql.push_str(" AND m.project = $2");
+        "$3"
+    } else {
+        "$2"
+    };
+    sql.push_str(&format!(" ORDER BY m.created_at DESC LIMIT {limit_ph}"));
+
+    let mut q = sqlx::query(&sql).bind(clamp_kind(kind));
+    if let Some(p) = project {
+        q = q.bind(p);
+    }
+    let rows: Vec<sqlx::any::AnyRow> = q.bind(limit).fetch_all(&db.pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r: sqlx::any::AnyRow| Memory {
+            id: r.get("id"),
+            project: r.get("project"),
+            session_id: r.get("session_id"),
+            summary: r.get("summary"),
+            tags: r.try_get("tags").ok().flatten(),
+            created_at: r.get("created_at"),
+        })
+        .collect())
+}
+
 pub async fn delete_memory_meta(db: &Database, memory_id: i64) -> Result<()> {
     sqlx::query("DELETE FROM memory_meta WHERE memory_id = $1")
         .bind(memory_id)
@@ -1859,6 +1904,36 @@ mod tests {
         set_memory_scope_kind(&db, m1, "bogus-scope", "bogus-kind").await?;
         let i1b = get_memory_meta_full(&db, m1).await?;
         assert_eq!((i1b.scope.as_str(), i1b.kind.as_str()), ("project", "session"));
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_memories_by_kind_filters_by_kind_and_project() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let a = "/tmp/a";
+        let b = "/tmp/b";
+        let sa = create_session(&db, a).await?;
+        let sb = create_session(&db, b).await?;
+
+        let e1 = insert_memory(&db, a, &sa, "Error: x failed; Fix: edited y", Some("fix")).await?;
+        set_memory_scope_kind(&db, e1, "project", "error_solution").await?;
+        let e2 = insert_memory(&db, b, &sb, "Error: z failed; Fix: edited w", Some("fix")).await?;
+        set_memory_scope_kind(&db, e2, "project", "error_solution").await?;
+        let plain = insert_memory(&db, a, &sa, "ordinary session", Some("s")).await?;
+        set_memory_scope_kind(&db, plain, "project", "session").await?;
+
+        // Project-scoped: only a's error_solution.
+        let a_fixes = get_memories_by_kind(&db, Some(a), "error_solution", 10).await?;
+        let a_ids: Vec<i64> = a_fixes.iter().map(|m| m.id).collect();
+        assert_eq!(a_ids, vec![e1]);
+
+        // Global: both error_solutions, not the plain session.
+        let all_fixes = get_memories_by_kind(&db, None, "error_solution", 10).await?;
+        let all_ids: Vec<i64> = all_fixes.iter().map(|m| m.id).collect();
+        assert!(all_ids.contains(&e1) && all_ids.contains(&e2));
+        assert!(!all_ids.contains(&plain));
 
         let _ = std::fs::remove_file(path);
         Ok(())

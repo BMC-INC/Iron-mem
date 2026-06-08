@@ -48,6 +48,7 @@ pub fn router(state: AppState) -> Router {
         .route("/remember", post(remember))
         .route("/profile", get(get_profile))
         .route("/refresh_profile", post(refresh_profile))
+        .route("/corrections", get(list_corrections))
         // Web UI routes
         .route("/ui", get(web_ui))
         .route("/api/projects", get(api_list_projects))
@@ -321,6 +322,30 @@ async fn refresh_profile(
         regenerated: id.is_some(),
         profile,
     }))
+}
+
+// GET /corrections?project=&limit=  (mined error_solution memories)
+#[derive(Deserialize)]
+pub struct CorrectionsQuery {
+    pub project: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Serialize)]
+pub struct CorrectionsResponse {
+    pub corrections: Vec<db::Memory>,
+}
+
+async fn list_corrections(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<CorrectionsQuery>,
+) -> Result<Json<CorrectionsResponse>, (StatusCode, String)> {
+    let limit = params.limit.unwrap_or(10);
+    let corrections =
+        db::get_memories_by_kind(&state.db, params.project.as_deref(), "error_solution", limit)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(CorrectionsResponse { corrections }))
 }
 
 // POST /compress  (manual trigger)

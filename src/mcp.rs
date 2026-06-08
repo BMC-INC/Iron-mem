@@ -259,6 +259,17 @@ impl IronMemServer {
                 })),
             ),
             Tool::new(
+                "list_corrections",
+                "List mined error→fix corrections (kind=error_solution) — past failures and how they were resolved. Optionally scope to a project.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project": { "type": "string", "description": "Project root path (omit for all projects)" },
+                        "limit": { "type": "integer", "description": "Max results (default 10)" }
+                    }
+                })),
+            ),
+            Tool::new(
                 "wipe_project",
                 "Delete all memories for a project.",
                 schema(serde_json::json!({
@@ -691,6 +702,23 @@ impl IronMemServer {
         )]))
     }
 
+    async fn handle_list_corrections(
+        &self,
+        args: &JsonObject,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project = args.get("project").and_then(|v| v.as_str());
+        let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10);
+
+        let corrections = db::get_memories_by_kind(&self.db, project, "error_solution", limit)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json = serde_json::json!({ "corrections": corrections });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json).unwrap(),
+        )]))
+    }
+
     async fn handle_wipe_project(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
         let project = args
             .get("project")
@@ -806,6 +834,7 @@ impl ServerHandler for IronMemServer {
             "remember" => self.handle_remember(&args).await,
             "get_profile" => self.handle_get_profile().await,
             "refresh_profile" => self.handle_refresh_profile().await,
+            "list_corrections" => self.handle_list_corrections(&args).await,
             "wipe_project" => self.handle_wipe_project(&args).await,
             _ => Err(ErrorData::invalid_params(
                 format!("unknown tool: {}", request.name),
@@ -1082,6 +1111,63 @@ mod tests {
         assert!(!v2["profile"].is_null());
 
         let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn list_corrections_returns_mined_error_solutions() {
+        let (server, path) = test_server().await;
+        let s = db::create_session(&server.db, "/tmp/p").await.unwrap();
+        let transcript = vec![
+            crate::db::Observation {
+                id: 0,
+                session_id: s.clone(),
+                project: "/tmp/p".into(),
+                tool: "Bash".into(),
+                input: Some("cargo build".into()),
+                output: Some("error[E0425]: cannot find value `foo`".into()),
+                created_at: 0,
+            },
+            crate::db::Observation {
+                id: 0,
+                session_id: s.clone(),
+                project: "/tmp/p".into(),
+                tool: "Edit".into(),
+                input: Some("src/lib.rs".into()),
+                output: Some("ok".into()),
+                created_at: 0,
+            },
+            crate::db::Observation {
+                id: 0,
+                session_id: s.clone(),
+                project: "/tmp/p".into(),
+                tool: "Bash".into(),
+                input: Some("cargo build".into()),
+                output: Some("Finished `dev` profile".into()),
+                created_at: 0,
+            },
+        ];
+        let n = crate::corrections::mine_and_store(
+            &server.db,
+            server.embedder.as_deref(),
+            server.store.as_ref(),
+            "/tmp/p",
+            &s,
+            &transcript,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 1);
+
+        let mut args = JsonObject::new();
+        args.insert("project".into(), serde_json::json!("/tmp/p"));
+        let v: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_list_corrections(&args).await.unwrap()))
+                .unwrap();
+        let arr = v["corrections"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert!(arr[0]["summary"].as_str().unwrap().contains("E0425"));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
