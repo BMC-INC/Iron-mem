@@ -29,6 +29,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Patched 7 Dependabot advisories: **rmcp** 1.2 → 1.7 (GHSA-89vp-x53w-74fx, high), **rustls-webpki** 0.103.10 → 0.103.13 (GHSA-82j2-j2ch-gfr8 high, plus GHSA-965h-392x-2mh5 / GHSA-xgp8-3hg3-c2mh), and **rand** → 0.8.6 / 0.9.3 / 0.10.1 (GHSA-cq8v-f236-94qc).
 
+### Added — Lossless Reversible Memory (CCR)
+
+- **Content-addressed blob store** — a new `blobs` table inside the existing SQLite/Postgres DB stores tool outputs and the verbatim pre-LLM session transcript whole, deduplicated by the sha256 of the original bytes, and compressed by **byte-exact reversible codecs**. `load_blob` re-hashes on read and fails loudly on any mismatch, so the original is recoverable exactly or not at all.
+- **Per-content-type compression** — content type is detected (json / code / log / diff / text / binary) and compressed with a zstd floor plus lazily-trained, content-addressed per-type **dictionaries** (`ccr_dicts` + `blobs.dict_hash`), so dictionaries can retrain without ever breaking an existing blob's round-trip. The dictionary is kept only when it beats the floor (never worse than the floor).
+- **Lossless `record_event`** — when a tool output exceeds the inline preview cap it is preserved whole in the blob store; the inline `output` keeps only a UTF-8-safe preview for search. The full session transcript behind each compressed memory is likewise preserved.
+- **`retrieve_original`** — new MCP tool + REST `POST /retrieve_original` to pull back the verbatim original behind any compressed memory, by `observation_id`, `memory_id`, or blob `hash`.
+- **Refcount GC + stats** — `ironmem gc` reclaims unreferenced blobs; `get_status` now reports CCR storage stats (blob count, original vs. stored bytes, compression %, dedup factor, bytes saved).
+
+### Added — Memory Model: Scoping, Types, Profile & Corrections
+
+- **Scope + kind** — every memory carries a **scope** (`project` or `user`/cross-project) and a **kind** (`session`, `error_solution`, `preference`, `architecture`, `learned_pattern`, `project_config`, `profile`), stored as additive columns on `memory_meta` with constant defaults so existing rows keep working unchanged. Session-start injection ranks **project ∪ user** memories and applies a per-kind multiplier (configurable via `embedding.weights.kind_boosts`) that lifts durable kinds.
+- **`remember`** — new MCP tool + REST `POST /remember` + `ironmem remember` CLI to store an explicit, typed memory (`scope`, `kind`, `text`, `tags`) in one call. User-scope facts surface in every project.
+- **User profile** — cross-project (`scope=user`) memories are distilled into a single, always-injected `kind=profile` memory: an LLM summary when a provider is reachable, otherwise a deterministic local rollup (never blocks, never egresses). It auto-refreshes as user memories accumulate. Read/regenerate via `get_profile` / `refresh_profile` (MCP), `GET /profile` / `POST /refresh_profile` (REST), or `ironmem profile [--refresh]` (CLI).
+- **Compression classifies kind** — session compression now emits a `KIND:` line that is clamped to the known set (default `session`) and recorded on the memory.
+- **Correction miner** — compression scans the session for error→fix loops (a failing command, intervening edits, then the same command passing) and records each as a project-scoped `error_solution` memory; surfaced via `list_corrections` (MCP), `GET /corrections` (REST), and `ironmem corrections` (CLI).
+
+### Changed (cont.)
+
+- **Quick Start now recommends the `~/.ironmem/api_key` file over `export ANTHROPIC_API_KEY`.** Tools that read `ANTHROPIC_API_KEY` from the environment — including Claude Code — will bill against it (pay-as-you-go) instead of your subscription whenever it's set, so the key file keeps IronMem's key out of your shell environment.
+
+### Fixed (cont.)
+
+- **Flaky `mcp_stdio_clean` test on slow CI** — the stdout-is-pure-JSON regression test used a fixed sleep before checking for the `initialize` response, which raced on slow Windows runners. It now waits for the response by content (up to a generous deadline), eliminating the flake without weakening the assertion.
+
 ## [0.1.0] - 2026-03-20
 
 ### Added

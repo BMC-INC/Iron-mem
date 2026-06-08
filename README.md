@@ -45,9 +45,20 @@
 
 <!-- SEO Keywords: AI coding assistant memory, session-aware AI tools, Rust AI tools, context preservation, Claude Code memory, Cursor context -->
 
-## What's New in v0.3.0
+## What's New in v0.4.0
 
-> Now multi-provider, cross-platform, with a built-in web UI.
+> Lossless, reversible memory — plus a real memory model: scoping, typed memories, an always-on user profile, and a correction miner.
+
+- **CCR — losslessly reversible memory** (Headroom pattern) — every truncated tool output and the verbatim pre-LLM session transcript is preserved in a content-addressed, deduplicated, byte-exact compressed blob store inside the DB. The new **`retrieve_original`** tool pulls the exact original back behind any compressed memory. No more lossy truncation.
+- **Memory scoping & typed memories** (Supermemory patterns) — memories carry a **scope** (`project` vs. `user`/cross-project) and a **kind** (`session`, `error_solution`, `preference`, `architecture`, `learned_pattern`, `project_config`, `profile`). Session-start injection ranks **project ∪ user** memories and boosts durable kinds.
+- **`remember` tool** — store an explicit, typed memory in one call (`scope`, `kind`, `text`, `tags`). User-scope facts follow you into every project.
+- **User profile** — your cross-project memories are distilled into a single always-injected profile (LLM summary, or a deterministic local rollup when offline). Read/regenerate with **`get_profile`** / **`refresh_profile`**.
+- **Correction miner** — error→fix loops in a session (a failing command, edits, then the same command passing) are mined into `error_solution` memories and surfaced via **`list_corrections`**, so past fixes resurface when the work recurs.
+- **18 MCP tools** now — adds `retrieve_original`, `remember`, `get_profile`, `refresh_profile`, `list_corrections`.
+- **Still zero telemetry. Still local-first. Your data stays yours.**
+
+<details>
+<summary>v0.3.0</summary>
 
 - **Multi-provider compression** — use OpenAI, Google Gemini, or Anthropic as your LLM. Set `"provider": "openai"` in settings.
 - **Neovim plugin** — native Lua plugin with auto session lifecycle, `:IronMemSearch`, `:IronMemStatus`
@@ -55,6 +66,7 @@
 - **Web UI** — browse, search, and delete memories at `http://localhost:37778/ui`
 - **Discovery tools** — list known projects, search across all projects, and inspect per-project session history
 - **Still zero telemetry. Still local-first. Your data stays yours.**
+</details>
 
 <details>
 <summary>v0.2.0</summary>
@@ -111,10 +123,11 @@ With IronMem:
    ```bash
    curl -fsSL https://raw.githubusercontent.com/BMC-INC/Iron-mem/main/install.sh | bash
    ```
-2. **Add your API key** (in your `~/.zshrc` or `~/.bashrc`):
+2. **Add your API key** to IronMem's key file:
    ```bash
-   export ANTHROPIC_API_KEY="your-key-here"
+   echo "your-key-here" > ~/.ironmem/api_key && chmod 600 ~/.ironmem/api_key
    ```
+   > **Prefer the key file over `export ANTHROPIC_API_KEY`.** Claude Code (and some other tools) bill against `ANTHROPIC_API_KEY` whenever it's set in your shell — using pay-as-you-go API credit instead of your Claude subscription. The key file keeps IronMem's key out of your environment so it can't change how other tools bill. (IronMem still honors `ANTHROPIC_API_KEY` if you prefer the env var.)
 3. **Start coding!** IronMem handles the rest silently in the background.
 
 ---
@@ -221,12 +234,14 @@ cd Iron-mem
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-Add to your shell profile (`~/.zshrc` or `~/.bashrc`):
+Add IronMem to your `PATH` (in `~/.zshrc` or `~/.bashrc`) and write your API key to IronMem's key file:
 
 ```bash
-export PATH="$HOME/.ironmem/bin:$PATH"
-export ANTHROPIC_API_KEY="your-key-here"
+export PATH="$HOME/.ironmem/bin:$PATH"          # in ~/.zshrc / ~/.bashrc
+echo "your-key-here" > ~/.ironmem/api_key && chmod 600 ~/.ironmem/api_key
 ```
+
+> Use the key file, not `export ANTHROPIC_API_KEY` — a global `ANTHROPIC_API_KEY` makes Claude Code (and similar tools) bill against pay-as-you-go API credit instead of your subscription. IronMem reads `~/.ironmem/api_key` automatically.
 
 Restart your terminal and Claude Code. That's it.
 
@@ -249,8 +264,12 @@ ironmem search "auth middleware"  # Hybrid (keyword + semantic) search across me
 ironmem search-global "auth middleware"  # Search across all projects
 ironmem sessions            # Session history for current project
 ironmem inject              # Manually rebuild IRONMEM.md (relevance-ranked)
+ironmem remember "..."      # Store an explicit memory (--scope user, --kind preference, --tags)
+ironmem profile             # Show the user profile (--refresh to regenerate it)
+ironmem corrections         # List mined error→fix memories (--all for every project)
 ironmem compress <id>       # Manually compress a session
 ironmem embed               # Backfill semantic embeddings for existing memories
+ironmem gc                  # Reclaim unreferenced CCR blobs (after wipes)
 ironmem wipe                # Delete all memories for current project
 ironmem config              # Print current settings
 ```
@@ -569,9 +588,11 @@ To switch providers, set `"provider"` in `~/.ironmem/settings.json` and ensure t
 
 ### API Key
 
-IronMem needs an LLM API key to compress session observations into memories. Set the environment variable for your chosen provider (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GOOGLE_API_KEY`).
+IronMem needs an LLM API key to compress session observations into memories.
 
-For the default Anthropic provider, IronMem also checks `~/.ironmem/api_key` as a fallback. This file is auto-created by the session-start hook because the IronMem server runs as a background process via `nohup`, and some environments strip environment variables from child processes. The hook persists your API key with `chmod 600` permissions so the server can always access it.
+**Recommended (Anthropic):** write the key to `~/.ironmem/api_key` (`echo "your-key" > ~/.ironmem/api_key && chmod 600 ~/.ironmem/api_key`). Keeping it in this file rather than a global `ANTHROPIC_API_KEY` export avoids changing how other tools bill — Claude Code, for instance, charges pay-as-you-go API credit whenever `ANTHROPIC_API_KEY` is set in the environment, instead of using your subscription. IronMem reads the file automatically (it also works when the background server is spawned via `nohup`, where some shells strip env vars from child processes).
+
+IronMem still honors the per-provider environment variable if you prefer it — `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GOOGLE_API_KEY`. The file fallback applies to the default Anthropic provider.
 
 ---
 
@@ -597,9 +618,9 @@ If count stays at 0, your hooks may not be installed. Re-run `./install.sh` or c
 **Compression failing (memories always 0):**
 
 ```bash
-# Check if the API key is accessible
+# Check if the API key is accessible (the key file is the recommended source)
 cat ~/.ironmem/api_key                   # Should contain your key
-echo $ANTHROPIC_API_KEY                  # Should be set
+echo $ANTHROPIC_API_KEY                  # Optional env-var fallback (may be empty)
 
 # Try manual compression
 ironmem compress <session-id>            # Get session ID from server.log
@@ -615,9 +636,9 @@ Check that `~/.claude/settings.json` has the hooks registered under the `"hooks"
 ```text
 ~/.ironmem/
 ├── bin/ironmem          # Single compiled binary
-├── mem.db               # SQLite database (FTS5 full-text search)
+├── mem.db               # SQLite DB: memories (FTS5) + vectors + CCR blob store
 ├── settings.json        # Configuration
-├── api_key              # Anthropic API key (auto-persisted, chmod 600)
+├── api_key              # Anthropic API key (chmod 600; keeps it out of your shell env)
 ├── current_session      # Active session ID (ephemeral)
 └── server.log           # Worker logs
 
@@ -628,7 +649,7 @@ Check that `~/.claude/settings.json` has the hooks registered under the `"hooks"
 └── session-end.sh       # Cleanup
 ```
 
-**~2,400 lines of Rust.** MCP-native. SQLite or Postgres. One binary. No external runtimes.
+**~9,000 lines of Rust.** MCP-native. SQLite or Postgres. Lossless, reversible memory. One binary. No external runtimes.
 
 ---
 
@@ -723,12 +744,19 @@ This starts IronMem with Streamable HTTP on `http://localhost:37779/mcp` and Pos
 - [x] Windows native support — `install.ps1`, platform-aware install messages, robust home dir detection
 - [x] Web UI memory browser — `http://localhost:37778/ui` when REST server is running
 
-### In progress / next
+### Shipped in v0.4.0
 
-- [x] **Semantic foundation** — hybrid FTS + vector (RRF) retrieval, local-first embeddings, and relevance-ranked session-start injection (see CHANGELOG `[Unreleased]`)
+- [x] **Semantic foundation** — hybrid FTS + vector (RRF) retrieval, local-first embeddings, and relevance-ranked session-start injection
 - [x] **Reliability & security hardening** — stdio MCP stream is no longer corrupted by log output, UTF-8-safe truncation prevents a crash on multibyte tool output, and 7 dependency advisories were patched
-- [ ] **CCR — losslessly reversible memory** (Headroom pattern): a content-addressed blob store + byte-exact per-content-type compression + a `retrieve_original` tool, so the verbatim original behind any compressed memory is always recoverable — no more lossy truncation. [Design »](docs/superpowers/plans/2026-06-07-ironmem-ccr-supermemory.md)
-- [ ] **Memory scoping & types** (Supermemory patterns): project vs. user (cross-project) scope, typed memories (error-solution / preference / architecture / learned-pattern), and an always-injected user profile
+- [x] **CCR — losslessly reversible memory** (Headroom pattern): a content-addressed, deduplicated blob store + byte-exact per-content-type compression (zstd + per-type dictionaries) + a `retrieve_original` tool, so the verbatim original behind any compressed memory is always recoverable — no more lossy truncation. Refcount GC (`ironmem gc`) + storage stats in `get_status`. [Design »](docs/superpowers/plans/2026-06-07-ironmem-ccr-supermemory.md)
+- [x] **Memory scoping & types** (Supermemory patterns): project vs. user (cross-project) scope, typed memories (`error_solution` / `preference` / `architecture` / `learned_pattern` / …), scope-aware injection with per-kind boosts, and a `remember` tool
+- [x] **Always-injected user profile** — cross-project facts distilled into one profile memory (LLM summary or deterministic local rollup); `get_profile` / `refresh_profile`
+- [x] **Correction miner** — error→fix loops become `error_solution` memories, surfaced via `list_corrections`
+
+### Next
+
+- [ ] **Bespoke per-content-type transforms** — invertible log timestamp-delta / diff-token / AST-aware code normalization on top of the dictionary codecs (currently documented-future; the byte-exact contract is the gate)
+- [ ] **Observation-blob lifecycle GC** — reclaim CCR blobs behind deleted observations (memory-session blobs are already GC'd)
 
 ---
 
