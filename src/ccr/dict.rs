@@ -4,11 +4,17 @@
 //! (`blobs.dict_hash`), so the exact dictionary is always available at decode
 //! time. Dictionaries may therefore be retrained freely without ever breaking
 //! an already-stored blob's round-trip.
-
-// Wired into store_blob/load_blob in Task 2.4; allow until then.
-#![allow(dead_code)]
+//!
+//! Per-content-type *transforms* (log timestamp-delta templating, diff-token
+//! preprocessing, AST normalization for code) are intentionally **out of scope**
+//! for now: they run on top of zstd — which already factors out recurring
+//! prefixes — for marginal additional gain, while any imperfection in the
+//! inverse silently breaks the byte-exact contract. Per-type dictionaries
+//! capture the same recurring structure safely, so they are the per-type codec.
+//! The bespoke transforms are documented future depth, not a stub.
 
 use crate::ccr::codec::Codec;
+use crate::db::{self, Database};
 use std::io::Read;
 
 /// zstd codec bound to a specific dictionary.
@@ -59,6 +65,48 @@ pub fn train_dict<S: AsRef<[u8]>>(samples: &[S], max_size: usize) -> Option<Vec<
     match zstd::dict::from_samples(samples, max_size) {
         Ok(d) if !d.is_empty() => Some(d),
         _ => None,
+    }
+}
+
+/// Sample cap when training a dictionary.
+pub const TRAIN_SAMPLE_LIMIT: i64 = 256;
+
+/// Resolve the dictionary to use for `content_type`: the latest trained one if
+/// it exists, otherwise lazily train (and persist, content-addressed) a new one
+/// from recently-stored blobs of this type once `MIN_DICT_SAMPLES` exist.
+/// Returns `(dict_hash, dict_bytes)`, or `None` when there isn't yet enough
+/// material — the caller then uses the plain zstd floor.
+///
+/// Because dictionaries are content-addressed and every blob records its
+/// `dict_hash`, a newly-trained dictionary never invalidates older blobs.
+pub async fn select_dict(
+    db: &Database,
+    content_type: &str,
+) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+    if let Some(hash) = db::latest_dict_hash(db, content_type).await? {
+        if let Some(bytes) = db::get_dict(db, &hash).await? {
+            return Ok(Some((hash, bytes)));
+        }
+    }
+
+    // No dictionary yet — gather decompressed samples and try to train one.
+    let hashes = db::recent_blob_hashes_by_type(db, content_type, TRAIN_SAMPLE_LIMIT).await?;
+    if hashes.len() < MIN_DICT_SAMPLES {
+        return Ok(None);
+    }
+    let mut samples: Vec<Vec<u8>> = Vec::with_capacity(hashes.len());
+    for h in &hashes {
+        if let Ok(bytes) = crate::ccr::load_blob(db, h).await {
+            samples.push(bytes);
+        }
+    }
+    match train_dict(&samples, DEFAULT_DICT_SIZE) {
+        Some(dict) => {
+            let hash = crate::ccr::sha256_hex(&dict);
+            db::insert_dict(db, &hash, content_type, &dict).await?;
+            Ok(Some((hash, dict)))
+        }
+        None => Ok(None),
     }
 }
 

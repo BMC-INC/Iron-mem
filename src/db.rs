@@ -1001,7 +1001,6 @@ pub async fn get_blob(db: &Database, hash: &str) -> Result<Option<BlobRow>> {
 
 /// Store a content-addressed dictionary (idempotent by hash). Dictionaries are
 /// stored verbatim (not compressed) so they can always be reconstructed.
-#[allow(dead_code)] // wired into store_blob/load_blob in Task 2.4
 pub async fn insert_dict(
     db: &Database,
     hash: &str,
@@ -1024,7 +1023,6 @@ pub async fn insert_dict(
 }
 
 /// Fetch dictionary bytes by content hash.
-#[allow(dead_code)] // wired into load_blob in Task 2.4
 pub async fn get_dict(db: &Database, hash: &str) -> Result<Option<Vec<u8>>> {
     let row: Option<sqlx::any::AnyRow> =
         sqlx::query("SELECT data FROM ccr_dicts WHERE hash = $1")
@@ -1035,7 +1033,6 @@ pub async fn get_dict(db: &Database, hash: &str) -> Result<Option<Vec<u8>>> {
 }
 
 /// The hash of the most recent dictionary trained for `content_type`, if any.
-#[allow(dead_code)] // wired into store_blob in Task 2.4
 pub async fn latest_dict_hash(db: &Database, content_type: &str) -> Result<Option<String>> {
     let row: Option<sqlx::any::AnyRow> = sqlx::query(
         "SELECT hash FROM ccr_dicts WHERE content_type = $1 ORDER BY created_at DESC LIMIT 1",
@@ -1044,6 +1041,23 @@ pub async fn latest_dict_hash(db: &Database, content_type: &str) -> Result<Optio
     .fetch_optional(&db.pool)
     .await?;
     Ok(row.map(|r| r.get::<String, _>("hash")))
+}
+
+/// Recent blob hashes of a given content type (newest first) — the sample pool
+/// for training a per-type dictionary.
+pub async fn recent_blob_hashes_by_type(
+    db: &Database,
+    content_type: &str,
+    limit: i64,
+) -> Result<Vec<String>> {
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(
+        "SELECT hash FROM blobs WHERE content_type = $1 ORDER BY created_at DESC LIMIT $2",
+    )
+    .bind(content_type)
+    .bind(limit)
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.get::<String, _>("hash")).collect())
 }
 
 /// Increment a blob's reference count (a new linker points at existing bytes).

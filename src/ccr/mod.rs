@@ -15,7 +15,7 @@ pub mod zstd_codec;
 pub use codec::{codec_by_id, codec_for, Codec};
 pub use detect::ContentType;
 
-use crate::db::{get_blob, insert_blob, Database};
+use crate::db::{get_blob, get_dict, insert_blob, Database};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
@@ -59,25 +59,45 @@ pub async fn store_blob(
 ) -> anyhow::Result<BlobRef> {
     let hash = sha256_hex(bytes);
     let content_type = detect::detect(bytes, path_hint);
-    let codec = codec_for(content_type);
-    let compressed = codec.compress(bytes)?;
+
+    // The plain zstd floor is the always-reversible baseline.
+    let floor = codec_for(content_type);
+    let mut codec_id = floor.id();
+    let mut chosen = floor.compress(bytes)?;
+    let mut chosen_dict: Option<String> = None;
+
+    // Try a per-type dictionary; keep it only if it actually wins, so a
+    // dict-compressed blob is never larger than the floor.
+    if !matches!(content_type, ContentType::Binary) {
+        if let Some((dict_hash, dict_bytes)) = dict::select_dict(db, content_type.as_str()).await? {
+            let dcodec = dict::DictZstdCodec::new(dict_bytes, codec::ZSTD_LEVEL);
+            if let Ok(dbytes) = dcodec.compress(bytes) {
+                if dbytes.len() < chosen.len() {
+                    codec_id = dcodec.id();
+                    chosen = dbytes;
+                    chosen_dict = Some(dict_hash);
+                }
+            }
+        }
+    }
+
     insert_blob(
         db,
         &hash,
         content_type.as_str(),
-        codec.id(),
+        codec_id,
         bytes.len() as i64,
-        compressed.len() as i64,
-        &compressed,
-        None,
+        chosen.len() as i64,
+        &chosen,
+        chosen_dict.as_deref(),
     )
     .await?;
     Ok(BlobRef {
         hash,
         content_type,
-        codec: codec.id(),
+        codec: codec_id,
         orig_len: bytes.len(),
-        comp_len: compressed.len(),
+        comp_len: chosen.len(),
     })
 }
 
@@ -89,8 +109,20 @@ pub async fn load_blob(db: &Database, hash: &str) -> anyhow::Result<Vec<u8>> {
     let row = get_blob(db, hash)
         .await?
         .ok_or_else(|| anyhow::anyhow!("CCR blob not found: {hash}"))?;
-    let codec = codec_by_id(&row.codec)?;
-    let original = codec.decompress(&row.data)?;
+
+    let original = if row.codec == "dict+zstd" {
+        let dict_hash = row
+            .dict_hash
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("CCR dict+zstd blob {hash} has no dict_hash"))?;
+        let dict = get_dict(db, dict_hash).await?.ok_or_else(|| {
+            anyhow::anyhow!("CCR dictionary {dict_hash} for blob {hash} not found")
+        })?;
+        dict::DictZstdCodec::new(dict, codec::ZSTD_LEVEL).decompress(&row.data)?
+    } else {
+        codec_by_id(&row.codec)?.decompress(&row.data)?
+    };
+
     let actual = sha256_hex(&original);
     if actual != hash {
         anyhow::bail!(
@@ -174,6 +206,65 @@ mod tests {
     async fn missing_blob_errors() -> anyhow::Result<()> {
         let (db, path) = test_db().await?;
         assert!(load_blob(&db, "deadbeef").await.is_err());
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn per_type_dict_kicks_in_and_round_trips() -> anyhow::Result<()> {
+        let (db, path) = test_db().await?;
+
+        // Below the sample threshold: floor only, no dictionary.
+        let early = store_blob(&db, b"{\"i\":0,\"msg\":\"first\"}", Some("json")).await?;
+        assert_eq!(early.codec, "zstd");
+        assert!(get_blob(&db, &early.hash).await?.unwrap().dict_hash.is_none());
+
+        // Store enough similar JSON records to trigger lazy dictionary training.
+        let mut last_hash = early.hash.clone();
+        let mut last_src = String::new();
+        for i in 1..60 {
+            last_src = format!("{{\"i\":{i},\"msg\":\"event number {i} happened\",\"ok\":true}}");
+            last_hash = store_blob(&db, last_src.as_bytes(), Some("json")).await?.hash;
+        }
+
+        // A dictionary now exists for json and the latest blob used it...
+        assert!(crate::db::latest_dict_hash(&db, "json").await?.is_some());
+        let row = get_blob(&db, &last_hash).await?.unwrap();
+        assert_eq!(row.codec, "dict+zstd");
+        assert!(row.dict_hash.is_some());
+        // ...and it still round-trips byte-exact through the dict decode path.
+        assert_eq!(load_blob(&db, &last_hash).await?, last_src.as_bytes());
+
+        // Binary content never takes the dict path.
+        let bin = store_blob(&db, &[0u8, 1, 2, 3, 255, 254], Some("bin")).await?;
+        assert_eq!(bin.codec, "zstd");
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "benchmark — run with `cargo test --bin ironmem -- --ignored bench_ccr`"]
+    async fn bench_ccr_dict_vs_floor() -> anyhow::Result<()> {
+        let (db, path) = test_db().await?;
+        let floor = codec_for(ContentType::Json);
+
+        let mut floor_total = 0usize;
+        let mut stored_total = 0usize;
+        for i in 0..500 {
+            let s = format!(
+                "{{\"ts\":\"2026-06-08T00:00:{:02}Z\",\"level\":\"INFO\",\"req\":{i},\"path\":\"/api/v1/items/{}\",\"ms\":{}}}",
+                i % 60, i % 50, (i * 7) % 800
+            );
+            floor_total += floor.compress(s.as_bytes())?.len();
+            stored_total += store_blob(&db, s.as_bytes(), Some("json")).await?.comp_len;
+        }
+        let pct = 100.0 * (1.0 - stored_total as f64 / floor_total as f64);
+        eprintln!(
+            "CCR json corpus: floor={floor_total} B, stored(dict-or-floor)={stored_total} B, saved={pct:.1}%"
+        );
+        assert!(stored_total <= floor_total, "store must never be worse than the floor");
+
         let _ = std::fs::remove_file(path);
         Ok(())
     }
