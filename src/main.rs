@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "ironmem",
     about = "Persistent session memory for Claude Code and AI coding assistants",
-    version = "0.1.0"
+    version = env!("CARGO_PKG_VERSION")
 )]
 struct Cli {
     #[command(subcommand)]
