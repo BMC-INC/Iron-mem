@@ -238,8 +238,15 @@ pub struct OnnxEmbedder {
 #[cfg(feature = "local-onnx")]
 impl OnnxEmbedder {
     pub fn new() -> Result<Self> {
+        // Pin the model cache under ~/.ironmem so it loads regardless of the
+        // process cwd. A launchd agent runs from "/", where the fastembed default
+        // (./.fastembed_cache) is unwritable — which silently downgraded retrieval
+        // to keyword-only. Seeded once, the model then loads fully offline (no egress).
+        let cache_dir = crate::config::ironmem_dir().join("fastembed_cache");
         let model = fastembed::TextEmbedding::try_new(
-            fastembed::InitOptions::new(fastembed::EmbeddingModel::BGESmallENV15),
+            fastembed::InitOptions::new(fastembed::EmbeddingModel::BGESmallENV15)
+                .with_cache_dir(cache_dir)
+                .with_show_download_progress(false),
         )?;
         Ok(Self {
             model: std::sync::Mutex::new(model),
