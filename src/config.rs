@@ -23,6 +23,49 @@ pub struct Config {
     pub auth_token: Option<String>,
     #[serde(default)]
     pub embedding: EmbeddingConfig,
+    #[serde(default)]
+    pub rerank: RerankConfig,
+}
+
+/// LLM reranking of retrieval candidates. Off by default: it adds one provider
+/// call (and its latency) per query. When enabled, retrieval pulls a `pool`-sized
+/// candidate set that a fast model reranks down to the requested limit — the
+/// precision lever for date- and answer-specific questions where the answer
+/// memory is in the pool but not yet in the top few.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankConfig {
+    /// Default on/off when a request doesn't specify `?rerank=`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Model for the rerank scoring call. Empty (the default) means "use the
+    /// compression `model`" — always available and as capable as the model the
+    /// user already trusts. Set a cheaper/faster model id here to override.
+    #[serde(default = "default_rerank_model")]
+    pub model: String,
+    /// Minimum candidate-pool size to rerank from (the effective pool is at least
+    /// twice the requested limit, so there is always headroom to promote a buried
+    /// answer memory into the top results).
+    #[serde(default = "default_rerank_pool")]
+    pub pool: usize,
+}
+
+impl Default for RerankConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: default_rerank_model(),
+            pool: default_rerank_pool(),
+        }
+    }
+}
+
+fn default_rerank_model() -> String {
+    // Empty ⇒ fall back to the compression `model` at call time (see retrieval).
+    String::new()
+}
+
+fn default_rerank_pool() -> usize {
+    20
 }
 
 /// Semantic-retrieval configuration. Local-first / no-egress by default.
@@ -143,6 +186,7 @@ impl Default for Config {
             mcp_sse_port: default_mcp_sse_port(),
             auth_token: None,
             embedding: EmbeddingConfig::default(),
+            rerank: RerankConfig::default(),
         }
     }
 }
@@ -233,6 +277,15 @@ mod tests {
         assert_eq!(cfg.embedding.weights.importance, 0.2);
         assert_eq!(cfg.embedding.recency_half_life_days, 30.0);
         assert_eq!(cfg.embedding.ollama_url, "http://localhost:11434");
+    }
+
+    #[test]
+    fn missing_rerank_key_yields_defaults() {
+        let cfg: Config = serde_json::from_str(BASE).unwrap();
+        assert!(!cfg.rerank.enabled, "rerank is off unless explicitly enabled");
+        assert_eq!(cfg.rerank.pool, 20);
+        // Empty default ⇒ rerank falls back to the compression model.
+        assert!(cfg.rerank.model.is_empty(), "default rerank model defers to compression model");
     }
 
     #[test]

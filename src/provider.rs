@@ -268,8 +268,14 @@ pub async fn compress(
 /// model's verbatim text. Used by features that need free-form output (e.g. the
 /// user-profile generator) rather than the structured compression format.
 pub async fn complete(prompt: &str, config: &Config) -> Result<String> {
+    complete_with(prompt, &config.model, config).await
+}
+
+/// Like [`complete`] but against an explicit model rather than the configured
+/// compression model — used by retrieval reranking, which wants a fast, cheap
+/// model independent of the compression model.
+pub async fn complete_with(prompt: &str, model: &str, config: &Config) -> Result<String> {
     let api_key = resolve_api_key(config.provider)?;
-    let model = &config.model;
     match config.provider {
         Provider::Anthropic => anthropic_text(prompt, model, &api_key).await,
         Provider::Openai => openai_text(prompt, model, &api_key).await,

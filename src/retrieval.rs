@@ -7,7 +7,7 @@ use anyhow::Result;
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 
-use crate::config::Weights;
+use crate::config::{Config, Weights};
 use crate::context;
 use crate::db::{self, Database, Memory};
 use crate::embedder::Embedder;
@@ -236,6 +236,156 @@ async fn reserve_narrative_slots(db: &Database, candidates: &[i64], limit: usize
     let rank: HashMap<i64, usize> = candidates.iter().enumerate().map(|(i, &id)| (id, i)).collect();
     chosen.sort_by_key(|id| rank[id]);
     Ok(chosen)
+}
+
+// ── LLM reranking ───────────────────────────────────────────────────
+
+/// Per-candidate character cap in the rerank prompt — keeps a wide pool within a
+/// small token budget. Short fact memories pass through whole; long narratives
+/// are trimmed to their leading content (enough to judge relevance).
+const RERANK_SNIPPET_CHARS: usize = 400;
+
+/// Build the rerank prompt: the question, then the numbered candidate snippets,
+/// then an instruction to return the useful candidate numbers most-useful-first.
+fn build_rerank_prompt(query: &str, candidates: &[Memory]) -> String {
+    let mut s = String::with_capacity(256 + candidates.len() * RERANK_SNIPPET_CHARS);
+    s.push_str(
+        "You are selecting which memory snippets best help answer a question.\n\
+         Read the QUESTION, then the numbered CANDIDATES.\n\n",
+    );
+    s.push_str("QUESTION: ");
+    s.push_str(query);
+    s.push_str("\n\nCANDIDATES:\n");
+    for (i, m) in candidates.iter().enumerate() {
+        let snippet: String = m
+            .summary
+            .chars()
+            .take(RERANK_SNIPPET_CHARS)
+            .collect::<String>()
+            .replace('\n', " ");
+        s.push_str(&format!("{}. {}\n", i + 1, snippet));
+    }
+    s.push_str(
+        "\nReturn the candidate numbers ordered from MOST to LEAST useful for \
+         answering the question, as a comma-separated list (e.g. \"4,1,9\"). Rank a \
+         snippet that contains the SPECIFIC answer the question asks for — the exact \
+         date, name, number, or event — above one that is merely on the same topic. \
+         Include only genuinely relevant numbers; omit the rest. Output ONLY the list.",
+    );
+    s
+}
+
+/// Parse a rerank reply into 0-based candidate positions. Pulls integer runs in
+/// order, maps 1-based → 0-based, and drops out-of-range and duplicate indices.
+/// Tolerant of stray prose/years: only valid candidate numbers survive.
+fn parse_rerank_order(text: &str, n: usize) -> Vec<usize> {
+    let mut seen = HashSet::new();
+    let mut order = Vec::new();
+    for tok in text.split(|c: char| !c.is_ascii_digit()) {
+        if let Ok(k) = tok.parse::<usize>() {
+            if (1..=n).contains(&k) && seen.insert(k) {
+                order.push(k - 1);
+            }
+        }
+    }
+    order
+}
+
+/// Fuse the base retrieval order with the LLM's preference order via RRF, then
+/// take the top `limit`. Fusing (rather than letting the LLM order replace the
+/// base) is the safety property: a candidate the base ranked high keeps its base
+/// RRF contribution even when the model omits or deprioritizes it, so reranking
+/// can PROMOTE a buried answer the model favors but can never push a strong
+/// base hit out of the top `limit`. An empty `order` (parse/LLM failure)
+/// collapses to the base order, truncated — never worse than no rerank.
+fn fuse_rerank(base: &[Memory], order: &[usize], limit: usize) -> Vec<Memory> {
+    if base.is_empty() {
+        return Vec::new();
+    }
+    let base_ids: Vec<i64> = base.iter().map(|m| m.id).collect();
+    let llm_ids: Vec<i64> = order.iter().filter_map(|&i| base.get(i).map(|m| m.id)).collect();
+    let fused = if llm_ids.is_empty() {
+        base_ids
+    } else {
+        rrf_fuse(&[base_ids, llm_ids], RRF_K)
+    };
+    let by_id: HashMap<i64, &Memory> = base.iter().map(|m| (m.id, m)).collect();
+    fused
+        .into_iter()
+        .take(limit)
+        .filter_map(|id| by_id.get(&id).map(|m| (*m).clone()))
+        .collect()
+}
+
+/// Rerank retrieved `candidates` against `query` with a fast model, returning the
+/// best `limit` in ranked order. On any provider/parse failure it falls back to
+/// the base retrieval order (truncated), so reranking can only improve precision,
+/// never reduce recall below what `hybrid_search` already produced.
+pub async fn llm_rerank(
+    config: &Config,
+    query: &str,
+    candidates: Vec<Memory>,
+    limit: usize,
+) -> Vec<Memory> {
+    if candidates.len() <= 1 || limit == 0 {
+        return candidates.into_iter().take(limit).collect();
+    }
+    // Empty rerank model ⇒ use the compression model (always available, capable).
+    let model = if config.rerank.model.is_empty() {
+        config.model.as_str()
+    } else {
+        config.rerank.model.as_str()
+    };
+    let prompt = build_rerank_prompt(query, &candidates);
+    match crate::provider::complete_with(&prompt, model, config).await {
+        Ok(reply) => {
+            let order = parse_rerank_order(&reply, candidates.len());
+            fuse_rerank(&candidates, &order, limit)
+        }
+        Err(e) => {
+            tracing::warn!("llm rerank failed ({e}); using base retrieval order");
+            candidates.into_iter().take(limit).collect()
+        }
+    }
+}
+
+/// Merge the narrow (`limit`-sized) retrieval with the wider pool: narrow items
+/// first — preserving their stronger ordering, which keeps an FTS-dominant answer
+/// (e.g. a specific dated fact) from being demoted by the pool-widening artifact
+/// where a larger candidate fusion sinks single-signal-strong items — then the
+/// wide-pool newcomers the reranker may promote. Deduped by id.
+fn reanchor(narrow: Vec<Memory>, wide: Vec<Memory>) -> Vec<Memory> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(wide.len().max(narrow.len()));
+    for m in narrow.into_iter().chain(wide) {
+        if seen.insert(m.id) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// Reranked retrieval. Retrieves the well-ordered `base@limit` set AND a wider
+/// pool, re-anchors them (narrow order on top, wide-pool newcomers appended), and
+/// LLM-reranks. The re-anchoring is what protects FTS-dominant temporal answers:
+/// they keep their strong narrow-order floor, so reranking can only PROMOTE a
+/// buried wide-pool answer (precision/recall for reasoning questions), never
+/// demote a dated fact the base retrieval already had in the top `limit`.
+#[allow(clippy::too_many_arguments)]
+pub async fn rerank_search(
+    db: &Database,
+    embedder: Option<&dyn Embedder>,
+    store: &dyn VectorStore,
+    config: &Config,
+    project: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<Memory>> {
+    let pool = limit.saturating_mul(2).max(config.rerank.pool);
+    let narrow = hybrid_search(db, embedder, store, project, query, limit).await?;
+    let wide = hybrid_search(db, embedder, store, project, query, pool).await?;
+    let candidates = reanchor(narrow, wide);
+    Ok(llm_rerank(config, query, candidates, limit).await)
 }
 
 // ── Blended injection ranking ───────────────────────────────────────
@@ -467,6 +617,94 @@ mod tests {
             "time-boost must surface the dated memory FTS+vector miss: {res:?}"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    fn mk(id: i64, summary: &str) -> Memory {
+        Memory {
+            id,
+            project: "/p".into(),
+            session_id: "s".into(),
+            summary: summary.into(),
+            tags: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn parse_rerank_order_maps_filters_and_dedupes() {
+        // 1-based → 0-based, order preserved.
+        assert_eq!(parse_rerank_order("3,1,2", 3), vec![2, 0, 1]);
+        // Out-of-range (99) and duplicate (second 1) dropped.
+        assert_eq!(parse_rerank_order("4, 1, 1, 99", 4), vec![3, 0]);
+        // No valid numbers ⇒ empty (caller falls back to base order).
+        assert!(parse_rerank_order("none are relevant", 3).is_empty());
+    }
+
+    #[test]
+    fn parse_rerank_order_tolerates_prose_and_years() {
+        // A stray year (2023) is out of range and dropped; real picks survive.
+        assert_eq!(
+            parse_rerank_order("Candidates 2 and 5 (from 2023) help most.", 6),
+            vec![1, 4]
+        );
+    }
+
+    #[test]
+    fn fuse_rerank_promotes_llm_favored_buried_candidate() {
+        let cands = vec![mk(10, "a"), mk(11, "b"), mk(12, "c"), mk(13, "d"), mk(14, "e")];
+        // The model's single favorite is the LAST base candidate (id 14, base rank
+        // 4) — a buried answer. Fusion promotes it to #1…
+        let out = fuse_rerank(&cands, &[4], 5);
+        assert_eq!(
+            out.first().map(|m| m.id),
+            Some(14),
+            "buried answer the model favors is promoted: {:?}",
+            out.iter().map(|m| m.id).collect::<Vec<_>>()
+        );
+        // …while the strong base hit (id 10) stays right behind it, never dropped.
+        assert_eq!(out.get(1).map(|m| m.id), Some(10));
+    }
+
+    #[test]
+    fn fuse_rerank_keeps_strong_base_hit_the_model_omits() {
+        // The safety property: id 10 is the top base hit (the answer). The model
+        // omits it entirely and only names a lower candidate. Fusion must STILL
+        // keep id 10 in the truncated result — reranking can't drop a strong base
+        // hit. (This is the regression the limit=20 sanity check exposed.)
+        let cands = vec![mk(10, "the answer"), mk(11, "b"), mk(12, "c"), mk(13, "d")];
+        let out = fuse_rerank(&cands, &[3], 2); // model only likes candidate 4 (id 13)
+        let ids: Vec<i64> = out.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&13), "promoted candidate is present: {ids:?}");
+        assert!(ids.contains(&10), "strong base hit is NOT dropped: {ids:?}");
+    }
+
+    #[test]
+    fn reanchor_keeps_narrow_order_then_appends_newcomers() {
+        let narrow = vec![mk(10, "a"), mk(11, "b"), mk(12, "c")];
+        // Wide pool: a different (degraded) order, same ids plus newcomers 9 and 8.
+        let wide = vec![mk(12, "c"), mk(9, "x"), mk(10, "a"), mk(8, "y"), mk(11, "b")];
+        let out = reanchor(narrow, wide);
+        // Narrow order preserved on top; only the wide-pool newcomers (9, 8) trail.
+        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![10, 11, 12, 9, 8]);
+    }
+
+    #[test]
+    fn fuse_rerank_empty_order_is_base_order_truncated() {
+        let cands = vec![mk(10, "a"), mk(11, "b"), mk(12, "c")];
+        // Parse/LLM failure ⇒ exact base order, truncated — never worse than off.
+        let out = fuse_rerank(&cands, &[], 2);
+        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![10, 11]);
+    }
+
+    #[test]
+    fn build_rerank_prompt_numbers_and_caps_snippets() {
+        let long = "x".repeat(900);
+        let cands = vec![mk(1, "short fact"), mk(2, &long)];
+        let p = build_rerank_prompt("when did it happen?", &cands);
+        assert!(p.contains("QUESTION: when did it happen?"));
+        assert!(p.contains("1. short fact"));
+        // The 900-char candidate is capped — its raw text never appears in full.
+        assert!(!p.contains(&"x".repeat(RERANK_SNIPPET_CHARS + 1)));
     }
 
     #[test]
