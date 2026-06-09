@@ -40,9 +40,21 @@ pub fn rrf_fuse(lists: &[Vec<i64>], k: i64) -> Vec<i64> {
     order
 }
 
-/// Hybrid search: fuse keyword (FTS) and semantic (vector) results. With no
-/// embedder — or when the vector side yields nothing — this returns the exact
-/// FTS ordering, reproducing legacy behavior.
+/// 4-digit years (1900–2099) named in a query. A temporal question ("what did X
+/// do in May 2023?") implies a year, which anchors the time-aware retrieval
+/// boost: memories whose `event_time` contains a named year get a rank lift.
+fn query_years(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|t| t.len() == 4)
+        .filter(|t| matches!(t.parse::<u16>(), Ok(y) if (1900..=2099).contains(&y)))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Hybrid search: fuse keyword (FTS), semantic (vector), and temporal
+/// (event_time) signals via RRF. With none of the auxiliary signals present this
+/// returns the exact FTS ordering, reproducing legacy behavior.
 pub async fn hybrid_search(
     db: &Database,
     embedder: Option<&dyn Embedder>,
@@ -73,15 +85,51 @@ pub async fn hybrid_search(
         Vec::new()
     };
 
-    // No semantic signal ⇒ pure FTS, unchanged.
-    if vec_ids.is_empty() {
+    // Temporal side: when the query names a year, memories tagged with a matching
+    // event_time get a rank boost. Additive — undated memories never match, so
+    // this only ever lifts dated memories, never suppresses anything.
+    let time_ids: Vec<i64> = {
+        let years = query_years(query);
+        if years.is_empty() {
+            Vec::new()
+        } else {
+            let mut seen = HashSet::new();
+            let mut ids = Vec::new();
+            for y in &years {
+                for id in db::memories_by_event_time(db, project, y, limit)
+                    .await
+                    .unwrap_or_default()
+                {
+                    if seen.insert(id) {
+                        ids.push(id);
+                    }
+                }
+            }
+            ids
+        }
+    };
+
+    // Auxiliary ranked signals beyond keyword FTS: semantic (vector) and temporal
+    // (event_time). Each non-empty list joins the RRF; with none present, return
+    // the exact FTS ordering (legacy behavior preserved).
+    let mut aux: Vec<Vec<i64>> = Vec::new();
+    if !vec_ids.is_empty() {
+        aux.push(vec_ids);
+    }
+    if !time_ids.is_empty() {
+        aux.push(time_ids);
+    }
+    if aux.is_empty() {
         return Ok(fts);
     }
 
     // Fuse and materialize in fused order, reusing already-loaded FTS rows.
     let fts_ids: Vec<i64> = fts.iter().map(|m| m.id).collect();
     let by_id: HashMap<i64, Memory> = fts.into_iter().map(|m| (m.id, m)).collect();
-    let fused = rrf_fuse(&[fts_ids, vec_ids], RRF_K);
+    let mut lists: Vec<Vec<i64>> = Vec::with_capacity(aux.len() + 1);
+    lists.push(fts_ids);
+    lists.append(&mut aux);
+    let fused = rrf_fuse(&lists, RRF_K);
 
     let mut out = Vec::with_capacity(limit);
     for id in fused.into_iter().take(limit) {
@@ -242,6 +290,44 @@ mod tests {
     fn rrf_single_list_preserves_order() {
         let fused = rrf_fuse(&[vec![5_i64, 6, 7]], 60);
         assert_eq!(fused, vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn query_years_extracts_valid_years_only() {
+        assert_eq!(query_years("what did Caroline do in May 2023?"), vec!["2023"]);
+        assert_eq!(query_years("between 2021 and 2099"), vec!["2021", "2099"]);
+        assert!(query_years("no years, just 42 and 12345").is_empty());
+        assert!(query_years("1899 is out of range").is_empty());
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_time_boost_surfaces_dated_memory() {
+        let (db, path) = seeded_db().await; // ids 1,2,3 under /tmp/p, all undated
+        // A 4th memory whose wording shares no keyword with the query and which
+        // has no embedding, but is tagged with an event_time in 2023.
+        let s = create_session(&db, "/tmp/p").await.unwrap();
+        let dated = insert_memory(&db, "/tmp/p", &s, "zzz unrelated wording", Some("x"))
+            .await
+            .unwrap();
+        db::set_memory_event_time(&db, dated, "2023-05-07").await.unwrap();
+
+        // No embedder ⇒ vector side empty; query keyword misses every summary in
+        // FTS, but names the year 2023 ⇒ the temporal signal surfaces the memory.
+        let res = hybrid_search(
+            &db,
+            None,
+            &crate::vectorstore::BruteForceStore,
+            Some("/tmp/p"),
+            "what happened in 2023",
+            5,
+        )
+        .await
+        .unwrap();
+        assert!(
+            res.iter().any(|m| m.id == dated),
+            "time-boost must surface the dated memory FTS+vector miss: {res:?}"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

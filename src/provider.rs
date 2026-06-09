@@ -46,6 +46,10 @@ pub struct CompressionResult {
     /// Each is stored as its own searchable `kind=fact` memory so specifics
     /// (dates, names, quantities) survive compression and rank on direct lookup.
     pub facts: Vec<String>,
+    /// The event time/date(-range) the session describes, if it states one
+    /// (`WHEN:`). Stored on the narrative memory's `event_time` to power the
+    /// time-aware retrieval boost. `None` when the session is undated.
+    pub event_time: Option<String>,
 }
 
 /// Default importance when the model omits or mangles the IMPORTANCE line.
@@ -59,6 +63,7 @@ impl Default for CompressionResult {
             importance: DEFAULT_IMPORTANCE,
             kind: "session".to_string(),
             facts: Vec::new(),
+            event_time: None,
         }
     }
 }
@@ -104,6 +109,10 @@ fn build_prompt(observations: &[Observation]) -> String {
         "KIND: [single word classifying this session: session | error_solution | preference | architecture | learned_pattern | project_config — default 'session']"
             .to_string(),
     );
+    lines.push(
+        "WHEN: [if the session describes events on a specific date or date range, give it as YYYY-MM-DD (or a short range like 2023-05-07..2023-05-09); otherwise write 'none'.]"
+            .to_string(),
+    );
 
     lines.join("\n")
 }
@@ -114,6 +123,7 @@ fn parse_response(text: &str) -> CompressionResult {
     let mut importance: Option<u8> = None;
     let mut kind: Option<String> = None;
     let mut facts: Vec<String> = Vec::new();
+    let mut event_time: Option<String> = None;
     // FACTS is a multi-line block: once the marker is seen, subsequent "- "
     // bullet lines are facts until the next known marker ends the block.
     let mut in_facts = false;
@@ -136,6 +146,14 @@ fn parse_response(text: &str) -> CompressionResult {
             // Clamp to the known set; unrecognized values collapse to `session`.
             kind = Some(crate::db::clamp_kind(k).to_string());
             in_facts = false;
+        } else if let Some(w) = line.strip_prefix("WHEN:") {
+            let w = w.trim();
+            // Treat blank / "none" / "unknown" as undated.
+            if !w.is_empty() && !w.eq_ignore_ascii_case("none") && !w.eq_ignore_ascii_case("unknown")
+            {
+                event_time = Some(w.to_string());
+            }
+            in_facts = false;
         } else if in_facts {
             push_fact(&mut facts, line);
         }
@@ -152,6 +170,7 @@ fn parse_response(text: &str) -> CompressionResult {
         importance: importance.unwrap_or(DEFAULT_IMPORTANCE),
         kind: kind.unwrap_or_else(|| "session".to_string()),
         facts,
+        event_time,
     }
 }
 
@@ -467,6 +486,23 @@ mod tests {
     fn prompt_emits_facts_section() {
         let p = build_prompt(&[]);
         assert!(p.contains("FACTS:"), "prompt must request a FACTS block");
+    }
+
+    #[test]
+    fn parse_response_extracts_when_as_event_time() {
+        let r = parse_response("SUMMARY: s\nKIND: session\nWHEN: 2023-05-07");
+        assert_eq!(r.event_time.as_deref(), Some("2023-05-07"));
+    }
+
+    #[test]
+    fn parse_response_treats_when_none_as_undated() {
+        assert!(parse_response("SUMMARY: s\nWHEN: none").event_time.is_none());
+        assert!(parse_response("SUMMARY: s").event_time.is_none());
+    }
+
+    #[test]
+    fn prompt_emits_when_section() {
+        assert!(build_prompt(&[]).contains("WHEN:"), "prompt must request WHEN");
     }
 
     #[test]

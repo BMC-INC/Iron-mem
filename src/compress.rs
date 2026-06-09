@@ -104,6 +104,13 @@ pub async fn persist(
     // Compressed sessions are project-scoped; record the LLM-classified kind
     // (importance is preserved — set_memory_scope_kind only touches scope+kind).
     db::set_memory_scope_kind(db, memory_id, "project", &result.kind).await?;
+    // Temporal tag: stamp the session's stated event date on the narrative so
+    // the time-aware retrieval boost can surface it for date-anchored questions.
+    if let Some(when) = &result.event_time {
+        if let Err(e) = db::set_memory_event_time(db, memory_id, when).await {
+            tracing::warn!("event_time store failed (memory {memory_id}): {e}");
+        }
+    }
 
     if let Some(emb) = embedder {
         let text = format!("{} {}", result.summary, result.tags);

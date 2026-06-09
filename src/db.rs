@@ -325,6 +325,23 @@ impl Database {
             }
         }
 
+        // Temporal tag: the event time a memory describes (a date/range stated in
+        // the session), distinct from created_at (wall-clock write time). Nullable
+        // and additive — undated memories read back as None and the time-aware
+        // retrieval boost simply skips them.
+        match self.backend {
+            Backend::Sqlite => {
+                let _ = sqlx::query("ALTER TABLE memory_meta ADD COLUMN event_time TEXT")
+                    .execute(&self.pool)
+                    .await;
+            }
+            Backend::Postgres => {
+                sqlx::query("ALTER TABLE memory_meta ADD COLUMN IF NOT EXISTS event_time TEXT")
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+
         Ok(())
     }
 
@@ -1047,6 +1064,12 @@ pub struct MemoryMetaInfo {
     #[allow(dead_code)]
     pub scope: String,
     pub kind: String,
+    /// Event time the memory describes (a date/range stated in the session),
+    /// `None` when undated. Distinct from `created_at` (write time). Production
+    /// time-aware retrieval filters at the SQL layer (`memories_by_event_time`),
+    /// so this field is read only in tests today.
+    #[allow(dead_code)]
+    pub event_time: Option<String>,
 }
 
 impl Default for MemoryMetaInfo {
@@ -1055,6 +1078,7 @@ impl Default for MemoryMetaInfo {
             importance: 0.5,
             scope: "project".to_string(),
             kind: "session".to_string(),
+            event_time: None,
         }
     }
 }
@@ -1063,7 +1087,7 @@ impl Default for MemoryMetaInfo {
 /// columns fall back to the defaults in [`MemoryMetaInfo::default`].
 pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<MemoryMetaInfo> {
     let row: Option<sqlx::any::AnyRow> =
-        sqlx::query("SELECT importance, scope, kind FROM memory_meta WHERE memory_id = $1")
+        sqlx::query("SELECT importance, scope, kind, event_time FROM memory_meta WHERE memory_id = $1")
             .bind(memory_id)
             .fetch_optional(&db.pool)
             .await?;
@@ -1080,6 +1104,7 @@ pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<Memor
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "session".to_string()),
+            event_time: r.try_get::<Option<String>, _>("event_time").ok().flatten(),
         },
         None => MemoryMetaInfo::default(),
     })
@@ -1107,6 +1132,70 @@ pub async fn set_memory_scope_kind(
     .execute(&db.pool)
     .await?;
     Ok(())
+}
+
+/// Set a memory's `event_time` (a date/range stated in the session). Upserts the
+/// meta row so it works whether or not `upsert_memory_meta`/`set_memory_scope_kind`
+/// ran first; a fresh row gets the default importance and never clobbers an
+/// existing one's importance/scope/kind.
+pub async fn set_memory_event_time(db: &Database, memory_id: i64, event_time: &str) -> Result<()> {
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO memory_meta(memory_id, importance, created_at, event_time)
+         VALUES($1, 0.5, $2, $3)
+         ON CONFLICT(memory_id) DO UPDATE SET event_time = excluded.event_time",
+    )
+    .bind(memory_id)
+    .bind(now)
+    .bind(event_time)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+/// Memory ids whose recorded `event_time` contains `needle` (typically a year),
+/// scoped to `project` when given, most-recent first and capped at `limit`.
+/// Undated memories (NULL event_time) never match, so this signal is purely
+/// additive to keyword/vector retrieval. Powers the time-aware retrieval boost.
+pub async fn memories_by_event_time(
+    db: &Database,
+    project: Option<&str>,
+    needle: &str,
+    limit: usize,
+) -> Result<Vec<i64>> {
+    let id_col = match db.backend {
+        Backend::Sqlite => "m.rowid",
+        Backend::Postgres => "m.id",
+    };
+    let like = format!("%{needle}%");
+    let rows: Vec<sqlx::any::AnyRow> = match project {
+        Some(p) => {
+            sqlx::query(&format!(
+                "SELECT {id_col} AS id FROM memories m
+                 JOIN memory_meta mm ON mm.memory_id = {id_col}
+                 WHERE mm.event_time LIKE $1 AND m.project = $2
+                 ORDER BY m.created_at DESC LIMIT $3"
+            ))
+            .bind(&like)
+            .bind(p)
+            .bind(limit as i64)
+            .fetch_all(&db.pool)
+            .await?
+        }
+        None => {
+            sqlx::query(&format!(
+                "SELECT {id_col} AS id FROM memories m
+                 JOIN memory_meta mm ON mm.memory_id = {id_col}
+                 WHERE mm.event_time LIKE $1
+                 ORDER BY m.created_at DESC LIMIT $2"
+            ))
+            .bind(&like)
+            .bind(limit as i64)
+            .fetch_all(&db.pool)
+            .await?
+        }
+    };
+    Ok(rows.into_iter().map(|r| r.get::<i64, _>("id")).collect())
 }
 
 /// Recent memories filtered by scope. `user`-scope memories are global (the
@@ -1917,6 +2006,34 @@ mod tests {
         assert_eq!(clamp_scope("USER"), "user");
         assert_eq!(clamp_scope("project"), "project");
         assert_eq!(clamp_scope("garbage"), "project");
+    }
+
+    #[tokio::test]
+    async fn event_time_round_trips_and_queries() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let p = "/tmp/temporal";
+        let s = create_session(&db, p).await?;
+
+        // One dated memory, one undated, same project.
+        let dated = insert_memory(&db, p, &s, "Caroline joined a support group", Some("t")).await?;
+        set_memory_event_time(&db, dated, "2023-05-07").await?;
+        let undated = insert_memory(&db, p, &s, "some other note", Some("t")).await?;
+
+        // event_time round-trips through the meta read; undated reads as None.
+        let info = get_memory_meta_full(&db, dated).await?;
+        assert_eq!(info.event_time.as_deref(), Some("2023-05-07"));
+        assert!(get_memory_meta_full(&db, undated).await?.event_time.is_none());
+
+        // Year query matches only the dated memory; a non-matching year finds none.
+        assert_eq!(memories_by_event_time(&db, Some(p), "2023", 10).await?, vec![dated]);
+        assert!(memories_by_event_time(&db, Some(p), "1999", 10).await?.is_empty());
+        // Project scoping: a different project sees nothing.
+        assert!(memories_by_event_time(&db, Some("/tmp/other"), "2023", 10)
+            .await?
+            .is_empty());
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[tokio::test]
