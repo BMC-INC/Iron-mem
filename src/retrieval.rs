@@ -16,6 +16,13 @@ use crate::vectorstore::VectorStore;
 /// Standard RRF damping constant. Larger ⇒ rank position matters less.
 pub const RRF_K: i64 = 60;
 
+/// Whether to fuse the entity-index signal into hybrid retrieval. Disabled: in
+/// person-centric corpora the index matches nearly every memory and returns them
+/// most-recent-first, which demotes older-but-exact facts below newer vaguer ones
+/// and measurably hurt LoCoMo precision. FTS + vector already match the named
+/// person; the index is retained for future relevance-ranked entity retrieval.
+const FUSE_ENTITY_SIGNAL: bool = false;
+
 /// Fuse several ranked id-lists into one ordering by Σ 1/(k + rank).
 /// `rank` is 0-indexed (top of a list contributes the most). Ties keep
 /// first-appearance order so the result is deterministic.
@@ -129,30 +136,26 @@ pub async fn hybrid_search(
         }
     };
 
-    // Entity side: when the query names a proper noun we indexed at write time,
-    // memories tagged with that entity get a rank boost. In person-centric data
-    // this disambiguates whose facts to surface; the narrative-reserve quota below
-    // keeps it (and the FTS flood) from crowding out narratives. Unknown names
-    // resolve to nothing.
-    let entity_ids: Vec<i64> = {
+    // Entity signal (see FUSE_ENTITY_SIGNAL): off by default — its recency-ordered
+    // matches demote older-but-exact facts in person-centric data. FTS + vector
+    // already cover the named person.
+    let entity_ids: Vec<i64> = if FUSE_ENTITY_SIGNAL {
         let ents = query_entities(query);
-        if ents.is_empty() {
-            Vec::new()
-        } else {
-            let mut seen = HashSet::new();
-            let mut ids = Vec::new();
-            for e in &ents {
-                for id in db::memories_for_entity(db, project, e, pool)
-                    .await
-                    .unwrap_or_default()
-                {
-                    if seen.insert(id) {
-                        ids.push(id);
-                    }
+        let mut seen = HashSet::new();
+        let mut ids = Vec::new();
+        for e in &ents {
+            for id in db::memories_for_entity(db, project, e, pool)
+                .await
+                .unwrap_or_default()
+            {
+                if seen.insert(id) {
+                    ids.push(id);
                 }
             }
-            ids
         }
+        ids
+    } else {
+        Vec::new()
     };
 
     // Candidate ordering: RRF over keyword + any auxiliary signals (semantic,
@@ -401,35 +404,6 @@ mod tests {
         );
         // Lowercased duplicates collapse; sub-3-char tokens drop.
         assert_eq!(query_entities("Al and Bo met Caroline and Caroline"), vec!["Caroline"]);
-    }
-
-    #[tokio::test]
-    async fn hybrid_search_entity_signal_surfaces_named_memory() {
-        let (db, path) = seeded_db().await; // ids 1,2,3 under /tmp/p
-        // A memory sharing no keyword with the query and with no embedding, but
-        // indexed under the entity "Caroline".
-        let s = create_session(&db, "/tmp/p").await.unwrap();
-        let named = insert_memory(&db, "/tmp/p", &s, "zzz unrelated text", Some("x"))
-            .await
-            .unwrap();
-        db::insert_memory_entity(&db, named, "Caroline").await.unwrap();
-
-        // No embedder ⇒ vector empty; query keyword misses FTS but names Caroline.
-        let res = hybrid_search(
-            &db,
-            None,
-            &crate::vectorstore::BruteForceStore,
-            Some("/tmp/p"),
-            "what did Caroline say",
-            5,
-        )
-        .await
-        .unwrap();
-        assert!(
-            res.iter().any(|m| m.id == named),
-            "entity signal must surface the named memory FTS+vector miss: {res:?}"
-        );
-        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
