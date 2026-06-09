@@ -77,7 +77,7 @@ impl Default for CompressionResult {
 
 fn build_prompt(observations: &[Observation]) -> String {
     let mut lines = vec![
-        "You are a memory system. Analyze this session and produce a faithful, compact memory entry. The session may be software development, a conversation, research, planning, or any other activity — adapt to its content and never assume it is code.".to_string(),
+        "You are a memory system. Analyze this session and produce a faithful, compact memory entry. The session may be software development, a conversation, research, planning, or any other activity — adapt to its content and never assume it is code. If the session states the date it took place, treat that as the reference date for resolving any relative time expressions.".to_string(),
         String::new(),
         "SESSION ACTIVITY:".to_string(),
     ];
@@ -101,7 +101,7 @@ fn build_prompt(observations: &[Observation]) -> String {
     lines.push(String::new());
     lines.push("Respond with EXACTLY this format, nothing else:".to_string());
     lines.push("SUMMARY: [3-6 sentences. PRESERVE every specific: exact dates and times, proper nouns (people, places, organizations, events), quantities, file names, and key quoted statements. Keep causal relationships (X because Y). When the work involves code, still capture what was built/changed/decided, errors resolved, and patterns established. Do not generalize specifics away — write \"attended an LGBTQ support group on 7 May 2023\", never \"attended social events\".]".to_string());
-    lines.push("FACTS: [one atomic fact per line, each starting with \"- \". Be EXHAUSTIVE — extract EVERY concrete fact stated; do not summarize, merge, or skip. Each fact must stand completely on its own: name the person or subject explicitly (never a bare \"she/he/they/it\"), and carry any date, place, quantity, or proper noun it involves, e.g. \"- Caroline researched adoption agencies\" or \"- Melanie painted a sunrise in 2022\". Omit only greetings and filler. If there are genuinely no concrete facts, write \"- none\".]".to_string());
+    lines.push("FACTS: [one atomic fact per line, each starting with \"- \". Be EXHAUSTIVE — extract EVERY concrete fact stated; do not summarize, merge, or skip. Each fact must stand completely on its own: name the person or subject explicitly (never a bare \"she/he/they/it\"), and carry any date, place, quantity, or proper noun it involves. CRITICAL: resolve every RELATIVE time expression to an ABSOLUTE date using the conversation's own date as the reference — \"last year\" → the actual year, \"last Friday\"/\"yesterday\"/\"two weeks ago\" → the actual date, \"in June\" → that month with its year — and write the absolute date in the fact, e.g. \"- Melanie painted a sunrise in 2022\" (not \"last year\"), \"- Melanie ran a charity race on 20 May 2023\" (not \"last Saturday\"). Omit only greetings and filler. If there are genuinely no concrete facts, write \"- none\".]".to_string());
     lines.push(
         "TAGS: [8-12 space-separated lowercase keywords: technologies, file names, concepts]"
             .to_string(),
@@ -505,6 +505,13 @@ mod tests {
     fn prompt_emits_facts_section() {
         let p = build_prompt(&[]);
         assert!(p.contains("FACTS:"), "prompt must request a FACTS block");
+    }
+
+    #[test]
+    fn prompt_requests_absolute_date_resolution() {
+        let p = build_prompt(&[]);
+        assert!(p.contains("ABSOLUTE"), "facts prompt must ask to resolve to absolute dates");
+        assert!(p.contains("RELATIVE"), "facts prompt must name relative-time resolution");
     }
 
     #[test]
