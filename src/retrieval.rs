@@ -16,6 +16,13 @@ use crate::vectorstore::VectorStore;
 /// Standard RRF damping constant. Larger ⇒ rank position matters less.
 pub const RRF_K: i64 = 60;
 
+/// Whether to fuse the entity-index signal into hybrid retrieval. Disabled: in
+/// person-centric corpora the index matches nearly every memory and returns them
+/// most-recent-first, which demotes older-but-exact facts below newer vaguer ones
+/// and measurably hurt LoCoMo precision. FTS + vector already match the named
+/// person; the index is retained for future relevance-ranked entity retrieval.
+const FUSE_ENTITY_SIGNAL: bool = false;
+
 /// Fuse several ranked id-lists into one ordering by Σ 1/(k + rank).
 /// `rank` is 0-indexed (top of a list contributes the most). Ties keep
 /// first-appearance order so the result is deterministic.
@@ -40,9 +47,37 @@ pub fn rrf_fuse(lists: &[Vec<i64>], k: i64) -> Vec<i64> {
     order
 }
 
-/// Hybrid search: fuse keyword (FTS) and semantic (vector) results. With no
-/// embedder — or when the vector side yields nothing — this returns the exact
-/// FTS ordering, reproducing legacy behavior.
+/// 4-digit years (1900–2099) named in a query. A temporal question ("what did X
+/// do in May 2023?") implies a year, which anchors the time-aware retrieval
+/// boost: memories whose `event_time` contains a named year get a rank lift.
+fn query_years(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|t| t.len() == 4)
+        .filter(|t| matches!(t.parse::<u16>(), Ok(y) if (1900..=2099).contains(&y)))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Capitalized word tokens (≥3 chars) in a query — candidate proper nouns for
+/// the entity-index lookup. No stoplist is needed: a non-entity capitalized word
+/// ("What") simply resolves to no memories, since the index only matches names
+/// actually stored at write time.
+fn query_entities(query: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 3)
+        .filter(|t| t.chars().next().is_some_and(|c| c.is_uppercase()))
+        .filter(|t| seen.insert(t.to_lowercase()))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Hybrid search: fuse keyword (FTS), semantic (vector), temporal (event_time),
+/// and entity (proper-noun index) signals via RRF. With none of the auxiliary
+/// signals present this returns the exact FTS ordering, reproducing legacy
+/// behavior.
 pub async fn hybrid_search(
     db: &Database,
     embedder: Option<&dyn Embedder>,
@@ -51,17 +86,21 @@ pub async fn hybrid_search(
     query: &str,
     limit: usize,
 ) -> Result<Vec<Memory>> {
+    // Candidate pool: pull more than `limit` per signal so the narrative-reserve
+    // quota below has narratives to choose from even when facts dominate ranking.
+    let pool = (limit * 3).max(30);
+
     // Keyword side (always run).
     let fts = match project {
-        Some(p) => db::search_memories(db, p, query, limit as i64).await?,
-        None => db::search_all_memories(db, query, limit as i64).await?,
+        Some(p) => db::search_memories(db, p, query, pool as i64).await?,
+        None => db::search_all_memories(db, query, pool as i64).await?,
     };
 
     // Semantic side (best-effort; only when an embedder is configured).
     let vec_ids: Vec<i64> = if let Some(emb) = embedder {
         match embed_one(emb, query).await {
             Some(qvec) => store
-                .knn(db, project, &qvec, emb.id(), limit)
+                .knn(db, project, &qvec, emb.id(), pool)
                 .await
                 .unwrap_or_default()
                 .into_iter()
@@ -73,18 +112,80 @@ pub async fn hybrid_search(
         Vec::new()
     };
 
-    // No semantic signal ⇒ pure FTS, unchanged.
-    if vec_ids.is_empty() {
-        return Ok(fts);
-    }
+    // Temporal side: when the query names a year, memories tagged with a matching
+    // event_time get a rank boost. Additive — undated memories never match, so
+    // this only ever lifts dated memories, never suppresses anything.
+    let time_ids: Vec<i64> = {
+        let years = query_years(query);
+        if years.is_empty() {
+            Vec::new()
+        } else {
+            let mut seen = HashSet::new();
+            let mut ids = Vec::new();
+            for y in &years {
+                for id in db::memories_by_event_time(db, project, y, pool)
+                    .await
+                    .unwrap_or_default()
+                {
+                    if seen.insert(id) {
+                        ids.push(id);
+                    }
+                }
+            }
+            ids
+        }
+    };
 
-    // Fuse and materialize in fused order, reusing already-loaded FTS rows.
+    // Entity signal (see FUSE_ENTITY_SIGNAL): off by default — its recency-ordered
+    // matches demote older-but-exact facts in person-centric data. FTS + vector
+    // already cover the named person.
+    let entity_ids: Vec<i64> = if FUSE_ENTITY_SIGNAL {
+        let ents = query_entities(query);
+        let mut seen = HashSet::new();
+        let mut ids = Vec::new();
+        for e in &ents {
+            for id in db::memories_for_entity(db, project, e, pool)
+                .await
+                .unwrap_or_default()
+            {
+                if seen.insert(id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    } else {
+        Vec::new()
+    };
+
+    // Candidate ordering: RRF over keyword + any auxiliary signals (semantic,
+    // temporal, entity). With no auxiliary signal this is the FTS order.
     let fts_ids: Vec<i64> = fts.iter().map(|m| m.id).collect();
     let by_id: HashMap<i64, Memory> = fts.into_iter().map(|m| (m.id, m)).collect();
-    let fused = rrf_fuse(&[fts_ids, vec_ids], RRF_K);
 
-    let mut out = Vec::with_capacity(limit);
-    for id in fused.into_iter().take(limit) {
+    let mut aux: Vec<Vec<i64>> = Vec::new();
+    if !vec_ids.is_empty() {
+        aux.push(vec_ids);
+    }
+    if !time_ids.is_empty() {
+        aux.push(time_ids);
+    }
+    if !entity_ids.is_empty() {
+        aux.push(entity_ids);
+    }
+    let candidates: Vec<i64> = if aux.is_empty() {
+        fts_ids
+    } else {
+        let mut lists: Vec<Vec<i64>> = Vec::with_capacity(aux.len() + 1);
+        lists.push(fts_ids);
+        lists.append(&mut aux);
+        rrf_fuse(&lists, RRF_K)
+    };
+
+    // Narrative-reserve quota, then materialize in rank order (reusing FTS rows).
+    let chosen = reserve_narrative_slots(db, &candidates, limit).await?;
+    let mut out = Vec::with_capacity(chosen.len());
+    for id in chosen {
         if let Some(m) = by_id.get(&id) {
             out.push(m.clone());
         } else if let Some(m) = db::get_memory_by_id(db, id).await? {
@@ -92,6 +193,49 @@ pub async fn hybrid_search(
         }
     }
     Ok(out)
+}
+
+/// Apply the narrative-reserve quota over a ranked candidate id list, returning at
+/// most `limit` ids. Atomic facts (`kind="fact"`) dominate ranking for specific
+/// queries and would otherwise crowd the few narrative memories that carry
+/// cross-turn (multi-hop) links out of the top-`limit`. Guarantee up to ~40% of
+/// the slots to narratives (in rank order) before filling the rest by rank, so
+/// facts AUGMENT rather than REPLACE narratives. Final order follows rank.
+async fn reserve_narrative_slots(db: &Database, candidates: &[i64], limit: usize) -> Result<Vec<i64>> {
+    if candidates.len() <= limit {
+        return Ok(candidates.to_vec());
+    }
+    let kinds = db::kinds_for_memories(db, candidates).await?;
+    // A missing kind (legacy/no-meta row) counts as a narrative, never a fact.
+    let is_fact = |id: &i64| kinds.get(id).map(|k| k == "fact").unwrap_or(false);
+
+    let narr_slots = ((limit * 2) / 5).max(1); // ~40% reserved for narratives
+    let mut chosen: Vec<i64> = Vec::with_capacity(limit);
+    let mut taken: HashSet<i64> = HashSet::new();
+
+    // First guarantee the narrative quota (in rank order)…
+    for &id in candidates {
+        if chosen.len() >= narr_slots {
+            break;
+        }
+        if !is_fact(&id) {
+            chosen.push(id);
+            taken.insert(id);
+        }
+    }
+    // …then fill the remaining slots by rank (facts + any extra narratives).
+    for &id in candidates {
+        if chosen.len() >= limit {
+            break;
+        }
+        if taken.insert(id) {
+            chosen.push(id);
+        }
+    }
+    // Restore rank order for a coherent final ordering.
+    let rank: HashMap<i64, usize> = candidates.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    chosen.sort_by_key(|id| rank[id]);
+    Ok(chosen)
 }
 
 // ── Blended injection ranking ───────────────────────────────────────
@@ -242,6 +386,87 @@ mod tests {
     fn rrf_single_list_preserves_order() {
         let fused = rrf_fuse(&[vec![5_i64, 6, 7]], 60);
         assert_eq!(fused, vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn query_years_extracts_valid_years_only() {
+        assert_eq!(query_years("what did Caroline do in May 2023?"), vec!["2023"]);
+        assert_eq!(query_years("between 2021 and 2099"), vec!["2021", "2099"]);
+        assert!(query_years("no years, just 42 and 12345").is_empty());
+        assert!(query_years("1899 is out of range").is_empty());
+    }
+
+    #[test]
+    fn query_entities_extracts_capitalized_tokens() {
+        assert_eq!(
+            query_entities("What did Caroline tell Melanie?"),
+            vec!["What", "Caroline", "Melanie"]
+        );
+        // Lowercased duplicates collapse; sub-3-char tokens drop.
+        assert_eq!(query_entities("Al and Bo met Caroline and Caroline"), vec!["Caroline"]);
+    }
+
+    #[tokio::test]
+    async fn reserve_narrative_slots_keeps_narrative_against_fact_flood() {
+        let (db, path) = seeded_db().await; // narratives 1,2,3 (irrelevant here)
+        let s = create_session(&db, "/tmp/p").await.unwrap();
+        // Six fact memories ranked ABOVE a single narrative (narrative ranked last
+        // in the candidate order) — without a quota it is dropped at limit=3.
+        let mut facts = Vec::new();
+        for i in 0..6 {
+            let f = insert_memory(&db, "/tmp/p", &s, &format!("fact {i}"), Some("fact"))
+                .await
+                .unwrap();
+            db::set_memory_scope_kind(&db, f, "project", "fact").await.unwrap();
+            facts.push(f);
+        }
+        let narr = insert_memory(&db, "/tmp/p", &s, "the connecting narrative", Some("x"))
+            .await
+            .unwrap();
+        db::set_memory_scope_kind(&db, narr, "project", "session").await.unwrap();
+
+        let mut candidates = facts.clone();
+        candidates.push(narr); // narrative is the lowest-ranked candidate
+
+        let chosen = reserve_narrative_slots(&db, &candidates, 3).await.unwrap();
+        assert_eq!(chosen.len(), 3, "respects limit");
+        assert!(
+            chosen.contains(&narr),
+            "narrative must be reserved despite ranking last: {chosen:?}"
+        );
+        // Quota is ~40% of 3 ⇒ 1 narrative slot; the other 2 are top facts by rank.
+        assert!(chosen.contains(&facts[0]) && chosen.contains(&facts[1]));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_time_boost_surfaces_dated_memory() {
+        let (db, path) = seeded_db().await; // ids 1,2,3 under /tmp/p, all undated
+        // A 4th memory whose wording shares no keyword with the query and which
+        // has no embedding, but is tagged with an event_time in 2023.
+        let s = create_session(&db, "/tmp/p").await.unwrap();
+        let dated = insert_memory(&db, "/tmp/p", &s, "zzz unrelated wording", Some("x"))
+            .await
+            .unwrap();
+        db::set_memory_event_time(&db, dated, "2023-05-07").await.unwrap();
+
+        // No embedder ⇒ vector side empty; query keyword misses every summary in
+        // FTS, but names the year 2023 ⇒ the temporal signal surfaces the memory.
+        let res = hybrid_search(
+            &db,
+            None,
+            &crate::vectorstore::BruteForceStore,
+            Some("/tmp/p"),
+            "what happened in 2023",
+            5,
+        )
+        .await
+        .unwrap();
+        assert!(
+            res.iter().any(|m| m.id == dated),
+            "time-boost must surface the dated memory FTS+vector miss: {res:?}"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

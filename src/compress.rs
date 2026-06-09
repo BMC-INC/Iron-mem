@@ -104,6 +104,13 @@ pub async fn persist(
     // Compressed sessions are project-scoped; record the LLM-classified kind
     // (importance is preserved — set_memory_scope_kind only touches scope+kind).
     db::set_memory_scope_kind(db, memory_id, "project", &result.kind).await?;
+    // Temporal tag: stamp the session's stated event date on the narrative so
+    // the time-aware retrieval boost can surface it for date-anchored questions.
+    if let Some(when) = &result.event_time {
+        if let Err(e) = db::set_memory_event_time(db, memory_id, when).await {
+            tracing::warn!("event_time store failed (memory {memory_id}): {e}");
+        }
+    }
 
     if let Some(emb) = embedder {
         let text = format!("{} {}", result.summary, result.tags);
@@ -119,8 +126,112 @@ pub async fn persist(
         }
     }
 
-    tracing::info!("Session {session_id} compressed → memory_id={memory_id}");
+    // Entity inverted index: link every proper noun named in the session to the
+    // narrative so name-anchored questions resolve by direct lookup even when the
+    // memory ranks low on keyword/vector. Best-effort.
+    for entity in &result.entities {
+        if let Err(e) = db::insert_memory_entity(db, memory_id, entity).await {
+            tracing::warn!("entity index failed (memory {memory_id}): {e}");
+        }
+    }
+
+    // Dual-output compression: persist each extracted atomic fact as its own
+    // searchable kind=fact memory in the same project/session. This bakes the
+    // benchmark's separate "explicit fact" extraction into the write path so
+    // specifics (dates, names, quantities) survive compression and resolve on
+    // direct lookup. Best-effort per fact — a single failure is logged, never
+    // fatal (local-first posture, matching the inline-embed handling above).
+    for fact in &result.facts {
+        persist_fact(
+            db,
+            embedder,
+            store,
+            project,
+            session_id,
+            memory_id,
+            result.importance,
+            fact,
+            &result.entities,
+            result.event_time.as_deref(),
+        )
+        .await;
+    }
+
+    tracing::info!(
+        "Session {session_id} compressed → memory_id={memory_id} (+{} facts)",
+        result.facts.len()
+    );
     Ok(memory_id)
+}
+
+/// Persist one extracted fact as a `kind=fact`, project-scoped memory tied to the
+/// originating session, inheriting the parent's importance and (best-effort)
+/// carrying its own embedding. Errors are logged against `parent_id` and
+/// swallowed so one bad fact never fails an otherwise-successful compression.
+#[allow(clippy::too_many_arguments)] // each arg is an independent field of the fact memory
+async fn persist_fact(
+    db: &Database,
+    embedder: Option<&dyn Embedder>,
+    store: &dyn VectorStore,
+    project: &str,
+    session_id: &str,
+    parent_id: i64,
+    importance: u8,
+    fact: &str,
+    entities: &[String],
+    event_time: Option<&str>,
+) {
+    // Date-stamp the fact so its date rides INSIDE the retrievable text and is
+    // visible to the answerer — the single biggest lever for temporal questions
+    // (mirrors the high-scoring "{fact} (as of {date})" pattern). Undated
+    // sessions store the fact verbatim.
+    let stored = match event_time {
+        Some(when) => format!("{fact} (as of {when})"),
+        None => fact.to_string(),
+    };
+    let tags = format!("fact session:{session_id}");
+    let fid = match db::insert_memory(db, project, session_id, &stored, Some(&tags)).await {
+        Ok(fid) => fid,
+        Err(e) => {
+            tracing::warn!("fact store failed (parent memory {parent_id}): {e}");
+            return;
+        }
+    };
+    if let Err(e) = db::upsert_memory_meta(db, fid, importance as f64 / 10.0).await {
+        tracing::warn!("fact meta failed (fact memory {fid}): {e}");
+    }
+    if let Err(e) = db::set_memory_scope_kind(db, fid, "project", "fact").await {
+        tracing::warn!("fact kind tag failed (fact memory {fid}): {e}");
+    }
+    // Also tag the fact with the session's event_time so the time-aware boost can
+    // surface it directly (not just via the dated text).
+    if let Some(when) = event_time {
+        if let Err(e) = db::set_memory_event_time(db, fid, when).await {
+            tracing::warn!("fact event_time failed (fact memory {fid}): {e}");
+        }
+    }
+    // Index the fact under any session entity it actually mentions, so the fact
+    // (which usually carries the answer) is directly reachable by that name.
+    let fact_lower = fact.to_lowercase();
+    for entity in entities {
+        if fact_lower.contains(&entity.to_lowercase()) {
+            if let Err(e) = db::insert_memory_entity(db, fid, entity).await {
+                tracing::warn!("fact entity index failed (fact memory {fid}): {e}");
+            }
+        }
+    }
+    if let Some(emb) = embedder {
+        match emb.embed(std::slice::from_ref(&stored)).await {
+            Ok(mut vecs) => {
+                if let Some(vec) = vecs.drain(..).next() {
+                    if let Err(e) = store.upsert(db, fid, emb.id(), emb.dim(), &vec).await {
+                        tracing::warn!("fact embed upsert failed (fact memory {fid}): {e}");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("fact embed failed (fact memory {fid}): {e}"),
+        }
+    }
 }
 
 /// Store an explicit, user-curated memory (the Supermemory "add memory" pattern):
@@ -208,6 +319,7 @@ mod tests {
             tags: "rust retrieval rrf".into(),
             importance: 8,
             kind: "architecture".into(),
+            ..Default::default()
         };
 
         let id = persist(&db, Some(&emb), &store, "/tmp/p", &session, result)
@@ -231,6 +343,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persist_stores_facts_as_searchable_memories() {
+        let path = std::env::temp_dir().join(format!("ironmem-facts-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::new(&path.to_string_lossy()).await.unwrap();
+        db.migrate().await.unwrap();
+        db.ensure_ann(8).await.unwrap();
+        let session = create_session(&db, "/tmp/p").await.unwrap();
+
+        let emb = FakeEmbedder::new(8);
+        let store = SqliteVecStore;
+        let result = CompressionResult {
+            summary: "Caroline attended community events".into(),
+            tags: "caroline community".into(),
+            importance: 6,
+            kind: "session".into(),
+            facts: vec![
+                "Caroline joined the LGBTQ support group on 7 May 2023".into(),
+                "Melanie painted a sunrise in 2022".into(),
+            ],
+            ..Default::default()
+        };
+
+        let id = persist(&db, Some(&emb), &store, "/tmp/p", &session, result)
+            .await
+            .unwrap();
+
+        // Narrative memory exists.
+        assert!(db::get_memory_by_id(&db, id).await.unwrap().is_some());
+
+        // The date-bearing fact is retrievable by its date and tagged kind=fact,
+        // as a memory distinct from the narrative.
+        let hits = db::search_memories(&db, "/tmp/p", "7 May 2023", 10)
+            .await
+            .unwrap();
+        let fact_hit = hits
+            .iter()
+            .find(|m| m.summary.contains("7 May 2023"))
+            .expect("date fact must be retrievable by its date");
+        assert_ne!(fact_hit.id, id, "fact is a memory distinct from the narrative");
+        let meta = db::get_memory_meta_full(&db, fact_hit.id).await.unwrap();
+        assert_eq!(meta.kind, "fact", "fact memory must be tagged kind=fact");
+
+        // The fact also carries an embedding (semantic recall path).
+        assert!(db::get_embedding(&db, "memory", fact_hit.id, emb.id())
+            .await
+            .unwrap()
+            .is_some());
+
+        // The second fact is its own memory too.
+        let melanie = db::search_memories(&db, "/tmp/p", "Melanie sunrise", 10)
+            .await
+            .unwrap();
+        assert!(melanie.iter().any(|m| m.summary.contains("Melanie")));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn persist_date_stamps_facts_when_session_dated() {
+        let path = std::env::temp_dir().join(format!("ironmem-df-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::new(&path.to_string_lossy()).await.unwrap();
+        db.migrate().await.unwrap();
+        let session = create_session(&db, "/tmp/p").await.unwrap();
+        let store = crate::vectorstore::BruteForceStore;
+        let result = CompressionResult {
+            summary: "Caroline talked about adoption".into(),
+            tags: "caroline".into(),
+            importance: 6,
+            kind: "session".into(),
+            facts: vec!["Caroline researched adoption agencies".into()],
+            event_time: Some("2023-05-08".into()),
+            ..Default::default()
+        };
+
+        persist(&db, None, &store, "/tmp/p", &session, result)
+            .await
+            .unwrap();
+
+        // The fact's stored text carries the date, and the fact memory is tagged
+        // with event_time (both retrieval paths for temporal questions).
+        let hits = db::search_memories(&db, "/tmp/p", "adoption 2023", 10)
+            .await
+            .unwrap();
+        let fact = hits
+            .iter()
+            .find(|m| m.summary.contains("researched adoption agencies"))
+            .expect("dated fact retrievable");
+        assert!(fact.summary.contains("2023-05-08"), "fact text must carry the date");
+        let meta = db::get_memory_meta_full(&db, fact.id).await.unwrap();
+        assert_eq!(meta.event_time.as_deref(), Some("2023-05-08"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn persist_without_embedder_still_writes_meta() {
         let path = std::env::temp_dir().join(format!("ironmem-cmp2-{}.db", uuid::Uuid::new_v4()));
         let db = Database::new(&path.to_string_lossy()).await.unwrap();
@@ -242,6 +447,7 @@ mod tests {
             tags: "fts only".into(),
             importance: 3,
             kind: "session".into(),
+            ..Default::default()
         };
 
         let id = persist(&db, None, &store, "/tmp/p", &session, result)
@@ -330,6 +536,7 @@ mod tests {
             tags: "t".into(),
             importance: 5,
             kind: "session".into(),
+            ..Default::default()
         };
         let memory_id = persist(&db, None, &store, "/tmp/p", &session, result)
             .await

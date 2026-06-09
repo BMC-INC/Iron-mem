@@ -330,6 +330,7 @@ pub async fn backfill(
 pub async fn purge_memory(db: &Database, store: &dyn VectorStore, memory_id: i64) -> Result<()> {
     store.delete(db, memory_id).await?;
     db::delete_memory_meta(db, memory_id).await?;
+    db::delete_memory_entities(db, memory_id).await?;
     Ok(())
 }
 
@@ -440,12 +441,22 @@ mod tests {
         let store = SqliteVecStore;
         store.upsert(&db, 1, "m", 4, &vecs()[0]).await.unwrap();
         db::upsert_memory_meta(&db, 1, 0.7).await.unwrap();
+        db::insert_memory_entity(&db, 1, "Caroline").await.unwrap();
 
-        // Delete the memory row, then purge its vectors + metadata.
+        // Delete the memory row, then purge its vectors + metadata + entity rows.
         assert!(db::delete_memory(&db, 1).await.unwrap());
         purge_memory(&db, &store, 1).await.unwrap();
 
         assert!(db::get_embedding(&db, "memory", 1, "m").await.unwrap().is_none());
+        // Entity-index rows for the memory are physically gone (checked directly,
+        // not via the memories JOIN which already excludes the deleted row).
+        let ent_rows: i64 =
+            sqlx::query("SELECT COUNT(*) AS c FROM memory_entities WHERE memory_id = 1")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+                .get("c");
+        assert_eq!(ent_rows, 0, "purge must remove entity-index rows");
         // meta back to default (no row) ⇒ 0.5
         assert!((db::get_memory_meta(&db, 1).await.unwrap() - 0.5).abs() < 1e-9);
         // ANN row gone too.

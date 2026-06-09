@@ -42,18 +42,44 @@ pub struct CompressionResult {
     /// Typed classification of the session, clamped to [`crate::db::MEMORY_KINDS`].
     /// Defaults to `session`.
     pub kind: String,
+    /// Atomic, self-contained facts extracted alongside the narrative summary.
+    /// Each is stored as its own searchable `kind=fact` memory so specifics
+    /// (dates, names, quantities) survive compression and rank on direct lookup.
+    pub facts: Vec<String>,
+    /// The event time/date(-range) the session describes, if it states one
+    /// (`WHEN:`). Stored on the narrative memory's `event_time` to power the
+    /// time-aware retrieval boost. `None` when the session is undated.
+    pub event_time: Option<String>,
+    /// Proper nouns named in the session (`ENTITIES:`) — people, places,
+    /// organizations, products. Indexed in `memory_entities` so name-anchored
+    /// questions resolve by direct lookup regardless of keyword/vector rank.
+    pub entities: Vec<String>,
 }
 
 /// Default importance when the model omits or mangles the IMPORTANCE line.
 const DEFAULT_IMPORTANCE: u8 = 5;
 
+impl Default for CompressionResult {
+    fn default() -> Self {
+        Self {
+            summary: String::new(),
+            tags: String::new(),
+            importance: DEFAULT_IMPORTANCE,
+            kind: "session".to_string(),
+            facts: Vec::new(),
+            event_time: None,
+            entities: Vec::new(),
+        }
+    }
+}
+
 // ── Shared prompt builder ───────────────────────────────────────────
 
 fn build_prompt(observations: &[Observation]) -> String {
     let mut lines = vec![
-        "You are a technical memory system. Analyze these tool calls from a coding session and produce a concise memory entry.".to_string(),
+        "You are a memory system. Analyze this session and produce a faithful, compact memory entry. The session may be software development, a conversation, research, planning, or any other activity — adapt to its content and never assume it is code.".to_string(),
         String::new(),
-        "TOOL CALLS:".to_string(),
+        "SESSION ACTIVITY:".to_string(),
     ];
 
     for (i, obs) in observations.iter().enumerate() {
@@ -74,7 +100,8 @@ fn build_prompt(observations: &[Observation]) -> String {
 
     lines.push(String::new());
     lines.push("Respond with EXACTLY this format, nothing else:".to_string());
-    lines.push("SUMMARY: [3-5 sentences describing what was built, changed, or decided. Include specific file names, key decisions, errors resolved, and patterns established.]".to_string());
+    lines.push("SUMMARY: [3-6 sentences. PRESERVE every specific: exact dates and times, proper nouns (people, places, organizations, events), quantities, file names, and key quoted statements. Keep causal relationships (X because Y). When the work involves code, still capture what was built/changed/decided, errors resolved, and patterns established. Do not generalize specifics away — write \"attended an LGBTQ support group on 7 May 2023\", never \"attended social events\".]".to_string());
+    lines.push("FACTS: [one atomic fact per line, each starting with \"- \". Be EXHAUSTIVE — extract EVERY concrete fact stated; do not summarize, merge, or skip. Each fact must stand completely on its own: name the person or subject explicitly (never a bare \"she/he/they/it\"), and carry any date, place, quantity, or proper noun it involves, e.g. \"- Caroline researched adoption agencies\" or \"- Melanie painted a sunrise in 2022\". Omit only greetings and filler. If there are genuinely no concrete facts, write \"- none\".]".to_string());
     lines.push(
         "TAGS: [8-12 space-separated lowercase keywords: technologies, file names, concepts]"
             .to_string(),
@@ -87,6 +114,14 @@ fn build_prompt(observations: &[Observation]) -> String {
         "KIND: [single word classifying this session: session | error_solution | preference | architecture | learned_pattern | project_config — default 'session']"
             .to_string(),
     );
+    lines.push(
+        "WHEN: [if the session describes events on a specific date or date range, give it as YYYY-MM-DD (or a short range like 2023-05-07..2023-05-09); otherwise write 'none'.]"
+            .to_string(),
+    );
+    lines.push(
+        "ENTITIES: [comma-separated proper nouns named in the session — people, places, organizations, products. Omit common words; write 'none' if there are no proper nouns.]"
+            .to_string(),
+    );
 
     lines.join("\n")
 }
@@ -96,17 +131,49 @@ fn parse_response(text: &str) -> CompressionResult {
     let mut tags = String::new();
     let mut importance: Option<u8> = None;
     let mut kind: Option<String> = None;
+    let mut facts: Vec<String> = Vec::new();
+    let mut event_time: Option<String> = None;
+    let mut entities: Vec<String> = Vec::new();
+    // FACTS is a multi-line block: once the marker is seen, subsequent "- "
+    // bullet lines are facts until the next known marker ends the block.
+    let mut in_facts = false;
 
     for line in text.lines() {
         if let Some(s) = line.strip_prefix("SUMMARY:") {
             summary = s.trim().to_string();
+            in_facts = false;
+        } else if let Some(rest) = line.strip_prefix("FACTS:") {
+            in_facts = true;
+            // Tolerate a first fact placed on the marker line itself.
+            push_fact(&mut facts, rest);
         } else if let Some(t) = line.strip_prefix("TAGS:") {
             tags = t.trim().to_string();
+            in_facts = false;
         } else if let Some(i) = line.strip_prefix("IMPORTANCE:") {
             importance = parse_importance(i);
+            in_facts = false;
         } else if let Some(k) = line.strip_prefix("KIND:") {
             // Clamp to the known set; unrecognized values collapse to `session`.
             kind = Some(crate::db::clamp_kind(k).to_string());
+            in_facts = false;
+        } else if let Some(w) = line.strip_prefix("WHEN:") {
+            let w = w.trim();
+            // Treat blank / "none" / "unknown" as undated.
+            if !w.is_empty() && !w.eq_ignore_ascii_case("none") && !w.eq_ignore_ascii_case("unknown")
+            {
+                event_time = Some(w.to_string());
+            }
+            in_facts = false;
+        } else if let Some(e) = line.strip_prefix("ENTITIES:") {
+            for ent in e.split(',') {
+                let ent = ent.trim();
+                if !ent.is_empty() && !ent.eq_ignore_ascii_case("none") {
+                    entities.push(ent.to_string());
+                }
+            }
+            in_facts = false;
+        } else if in_facts {
+            push_fact(&mut facts, line);
         }
     }
 
@@ -120,6 +187,25 @@ fn parse_response(text: &str) -> CompressionResult {
         tags,
         importance: importance.unwrap_or(DEFAULT_IMPORTANCE),
         kind: kind.unwrap_or_else(|| "session".to_string()),
+        facts,
+        event_time,
+        entities,
+    }
+}
+
+/// Append a FACTS-block line as a fact when it is a non-empty "- …" bullet.
+/// Skips blanks, lines without bullet syntax, and the "- none" sentinel the
+/// prompt asks for when a session has no concrete facts.
+fn push_fact(facts: &mut Vec<String>, line: &str) {
+    let trimmed = line.trim();
+    let bullet = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix('-'));
+    if let Some(f) = bullet {
+        let f = f.trim();
+        if !f.is_empty() && !f.eq_ignore_ascii_case("none") {
+            facts.push(f.to_string());
+        }
     }
 }
 
@@ -226,7 +312,7 @@ async fn anthropic_text(prompt: &str, model: &str, api_key: &str) -> Result<Stri
     let client = reqwest::Client::new();
     let req = AnthropicRequest {
         model: model.to_string(),
-        max_tokens: 1024,
+        max_tokens: 2048,
         messages: vec![ChatMessage {
             role: "user".to_string(),
             content: prompt.to_string(),
@@ -288,7 +374,7 @@ async fn openai_text(prompt: &str, model: &str, api_key: &str) -> Result<String>
     let client = reqwest::Client::new();
     let req = OpenAiRequest {
         model: model.to_string(),
-        max_tokens: 1024,
+        max_tokens: 2048,
         messages: vec![ChatMessage {
             role: "user".to_string(),
             content: prompt.to_string(),
@@ -397,6 +483,80 @@ async fn google_text(prompt: &str, model: &str, api_key: &str) -> Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_response_extracts_facts_block() {
+        let r = parse_response("SUMMARY: s\nFACTS:\n- Caroline joined the LGBTQ group on 7 May 2023\n- Melanie painted a sunrise in 2022\nTAGS: a b\nIMPORTANCE: 6");
+        assert_eq!(r.facts.len(), 2);
+        assert!(r.facts[0].contains("7 May 2023"));
+        // Other fields still parse around the block.
+        assert_eq!(r.summary, "s");
+        assert_eq!(r.tags, "a b");
+        assert_eq!(r.importance, 6);
+    }
+
+    #[test]
+    fn parse_response_without_facts_yields_empty_vec() {
+        let r = parse_response("SUMMARY: s\nTAGS: a b\nIMPORTANCE: 5");
+        assert!(r.facts.is_empty());
+    }
+
+    #[test]
+    fn prompt_emits_facts_section() {
+        let p = build_prompt(&[]);
+        assert!(p.contains("FACTS:"), "prompt must request a FACTS block");
+    }
+
+    #[test]
+    fn parse_response_extracts_when_as_event_time() {
+        let r = parse_response("SUMMARY: s\nKIND: session\nWHEN: 2023-05-07");
+        assert_eq!(r.event_time.as_deref(), Some("2023-05-07"));
+    }
+
+    #[test]
+    fn parse_response_treats_when_none_as_undated() {
+        assert!(parse_response("SUMMARY: s\nWHEN: none").event_time.is_none());
+        assert!(parse_response("SUMMARY: s").event_time.is_none());
+    }
+
+    #[test]
+    fn prompt_emits_when_section() {
+        assert!(build_prompt(&[]).contains("WHEN:"), "prompt must request WHEN");
+    }
+
+    #[test]
+    fn parse_response_extracts_entities_csv() {
+        let r = parse_response("SUMMARY: s\nENTITIES: Caroline, Melanie, New York\nKIND: session");
+        assert_eq!(r.entities, vec!["Caroline", "Melanie", "New York"]);
+    }
+
+    #[test]
+    fn parse_response_entities_none_is_empty() {
+        assert!(parse_response("SUMMARY: s\nENTITIES: none").entities.is_empty());
+        assert!(parse_response("SUMMARY: s").entities.is_empty());
+    }
+
+    #[test]
+    fn prompt_emits_entities_section() {
+        assert!(
+            build_prompt(&[]).contains("ENTITIES:"),
+            "prompt must request ENTITIES"
+        );
+    }
+
+    #[test]
+    fn prompt_preserves_specifics_and_is_domain_agnostic() {
+        let p = build_prompt(&[]);
+        assert!(p.contains("dates"), "must ask to keep dates");
+        assert!(
+            p.contains("proper nouns") || p.contains("names"),
+            "must ask to keep proper nouns/names"
+        );
+        assert!(
+            !p.contains("coding session"),
+            "must not assume the session is coding"
+        );
+    }
 
     #[test]
     fn parses_importance_line() {

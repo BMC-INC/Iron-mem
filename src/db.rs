@@ -325,6 +325,40 @@ impl Database {
             }
         }
 
+        // Temporal tag: the event time a memory describes (a date/range stated in
+        // the session), distinct from created_at (wall-clock write time). Nullable
+        // and additive — undated memories read back as None and the time-aware
+        // retrieval boost simply skips them.
+        match self.backend {
+            Backend::Sqlite => {
+                let _ = sqlx::query("ALTER TABLE memory_meta ADD COLUMN event_time TEXT")
+                    .execute(&self.pool)
+                    .await;
+            }
+            Backend::Postgres => {
+                sqlx::query("ALTER TABLE memory_meta ADD COLUMN IF NOT EXISTS event_time TEXT")
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+
+        // Entity inverted index: one row per (memory, normalized proper-noun
+        // token), so name-anchored questions resolve by direct lookup even when a
+        // memory ranks low on keyword/vector. Additive — empty for legacy data.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS memory_entities (
+                memory_id BIGINT NOT NULL,
+                entity    TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -1011,6 +1045,10 @@ pub const MEMORY_KINDS: &[&str] = &[
     "learned_pattern",
     "project_config",
     "profile",
+    // Atomic facts extracted from a session by dual-output compression. Stored
+    // as their own searchable memories so dates/names/quantities survive and
+    // resolve on direct lookup (see compress::persist).
+    "fact",
 ];
 
 /// Clamp an arbitrary kind string to the known set, case-insensitively.
@@ -1043,6 +1081,12 @@ pub struct MemoryMetaInfo {
     #[allow(dead_code)]
     pub scope: String,
     pub kind: String,
+    /// Event time the memory describes (a date/range stated in the session),
+    /// `None` when undated. Distinct from `created_at` (write time). Production
+    /// time-aware retrieval filters at the SQL layer (`memories_by_event_time`),
+    /// so this field is read only in tests today.
+    #[allow(dead_code)]
+    pub event_time: Option<String>,
 }
 
 impl Default for MemoryMetaInfo {
@@ -1051,6 +1095,7 @@ impl Default for MemoryMetaInfo {
             importance: 0.5,
             scope: "project".to_string(),
             kind: "session".to_string(),
+            event_time: None,
         }
     }
 }
@@ -1059,7 +1104,7 @@ impl Default for MemoryMetaInfo {
 /// columns fall back to the defaults in [`MemoryMetaInfo::default`].
 pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<MemoryMetaInfo> {
     let row: Option<sqlx::any::AnyRow> =
-        sqlx::query("SELECT importance, scope, kind FROM memory_meta WHERE memory_id = $1")
+        sqlx::query("SELECT importance, scope, kind, event_time FROM memory_meta WHERE memory_id = $1")
             .bind(memory_id)
             .fetch_optional(&db.pool)
             .await?;
@@ -1076,6 +1121,7 @@ pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<Memor
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "session".to_string()),
+            event_time: r.try_get::<Option<String>, _>("event_time").ok().flatten(),
         },
         None => MemoryMetaInfo::default(),
     })
@@ -1103,6 +1149,167 @@ pub async fn set_memory_scope_kind(
     .execute(&db.pool)
     .await?;
     Ok(())
+}
+
+/// Set a memory's `event_time` (a date/range stated in the session). Upserts the
+/// meta row so it works whether or not `upsert_memory_meta`/`set_memory_scope_kind`
+/// ran first; a fresh row gets the default importance and never clobbers an
+/// existing one's importance/scope/kind.
+pub async fn set_memory_event_time(db: &Database, memory_id: i64, event_time: &str) -> Result<()> {
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO memory_meta(memory_id, importance, created_at, event_time)
+         VALUES($1, 0.5, $2, $3)
+         ON CONFLICT(memory_id) DO UPDATE SET event_time = excluded.event_time",
+    )
+    .bind(memory_id)
+    .bind(now)
+    .bind(event_time)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+/// Memory ids whose recorded `event_time` contains `needle` (typically a year),
+/// scoped to `project` when given, most-recent first and capped at `limit`.
+/// Undated memories (NULL event_time) never match, so this signal is purely
+/// additive to keyword/vector retrieval. Powers the time-aware retrieval boost.
+pub async fn memories_by_event_time(
+    db: &Database,
+    project: Option<&str>,
+    needle: &str,
+    limit: usize,
+) -> Result<Vec<i64>> {
+    let id_col = match db.backend {
+        Backend::Sqlite => "m.rowid",
+        Backend::Postgres => "m.id",
+    };
+    let like = format!("%{needle}%");
+    let rows: Vec<sqlx::any::AnyRow> = match project {
+        Some(p) => {
+            sqlx::query(&format!(
+                "SELECT {id_col} AS id FROM memories m
+                 JOIN memory_meta mm ON mm.memory_id = {id_col}
+                 WHERE mm.event_time LIKE $1 AND m.project = $2
+                 ORDER BY m.created_at DESC LIMIT $3"
+            ))
+            .bind(&like)
+            .bind(p)
+            .bind(limit as i64)
+            .fetch_all(&db.pool)
+            .await?
+        }
+        None => {
+            sqlx::query(&format!(
+                "SELECT {id_col} AS id FROM memories m
+                 JOIN memory_meta mm ON mm.memory_id = {id_col}
+                 WHERE mm.event_time LIKE $1
+                 ORDER BY m.created_at DESC LIMIT $2"
+            ))
+            .bind(&like)
+            .bind(limit as i64)
+            .fetch_all(&db.pool)
+            .await?
+        }
+    };
+    Ok(rows.into_iter().map(|r| r.get::<i64, _>("id")).collect())
+}
+
+/// Index a memory under an entity (proper noun). The entity is split into word
+/// tokens, lowercased, and stored one row per token (≥3 chars) so a single-token
+/// query resolves any token of a multi-word entity ("York" of "New York").
+/// Duplicate tokens within one call are collapsed.
+pub async fn insert_memory_entity(db: &Database, memory_id: i64, entity: &str) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for tok in entity.split(|c: char| !c.is_alphanumeric()) {
+        let t = tok.to_lowercase();
+        if t.chars().count() < 3 || !seen.insert(t.clone()) {
+            continue;
+        }
+        sqlx::query("INSERT INTO memory_entities(memory_id, entity) VALUES($1, $2)")
+            .bind(memory_id)
+            .bind(&t)
+            .execute(&db.pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Memory ids indexed under `entity` (matched case-insensitively against a single
+/// normalized token), scoped to `project` when given, most-recent first and
+/// capped at `limit`. Powers the entity-aware retrieval signal.
+pub async fn memories_for_entity(
+    db: &Database,
+    project: Option<&str>,
+    entity: &str,
+    limit: usize,
+) -> Result<Vec<i64>> {
+    let needle = entity.trim().to_lowercase();
+    if needle.chars().count() < 3 {
+        return Ok(Vec::new());
+    }
+    let id_col = match db.backend {
+        Backend::Sqlite => "m.rowid",
+        Backend::Postgres => "m.id",
+    };
+    let rows: Vec<sqlx::any::AnyRow> = match project {
+        Some(p) => {
+            sqlx::query(&format!(
+                "SELECT {id_col} AS id, m.created_at AS ca
+                 FROM memories m JOIN memory_entities me ON me.memory_id = {id_col}
+                 WHERE me.entity = $1 AND m.project = $2
+                 GROUP BY {id_col}, m.created_at
+                 ORDER BY ca DESC LIMIT $3"
+            ))
+            .bind(&needle)
+            .bind(p)
+            .bind(limit as i64)
+            .fetch_all(&db.pool)
+            .await?
+        }
+        None => {
+            sqlx::query(&format!(
+                "SELECT {id_col} AS id, m.created_at AS ca
+                 FROM memories m JOIN memory_entities me ON me.memory_id = {id_col}
+                 WHERE me.entity = $1
+                 GROUP BY {id_col}, m.created_at
+                 ORDER BY ca DESC LIMIT $2"
+            ))
+            .bind(&needle)
+            .bind(limit as i64)
+            .fetch_all(&db.pool)
+            .await?
+        }
+    };
+    Ok(rows.into_iter().map(|r| r.get::<i64, _>("id")).collect())
+}
+
+/// Kind for each of `ids`, in one query. Ids absent from `memory_meta` (legacy
+/// rows / no meta) are simply omitted — callers treat a missing id as a narrative
+/// (non-fact) default. Used by the retrieval narrative-reserve quota.
+pub async fn kinds_for_memories(
+    db: &Database,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, String>> {
+    let mut out = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    // i64 values are safe to inline; avoids per-backend variadic IN binding.
+    let in_list = ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT memory_id, kind FROM memory_meta WHERE memory_id IN ({in_list})");
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql).fetch_all(&db.pool).await?;
+    for r in rows {
+        let id: i64 = r.get("memory_id");
+        if let Some(kind) = r.try_get::<Option<String>, _>("kind").ok().flatten() {
+            out.insert(id, kind);
+        }
+    }
+    Ok(out)
 }
 
 /// Recent memories filtered by scope. `user`-scope memories are global (the
@@ -1241,6 +1448,16 @@ pub async fn get_memories_by_kind(
 
 pub async fn delete_memory_meta(db: &Database, memory_id: i64) -> Result<()> {
     sqlx::query("DELETE FROM memory_meta WHERE memory_id = $1")
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+/// Remove a memory's entity-index rows. Called from `purge_memory` so the
+/// inverted index never retains rows for a deleted memory.
+pub async fn delete_memory_entities(db: &Database, memory_id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM memory_entities WHERE memory_id = $1")
         .bind(memory_id)
         .execute(&db.pool)
         .await?;
@@ -1913,6 +2130,59 @@ mod tests {
         assert_eq!(clamp_scope("USER"), "user");
         assert_eq!(clamp_scope("project"), "project");
         assert_eq!(clamp_scope("garbage"), "project");
+    }
+
+    #[tokio::test]
+    async fn event_time_round_trips_and_queries() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let p = "/tmp/temporal";
+        let s = create_session(&db, p).await?;
+
+        // One dated memory, one undated, same project.
+        let dated = insert_memory(&db, p, &s, "Caroline joined a support group", Some("t")).await?;
+        set_memory_event_time(&db, dated, "2023-05-07").await?;
+        let undated = insert_memory(&db, p, &s, "some other note", Some("t")).await?;
+
+        // event_time round-trips through the meta read; undated reads as None.
+        let info = get_memory_meta_full(&db, dated).await?;
+        assert_eq!(info.event_time.as_deref(), Some("2023-05-07"));
+        assert!(get_memory_meta_full(&db, undated).await?.event_time.is_none());
+
+        // Year query matches only the dated memory; a non-matching year finds none.
+        assert_eq!(memories_by_event_time(&db, Some(p), "2023", 10).await?, vec![dated]);
+        assert!(memories_by_event_time(&db, Some(p), "1999", 10).await?.is_empty());
+        // Project scoping: a different project sees nothing.
+        assert!(memories_by_event_time(&db, Some("/tmp/other"), "2023", 10)
+            .await?
+            .is_empty());
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_entities_insert_and_lookup() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let p = "/tmp/ent";
+        let s = create_session(&db, p).await?;
+        let caro = insert_memory(&db, p, &s, "Caroline did things in New York", Some("t")).await?;
+        insert_memory_entity(&db, caro, "Caroline").await?;
+        insert_memory_entity(&db, caro, "New York").await?;
+
+        // Case-insensitive single-token lookup returns the id.
+        assert_eq!(memories_for_entity(&db, Some(p), "caroline", 10).await?, vec![caro]);
+        assert_eq!(memories_for_entity(&db, Some(p), "CAROLINE", 10).await?, vec![caro]);
+        // Either token of a multi-word entity resolves.
+        assert_eq!(memories_for_entity(&db, Some(p), "York", 10).await?, vec![caro]);
+        // Unknown entity / too-short token / wrong project ⇒ nothing.
+        assert!(memories_for_entity(&db, Some(p), "Melanie", 10).await?.is_empty());
+        assert!(memories_for_entity(&db, Some(p), "of", 10).await?.is_empty());
+        assert!(memories_for_entity(&db, Some("/tmp/other"), "caroline", 10)
+            .await?
+            .is_empty());
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[tokio::test]

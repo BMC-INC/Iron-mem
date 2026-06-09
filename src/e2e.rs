@@ -45,6 +45,7 @@ async fn semantic_pipeline_end_to_end() {
             tags: "rust sqlite vector ann".into(),
             importance: 9,
             kind: "architecture".into(),
+            ..Default::default()
         },
     )
     .await
@@ -61,6 +62,7 @@ async fn semantic_pipeline_end_to_end() {
             tags: "css frontend layout".into(),
             importance: 2,
             kind: "session".into(),
+            ..Default::default()
         },
     )
     .await
