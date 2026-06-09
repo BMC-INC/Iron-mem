@@ -79,17 +79,21 @@ pub async fn hybrid_search(
     query: &str,
     limit: usize,
 ) -> Result<Vec<Memory>> {
+    // Candidate pool: pull more than `limit` per signal so the narrative-reserve
+    // quota below has narratives to choose from even when facts dominate ranking.
+    let pool = (limit * 3).max(30);
+
     // Keyword side (always run).
     let fts = match project {
-        Some(p) => db::search_memories(db, p, query, limit as i64).await?,
-        None => db::search_all_memories(db, query, limit as i64).await?,
+        Some(p) => db::search_memories(db, p, query, pool as i64).await?,
+        None => db::search_all_memories(db, query, pool as i64).await?,
     };
 
     // Semantic side (best-effort; only when an embedder is configured).
     let vec_ids: Vec<i64> = if let Some(emb) = embedder {
         match embed_one(emb, query).await {
             Some(qvec) => store
-                .knn(db, project, &qvec, emb.id(), limit)
+                .knn(db, project, &qvec, emb.id(), pool)
                 .await
                 .unwrap_or_default()
                 .into_iter()
@@ -112,7 +116,7 @@ pub async fn hybrid_search(
             let mut seen = HashSet::new();
             let mut ids = Vec::new();
             for y in &years {
-                for id in db::memories_by_event_time(db, project, y, limit)
+                for id in db::memories_by_event_time(db, project, y, pool)
                     .await
                     .unwrap_or_default()
                 {
@@ -126,7 +130,9 @@ pub async fn hybrid_search(
     };
 
     // Entity side: when the query names a proper noun we indexed at write time,
-    // memories tagged with that entity get a rank boost. Additive — unknown names
+    // memories tagged with that entity get a rank boost. In person-centric data
+    // this disambiguates whose facts to surface; the narrative-reserve quota below
+    // keeps it (and the FTS flood) from crowding out narratives. Unknown names
     // resolve to nothing.
     let entity_ids: Vec<i64> = {
         let ents = query_entities(query);
@@ -136,7 +142,7 @@ pub async fn hybrid_search(
             let mut seen = HashSet::new();
             let mut ids = Vec::new();
             for e in &ents {
-                for id in db::memories_for_entity(db, project, e, limit)
+                for id in db::memories_for_entity(db, project, e, pool)
                     .await
                     .unwrap_or_default()
                 {
@@ -149,9 +155,11 @@ pub async fn hybrid_search(
         }
     };
 
-    // Auxiliary ranked signals beyond keyword FTS: semantic (vector), temporal
-    // (event_time), and entity (proper-noun index). Each non-empty list joins the
-    // RRF; with none present, return the exact FTS ordering (legacy preserved).
+    // Candidate ordering: RRF over keyword + any auxiliary signals (semantic,
+    // temporal, entity). With no auxiliary signal this is the FTS order.
+    let fts_ids: Vec<i64> = fts.iter().map(|m| m.id).collect();
+    let by_id: HashMap<i64, Memory> = fts.into_iter().map(|m| (m.id, m)).collect();
+
     let mut aux: Vec<Vec<i64>> = Vec::new();
     if !vec_ids.is_empty() {
         aux.push(vec_ids);
@@ -162,20 +170,19 @@ pub async fn hybrid_search(
     if !entity_ids.is_empty() {
         aux.push(entity_ids);
     }
-    if aux.is_empty() {
-        return Ok(fts);
-    }
+    let candidates: Vec<i64> = if aux.is_empty() {
+        fts_ids
+    } else {
+        let mut lists: Vec<Vec<i64>> = Vec::with_capacity(aux.len() + 1);
+        lists.push(fts_ids);
+        lists.append(&mut aux);
+        rrf_fuse(&lists, RRF_K)
+    };
 
-    // Fuse and materialize in fused order, reusing already-loaded FTS rows.
-    let fts_ids: Vec<i64> = fts.iter().map(|m| m.id).collect();
-    let by_id: HashMap<i64, Memory> = fts.into_iter().map(|m| (m.id, m)).collect();
-    let mut lists: Vec<Vec<i64>> = Vec::with_capacity(aux.len() + 1);
-    lists.push(fts_ids);
-    lists.append(&mut aux);
-    let fused = rrf_fuse(&lists, RRF_K);
-
-    let mut out = Vec::with_capacity(limit);
-    for id in fused.into_iter().take(limit) {
+    // Narrative-reserve quota, then materialize in rank order (reusing FTS rows).
+    let chosen = reserve_narrative_slots(db, &candidates, limit).await?;
+    let mut out = Vec::with_capacity(chosen.len());
+    for id in chosen {
         if let Some(m) = by_id.get(&id) {
             out.push(m.clone());
         } else if let Some(m) = db::get_memory_by_id(db, id).await? {
@@ -183,6 +190,49 @@ pub async fn hybrid_search(
         }
     }
     Ok(out)
+}
+
+/// Apply the narrative-reserve quota over a ranked candidate id list, returning at
+/// most `limit` ids. Atomic facts (`kind="fact"`) dominate ranking for specific
+/// queries and would otherwise crowd the few narrative memories that carry
+/// cross-turn (multi-hop) links out of the top-`limit`. Guarantee up to ~40% of
+/// the slots to narratives (in rank order) before filling the rest by rank, so
+/// facts AUGMENT rather than REPLACE narratives. Final order follows rank.
+async fn reserve_narrative_slots(db: &Database, candidates: &[i64], limit: usize) -> Result<Vec<i64>> {
+    if candidates.len() <= limit {
+        return Ok(candidates.to_vec());
+    }
+    let kinds = db::kinds_for_memories(db, candidates).await?;
+    // A missing kind (legacy/no-meta row) counts as a narrative, never a fact.
+    let is_fact = |id: &i64| kinds.get(id).map(|k| k == "fact").unwrap_or(false);
+
+    let narr_slots = ((limit * 2) / 5).max(1); // ~40% reserved for narratives
+    let mut chosen: Vec<i64> = Vec::with_capacity(limit);
+    let mut taken: HashSet<i64> = HashSet::new();
+
+    // First guarantee the narrative quota (in rank order)…
+    for &id in candidates {
+        if chosen.len() >= narr_slots {
+            break;
+        }
+        if !is_fact(&id) {
+            chosen.push(id);
+            taken.insert(id);
+        }
+    }
+    // …then fill the remaining slots by rank (facts + any extra narratives).
+    for &id in candidates {
+        if chosen.len() >= limit {
+            break;
+        }
+        if taken.insert(id) {
+            chosen.push(id);
+        }
+    }
+    // Restore rank order for a coherent final ordering.
+    let rank: HashMap<i64, usize> = candidates.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    chosen.sort_by_key(|id| rank[id]);
+    Ok(chosen)
 }
 
 // ── Blended injection ranking ───────────────────────────────────────
@@ -379,6 +429,39 @@ mod tests {
             res.iter().any(|m| m.id == named),
             "entity signal must surface the named memory FTS+vector miss: {res:?}"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn reserve_narrative_slots_keeps_narrative_against_fact_flood() {
+        let (db, path) = seeded_db().await; // narratives 1,2,3 (irrelevant here)
+        let s = create_session(&db, "/tmp/p").await.unwrap();
+        // Six fact memories ranked ABOVE a single narrative (narrative ranked last
+        // in the candidate order) — without a quota it is dropped at limit=3.
+        let mut facts = Vec::new();
+        for i in 0..6 {
+            let f = insert_memory(&db, "/tmp/p", &s, &format!("fact {i}"), Some("fact"))
+                .await
+                .unwrap();
+            db::set_memory_scope_kind(&db, f, "project", "fact").await.unwrap();
+            facts.push(f);
+        }
+        let narr = insert_memory(&db, "/tmp/p", &s, "the connecting narrative", Some("x"))
+            .await
+            .unwrap();
+        db::set_memory_scope_kind(&db, narr, "project", "session").await.unwrap();
+
+        let mut candidates = facts.clone();
+        candidates.push(narr); // narrative is the lowest-ranked candidate
+
+        let chosen = reserve_narrative_slots(&db, &candidates, 3).await.unwrap();
+        assert_eq!(chosen.len(), 3, "respects limit");
+        assert!(
+            chosen.contains(&narr),
+            "narrative must be reserved despite ranking last: {chosen:?}"
+        );
+        // Quota is ~40% of 3 ⇒ 1 narrative slot; the other 2 are top facts by rank.
+        assert!(chosen.contains(&facts[0]) && chosen.contains(&facts[1]));
         let _ = std::fs::remove_file(path);
     }
 

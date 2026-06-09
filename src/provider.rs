@@ -101,7 +101,7 @@ fn build_prompt(observations: &[Observation]) -> String {
     lines.push(String::new());
     lines.push("Respond with EXACTLY this format, nothing else:".to_string());
     lines.push("SUMMARY: [3-6 sentences. PRESERVE every specific: exact dates and times, proper nouns (people, places, organizations, events), quantities, file names, and key quoted statements. Keep causal relationships (X because Y). When the work involves code, still capture what was built/changed/decided, errors resolved, and patterns established. Do not generalize specifics away — write \"attended an LGBTQ support group on 7 May 2023\", never \"attended social events\".]".to_string());
-    lines.push("FACTS: [then one atomic fact per line, each starting with \"- \". Each fact must be self-contained and carry its own entity plus any date/quantity, e.g. \"- Caroline joined the LGBTQ support group on 7 May 2023\". Extract every concrete fact stated in the session; omit chit-chat. If there are no concrete facts, write \"- none\".]".to_string());
+    lines.push("FACTS: [one atomic fact per line, each starting with \"- \". Be EXHAUSTIVE — extract EVERY concrete fact stated; do not summarize, merge, or skip. Each fact must stand completely on its own: name the person or subject explicitly (never a bare \"she/he/they/it\"), and carry any date, place, quantity, or proper noun it involves, e.g. \"- Caroline researched adoption agencies\" or \"- Melanie painted a sunrise in 2022\". Omit only greetings and filler. If there are genuinely no concrete facts, write \"- none\".]".to_string());
     lines.push(
         "TAGS: [8-12 space-separated lowercase keywords: technologies, file names, concepts]"
             .to_string(),
@@ -312,7 +312,7 @@ async fn anthropic_text(prompt: &str, model: &str, api_key: &str) -> Result<Stri
     let client = reqwest::Client::new();
     let req = AnthropicRequest {
         model: model.to_string(),
-        max_tokens: 1024,
+        max_tokens: 2048,
         messages: vec![ChatMessage {
             role: "user".to_string(),
             content: prompt.to_string(),
@@ -374,7 +374,7 @@ async fn openai_text(prompt: &str, model: &str, api_key: &str) -> Result<String>
     let client = reqwest::Client::new();
     let req = OpenAiRequest {
         model: model.to_string(),
-        max_tokens: 1024,
+        max_tokens: 2048,
         messages: vec![ChatMessage {
             role: "user".to_string(),
             content: prompt.to_string(),

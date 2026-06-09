@@ -152,6 +152,7 @@ pub async fn persist(
             result.importance,
             fact,
             &result.entities,
+            result.event_time.as_deref(),
         )
         .await;
     }
@@ -178,9 +179,18 @@ async fn persist_fact(
     importance: u8,
     fact: &str,
     entities: &[String],
+    event_time: Option<&str>,
 ) {
+    // Date-stamp the fact so its date rides INSIDE the retrievable text and is
+    // visible to the answerer — the single biggest lever for temporal questions
+    // (mirrors the high-scoring "{fact} (as of {date})" pattern). Undated
+    // sessions store the fact verbatim.
+    let stored = match event_time {
+        Some(when) => format!("{fact} (as of {when})"),
+        None => fact.to_string(),
+    };
     let tags = format!("fact session:{session_id}");
-    let fid = match db::insert_memory(db, project, session_id, fact, Some(&tags)).await {
+    let fid = match db::insert_memory(db, project, session_id, &stored, Some(&tags)).await {
         Ok(fid) => fid,
         Err(e) => {
             tracing::warn!("fact store failed (parent memory {parent_id}): {e}");
@@ -193,6 +203,13 @@ async fn persist_fact(
     if let Err(e) = db::set_memory_scope_kind(db, fid, "project", "fact").await {
         tracing::warn!("fact kind tag failed (fact memory {fid}): {e}");
     }
+    // Also tag the fact with the session's event_time so the time-aware boost can
+    // surface it directly (not just via the dated text).
+    if let Some(when) = event_time {
+        if let Err(e) = db::set_memory_event_time(db, fid, when).await {
+            tracing::warn!("fact event_time failed (fact memory {fid}): {e}");
+        }
+    }
     // Index the fact under any session entity it actually mentions, so the fact
     // (which usually carries the answer) is directly reachable by that name.
     let fact_lower = fact.to_lowercase();
@@ -204,7 +221,7 @@ async fn persist_fact(
         }
     }
     if let Some(emb) = embedder {
-        match emb.embed(&[fact.to_string()]).await {
+        match emb.embed(std::slice::from_ref(&stored)).await {
             Ok(mut vecs) => {
                 if let Some(vec) = vecs.drain(..).next() {
                     if let Err(e) = store.upsert(db, fid, emb.id(), emb.dim(), &vec).await {
@@ -379,6 +396,42 @@ mod tests {
             .unwrap();
         assert!(melanie.iter().any(|m| m.summary.contains("Melanie")));
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn persist_date_stamps_facts_when_session_dated() {
+        let path = std::env::temp_dir().join(format!("ironmem-df-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::new(&path.to_string_lossy()).await.unwrap();
+        db.migrate().await.unwrap();
+        let session = create_session(&db, "/tmp/p").await.unwrap();
+        let store = crate::vectorstore::BruteForceStore;
+        let result = CompressionResult {
+            summary: "Caroline talked about adoption".into(),
+            tags: "caroline".into(),
+            importance: 6,
+            kind: "session".into(),
+            facts: vec!["Caroline researched adoption agencies".into()],
+            event_time: Some("2023-05-08".into()),
+            ..Default::default()
+        };
+
+        persist(&db, None, &store, "/tmp/p", &session, result)
+            .await
+            .unwrap();
+
+        // The fact's stored text carries the date, and the fact memory is tagged
+        // with event_time (both retrieval paths for temporal questions).
+        let hits = db::search_memories(&db, "/tmp/p", "adoption 2023", 10)
+            .await
+            .unwrap();
+        let fact = hits
+            .iter()
+            .find(|m| m.summary.contains("researched adoption agencies"))
+            .expect("dated fact retrievable");
+        assert!(fact.summary.contains("2023-05-08"), "fact text must carry the date");
+        let meta = db::get_memory_meta_full(&db, fact.id).await.unwrap();
+        assert_eq!(meta.event_time.as_deref(), Some("2023-05-08"));
         let _ = std::fs::remove_file(path);
     }
 

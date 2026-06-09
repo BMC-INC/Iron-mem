@@ -1284,6 +1284,34 @@ pub async fn memories_for_entity(
     Ok(rows.into_iter().map(|r| r.get::<i64, _>("id")).collect())
 }
 
+/// Kind for each of `ids`, in one query. Ids absent from `memory_meta` (legacy
+/// rows / no meta) are simply omitted — callers treat a missing id as a narrative
+/// (non-fact) default. Used by the retrieval narrative-reserve quota.
+pub async fn kinds_for_memories(
+    db: &Database,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, String>> {
+    let mut out = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    // i64 values are safe to inline; avoids per-backend variadic IN binding.
+    let in_list = ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT memory_id, kind FROM memory_meta WHERE memory_id IN ({in_list})");
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql).fetch_all(&db.pool).await?;
+    for r in rows {
+        let id: i64 = r.get("memory_id");
+        if let Some(kind) = r.try_get::<Option<String>, _>("kind").ok().flatten() {
+            out.insert(id, kind);
+        }
+    }
+    Ok(out)
+}
+
 /// Recent memories filtered by scope. `user`-scope memories are global (the
 /// `project` argument is ignored); `project`-scope returns the project's
 /// memories — including legacy rows with no meta or a null scope, which read as
