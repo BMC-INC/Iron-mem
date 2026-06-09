@@ -376,6 +376,20 @@ pub struct ContextQuery {
     pub project: String,
     pub limit: Option<i64>,
     pub query: Option<String>,
+    /// Per-request override for LLM reranking ("1"/"true"/"yes"/"on"). Absent ⇒
+    /// fall back to the server's `rerank.enabled` config default.
+    pub rerank: Option<String>,
+}
+
+/// Interpret a `?rerank=` value as a boolean opt-in. Accepts the common truthy
+/// spellings; `None` (param absent) leaves the decision to the config default.
+fn truthy(v: &Option<String>) -> Option<bool> {
+    v.as_deref().map(|s| {
+        matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 #[derive(Serialize)]
@@ -388,9 +402,29 @@ async fn get_context(
     Query(params): Query<ContextQuery>,
 ) -> Result<Json<ContextResponse>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(state.config.inject_limit as i64);
+    let rerank_on = truthy(&params.rerank).unwrap_or(state.config.rerank.enabled);
 
     let memories = match &params.query {
-        Some(q) if !q.is_empty() => state.hybrid(Some(&params.project), q, limit).await,
+        Some(q) if !q.is_empty() => {
+            if rerank_on {
+                // Re-anchored reranked retrieval: protect the base@limit ordering
+                // (FTS-strong temporal answers) while letting the LLM promote
+                // buried wide-pool answers. Failure falls back to base order.
+                retrieval::rerank_search(
+                    &state.db,
+                    state.embedder.as_deref(),
+                    state.store.as_ref(),
+                    &state.config,
+                    Some(&params.project),
+                    q,
+                    limit as usize,
+                )
+                .await
+                .unwrap_or_default()
+            } else {
+                state.hybrid(Some(&params.project), q, limit).await
+            }
+        }
         _ => db::get_recent_memories(&state.db, &params.project, limit)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
