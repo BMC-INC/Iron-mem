@@ -52,9 +52,25 @@ fn query_years(query: &str) -> Vec<String> {
         .collect()
 }
 
-/// Hybrid search: fuse keyword (FTS), semantic (vector), and temporal
-/// (event_time) signals via RRF. With none of the auxiliary signals present this
-/// returns the exact FTS ordering, reproducing legacy behavior.
+/// Capitalized word tokens (≥3 chars) in a query — candidate proper nouns for
+/// the entity-index lookup. No stoplist is needed: a non-entity capitalized word
+/// ("What") simply resolves to no memories, since the index only matches names
+/// actually stored at write time.
+fn query_entities(query: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 3)
+        .filter(|t| t.chars().next().is_some_and(|c| c.is_uppercase()))
+        .filter(|t| seen.insert(t.to_lowercase()))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Hybrid search: fuse keyword (FTS), semantic (vector), temporal (event_time),
+/// and entity (proper-noun index) signals via RRF. With none of the auxiliary
+/// signals present this returns the exact FTS ordering, reproducing legacy
+/// behavior.
 pub async fn hybrid_search(
     db: &Database,
     embedder: Option<&dyn Embedder>,
@@ -109,15 +125,42 @@ pub async fn hybrid_search(
         }
     };
 
-    // Auxiliary ranked signals beyond keyword FTS: semantic (vector) and temporal
-    // (event_time). Each non-empty list joins the RRF; with none present, return
-    // the exact FTS ordering (legacy behavior preserved).
+    // Entity side: when the query names a proper noun we indexed at write time,
+    // memories tagged with that entity get a rank boost. Additive — unknown names
+    // resolve to nothing.
+    let entity_ids: Vec<i64> = {
+        let ents = query_entities(query);
+        if ents.is_empty() {
+            Vec::new()
+        } else {
+            let mut seen = HashSet::new();
+            let mut ids = Vec::new();
+            for e in &ents {
+                for id in db::memories_for_entity(db, project, e, limit)
+                    .await
+                    .unwrap_or_default()
+                {
+                    if seen.insert(id) {
+                        ids.push(id);
+                    }
+                }
+            }
+            ids
+        }
+    };
+
+    // Auxiliary ranked signals beyond keyword FTS: semantic (vector), temporal
+    // (event_time), and entity (proper-noun index). Each non-empty list joins the
+    // RRF; with none present, return the exact FTS ordering (legacy preserved).
     let mut aux: Vec<Vec<i64>> = Vec::new();
     if !vec_ids.is_empty() {
         aux.push(vec_ids);
     }
     if !time_ids.is_empty() {
         aux.push(time_ids);
+    }
+    if !entity_ids.is_empty() {
+        aux.push(entity_ids);
     }
     if aux.is_empty() {
         return Ok(fts);
@@ -298,6 +341,45 @@ mod tests {
         assert_eq!(query_years("between 2021 and 2099"), vec!["2021", "2099"]);
         assert!(query_years("no years, just 42 and 12345").is_empty());
         assert!(query_years("1899 is out of range").is_empty());
+    }
+
+    #[test]
+    fn query_entities_extracts_capitalized_tokens() {
+        assert_eq!(
+            query_entities("What did Caroline tell Melanie?"),
+            vec!["What", "Caroline", "Melanie"]
+        );
+        // Lowercased duplicates collapse; sub-3-char tokens drop.
+        assert_eq!(query_entities("Al and Bo met Caroline and Caroline"), vec!["Caroline"]);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_entity_signal_surfaces_named_memory() {
+        let (db, path) = seeded_db().await; // ids 1,2,3 under /tmp/p
+        // A memory sharing no keyword with the query and with no embedding, but
+        // indexed under the entity "Caroline".
+        let s = create_session(&db, "/tmp/p").await.unwrap();
+        let named = insert_memory(&db, "/tmp/p", &s, "zzz unrelated text", Some("x"))
+            .await
+            .unwrap();
+        db::insert_memory_entity(&db, named, "Caroline").await.unwrap();
+
+        // No embedder ⇒ vector empty; query keyword misses FTS but names Caroline.
+        let res = hybrid_search(
+            &db,
+            None,
+            &crate::vectorstore::BruteForceStore,
+            Some("/tmp/p"),
+            "what did Caroline say",
+            5,
+        )
+        .await
+        .unwrap();
+        assert!(
+            res.iter().any(|m| m.id == named),
+            "entity signal must surface the named memory FTS+vector miss: {res:?}"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

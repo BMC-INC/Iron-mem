@@ -126,6 +126,15 @@ pub async fn persist(
         }
     }
 
+    // Entity inverted index: link every proper noun named in the session to the
+    // narrative so name-anchored questions resolve by direct lookup even when the
+    // memory ranks low on keyword/vector. Best-effort.
+    for entity in &result.entities {
+        if let Err(e) = db::insert_memory_entity(db, memory_id, entity).await {
+            tracing::warn!("entity index failed (memory {memory_id}): {e}");
+        }
+    }
+
     // Dual-output compression: persist each extracted atomic fact as its own
     // searchable kind=fact memory in the same project/session. This bakes the
     // benchmark's separate "explicit fact" extraction into the write path so
@@ -134,7 +143,15 @@ pub async fn persist(
     // fatal (local-first posture, matching the inline-embed handling above).
     for fact in &result.facts {
         persist_fact(
-            db, embedder, store, project, session_id, memory_id, result.importance, fact,
+            db,
+            embedder,
+            store,
+            project,
+            session_id,
+            memory_id,
+            result.importance,
+            fact,
+            &result.entities,
         )
         .await;
     }
@@ -160,6 +177,7 @@ async fn persist_fact(
     parent_id: i64,
     importance: u8,
     fact: &str,
+    entities: &[String],
 ) {
     let tags = format!("fact session:{session_id}");
     let fid = match db::insert_memory(db, project, session_id, fact, Some(&tags)).await {
@@ -174,6 +192,16 @@ async fn persist_fact(
     }
     if let Err(e) = db::set_memory_scope_kind(db, fid, "project", "fact").await {
         tracing::warn!("fact kind tag failed (fact memory {fid}): {e}");
+    }
+    // Index the fact under any session entity it actually mentions, so the fact
+    // (which usually carries the answer) is directly reachable by that name.
+    let fact_lower = fact.to_lowercase();
+    for entity in entities {
+        if fact_lower.contains(&entity.to_lowercase()) {
+            if let Err(e) = db::insert_memory_entity(db, fid, entity).await {
+                tracing::warn!("fact entity index failed (fact memory {fid}): {e}");
+            }
+        }
     }
     if let Some(emb) = embedder {
         match emb.embed(&[fact.to_string()]).await {

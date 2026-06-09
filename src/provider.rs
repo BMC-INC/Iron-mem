@@ -50,6 +50,10 @@ pub struct CompressionResult {
     /// (`WHEN:`). Stored on the narrative memory's `event_time` to power the
     /// time-aware retrieval boost. `None` when the session is undated.
     pub event_time: Option<String>,
+    /// Proper nouns named in the session (`ENTITIES:`) — people, places,
+    /// organizations, products. Indexed in `memory_entities` so name-anchored
+    /// questions resolve by direct lookup regardless of keyword/vector rank.
+    pub entities: Vec<String>,
 }
 
 /// Default importance when the model omits or mangles the IMPORTANCE line.
@@ -64,6 +68,7 @@ impl Default for CompressionResult {
             kind: "session".to_string(),
             facts: Vec::new(),
             event_time: None,
+            entities: Vec::new(),
         }
     }
 }
@@ -113,6 +118,10 @@ fn build_prompt(observations: &[Observation]) -> String {
         "WHEN: [if the session describes events on a specific date or date range, give it as YYYY-MM-DD (or a short range like 2023-05-07..2023-05-09); otherwise write 'none'.]"
             .to_string(),
     );
+    lines.push(
+        "ENTITIES: [comma-separated proper nouns named in the session — people, places, organizations, products. Omit common words; write 'none' if there are no proper nouns.]"
+            .to_string(),
+    );
 
     lines.join("\n")
 }
@@ -124,6 +133,7 @@ fn parse_response(text: &str) -> CompressionResult {
     let mut kind: Option<String> = None;
     let mut facts: Vec<String> = Vec::new();
     let mut event_time: Option<String> = None;
+    let mut entities: Vec<String> = Vec::new();
     // FACTS is a multi-line block: once the marker is seen, subsequent "- "
     // bullet lines are facts until the next known marker ends the block.
     let mut in_facts = false;
@@ -154,6 +164,14 @@ fn parse_response(text: &str) -> CompressionResult {
                 event_time = Some(w.to_string());
             }
             in_facts = false;
+        } else if let Some(e) = line.strip_prefix("ENTITIES:") {
+            for ent in e.split(',') {
+                let ent = ent.trim();
+                if !ent.is_empty() && !ent.eq_ignore_ascii_case("none") {
+                    entities.push(ent.to_string());
+                }
+            }
+            in_facts = false;
         } else if in_facts {
             push_fact(&mut facts, line);
         }
@@ -171,6 +189,7 @@ fn parse_response(text: &str) -> CompressionResult {
         kind: kind.unwrap_or_else(|| "session".to_string()),
         facts,
         event_time,
+        entities,
     }
 }
 
@@ -503,6 +522,26 @@ mod tests {
     #[test]
     fn prompt_emits_when_section() {
         assert!(build_prompt(&[]).contains("WHEN:"), "prompt must request WHEN");
+    }
+
+    #[test]
+    fn parse_response_extracts_entities_csv() {
+        let r = parse_response("SUMMARY: s\nENTITIES: Caroline, Melanie, New York\nKIND: session");
+        assert_eq!(r.entities, vec!["Caroline", "Melanie", "New York"]);
+    }
+
+    #[test]
+    fn parse_response_entities_none_is_empty() {
+        assert!(parse_response("SUMMARY: s\nENTITIES: none").entities.is_empty());
+        assert!(parse_response("SUMMARY: s").entities.is_empty());
+    }
+
+    #[test]
+    fn prompt_emits_entities_section() {
+        assert!(
+            build_prompt(&[]).contains("ENTITIES:"),
+            "prompt must request ENTITIES"
+        );
     }
 
     #[test]

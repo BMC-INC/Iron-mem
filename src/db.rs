@@ -342,6 +342,23 @@ impl Database {
             }
         }
 
+        // Entity inverted index: one row per (memory, normalized proper-noun
+        // token), so name-anchored questions resolve by direct lookup even when a
+        // memory ranks low on keyword/vector. Additive — empty for legacy data.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS memory_entities (
+                memory_id BIGINT NOT NULL,
+                entity    TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -1198,6 +1215,75 @@ pub async fn memories_by_event_time(
     Ok(rows.into_iter().map(|r| r.get::<i64, _>("id")).collect())
 }
 
+/// Index a memory under an entity (proper noun). The entity is split into word
+/// tokens, lowercased, and stored one row per token (≥3 chars) so a single-token
+/// query resolves any token of a multi-word entity ("York" of "New York").
+/// Duplicate tokens within one call are collapsed.
+pub async fn insert_memory_entity(db: &Database, memory_id: i64, entity: &str) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for tok in entity.split(|c: char| !c.is_alphanumeric()) {
+        let t = tok.to_lowercase();
+        if t.chars().count() < 3 || !seen.insert(t.clone()) {
+            continue;
+        }
+        sqlx::query("INSERT INTO memory_entities(memory_id, entity) VALUES($1, $2)")
+            .bind(memory_id)
+            .bind(&t)
+            .execute(&db.pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Memory ids indexed under `entity` (matched case-insensitively against a single
+/// normalized token), scoped to `project` when given, most-recent first and
+/// capped at `limit`. Powers the entity-aware retrieval signal.
+pub async fn memories_for_entity(
+    db: &Database,
+    project: Option<&str>,
+    entity: &str,
+    limit: usize,
+) -> Result<Vec<i64>> {
+    let needle = entity.trim().to_lowercase();
+    if needle.chars().count() < 3 {
+        return Ok(Vec::new());
+    }
+    let id_col = match db.backend {
+        Backend::Sqlite => "m.rowid",
+        Backend::Postgres => "m.id",
+    };
+    let rows: Vec<sqlx::any::AnyRow> = match project {
+        Some(p) => {
+            sqlx::query(&format!(
+                "SELECT {id_col} AS id, m.created_at AS ca
+                 FROM memories m JOIN memory_entities me ON me.memory_id = {id_col}
+                 WHERE me.entity = $1 AND m.project = $2
+                 GROUP BY {id_col}, m.created_at
+                 ORDER BY ca DESC LIMIT $3"
+            ))
+            .bind(&needle)
+            .bind(p)
+            .bind(limit as i64)
+            .fetch_all(&db.pool)
+            .await?
+        }
+        None => {
+            sqlx::query(&format!(
+                "SELECT {id_col} AS id, m.created_at AS ca
+                 FROM memories m JOIN memory_entities me ON me.memory_id = {id_col}
+                 WHERE me.entity = $1
+                 GROUP BY {id_col}, m.created_at
+                 ORDER BY ca DESC LIMIT $2"
+            ))
+            .bind(&needle)
+            .bind(limit as i64)
+            .fetch_all(&db.pool)
+            .await?
+        }
+    };
+    Ok(rows.into_iter().map(|r| r.get::<i64, _>("id")).collect())
+}
+
 /// Recent memories filtered by scope. `user`-scope memories are global (the
 /// `project` argument is ignored); `project`-scope returns the project's
 /// memories — including legacy rows with no meta or a null scope, which read as
@@ -1334,6 +1420,16 @@ pub async fn get_memories_by_kind(
 
 pub async fn delete_memory_meta(db: &Database, memory_id: i64) -> Result<()> {
     sqlx::query("DELETE FROM memory_meta WHERE memory_id = $1")
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+/// Remove a memory's entity-index rows. Called from `purge_memory` so the
+/// inverted index never retains rows for a deleted memory.
+pub async fn delete_memory_entities(db: &Database, memory_id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM memory_entities WHERE memory_id = $1")
         .bind(memory_id)
         .execute(&db.pool)
         .await?;
@@ -2029,6 +2125,31 @@ mod tests {
         assert!(memories_by_event_time(&db, Some(p), "1999", 10).await?.is_empty());
         // Project scoping: a different project sees nothing.
         assert!(memories_by_event_time(&db, Some("/tmp/other"), "2023", 10)
+            .await?
+            .is_empty());
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_entities_insert_and_lookup() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let p = "/tmp/ent";
+        let s = create_session(&db, p).await?;
+        let caro = insert_memory(&db, p, &s, "Caroline did things in New York", Some("t")).await?;
+        insert_memory_entity(&db, caro, "Caroline").await?;
+        insert_memory_entity(&db, caro, "New York").await?;
+
+        // Case-insensitive single-token lookup returns the id.
+        assert_eq!(memories_for_entity(&db, Some(p), "caroline", 10).await?, vec![caro]);
+        assert_eq!(memories_for_entity(&db, Some(p), "CAROLINE", 10).await?, vec![caro]);
+        // Either token of a multi-word entity resolves.
+        assert_eq!(memories_for_entity(&db, Some(p), "York", 10).await?, vec![caro]);
+        // Unknown entity / too-short token / wrong project ⇒ nothing.
+        assert!(memories_for_entity(&db, Some(p), "Melanie", 10).await?.is_empty());
+        assert!(memories_for_entity(&db, Some(p), "of", 10).await?.is_empty());
+        assert!(memories_for_entity(&db, Some("/tmp/other"), "caroline", 10)
             .await?
             .is_empty());
 
