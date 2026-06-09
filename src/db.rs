@@ -1011,6 +1011,10 @@ pub const MEMORY_KINDS: &[&str] = &[
     "learned_pattern",
     "project_config",
     "profile",
+    // Atomic facts extracted from a session by dual-output compression. Stored
+    // as their own searchable memories so dates/names/quantities survive and
+    // resolve on direct lookup (see compress::persist).
+    "fact",
 ];
 
 /// Clamp an arbitrary kind string to the known set, case-insensitively.

@@ -42,10 +42,26 @@ pub struct CompressionResult {
     /// Typed classification of the session, clamped to [`crate::db::MEMORY_KINDS`].
     /// Defaults to `session`.
     pub kind: String,
+    /// Atomic, self-contained facts extracted alongside the narrative summary.
+    /// Each is stored as its own searchable `kind=fact` memory so specifics
+    /// (dates, names, quantities) survive compression and rank on direct lookup.
+    pub facts: Vec<String>,
 }
 
 /// Default importance when the model omits or mangles the IMPORTANCE line.
 const DEFAULT_IMPORTANCE: u8 = 5;
+
+impl Default for CompressionResult {
+    fn default() -> Self {
+        Self {
+            summary: String::new(),
+            tags: String::new(),
+            importance: DEFAULT_IMPORTANCE,
+            kind: "session".to_string(),
+            facts: Vec::new(),
+        }
+    }
+}
 
 // ── Shared prompt builder ───────────────────────────────────────────
 
@@ -75,6 +91,7 @@ fn build_prompt(observations: &[Observation]) -> String {
     lines.push(String::new());
     lines.push("Respond with EXACTLY this format, nothing else:".to_string());
     lines.push("SUMMARY: [3-6 sentences. PRESERVE every specific: exact dates and times, proper nouns (people, places, organizations, events), quantities, file names, and key quoted statements. Keep causal relationships (X because Y). When the work involves code, still capture what was built/changed/decided, errors resolved, and patterns established. Do not generalize specifics away — write \"attended an LGBTQ support group on 7 May 2023\", never \"attended social events\".]".to_string());
+    lines.push("FACTS: [then one atomic fact per line, each starting with \"- \". Each fact must be self-contained and carry its own entity plus any date/quantity, e.g. \"- Caroline joined the LGBTQ support group on 7 May 2023\". Extract every concrete fact stated in the session; omit chit-chat. If there are no concrete facts, write \"- none\".]".to_string());
     lines.push(
         "TAGS: [8-12 space-separated lowercase keywords: technologies, file names, concepts]"
             .to_string(),
@@ -96,17 +113,31 @@ fn parse_response(text: &str) -> CompressionResult {
     let mut tags = String::new();
     let mut importance: Option<u8> = None;
     let mut kind: Option<String> = None;
+    let mut facts: Vec<String> = Vec::new();
+    // FACTS is a multi-line block: once the marker is seen, subsequent "- "
+    // bullet lines are facts until the next known marker ends the block.
+    let mut in_facts = false;
 
     for line in text.lines() {
         if let Some(s) = line.strip_prefix("SUMMARY:") {
             summary = s.trim().to_string();
+            in_facts = false;
+        } else if let Some(rest) = line.strip_prefix("FACTS:") {
+            in_facts = true;
+            // Tolerate a first fact placed on the marker line itself.
+            push_fact(&mut facts, rest);
         } else if let Some(t) = line.strip_prefix("TAGS:") {
             tags = t.trim().to_string();
+            in_facts = false;
         } else if let Some(i) = line.strip_prefix("IMPORTANCE:") {
             importance = parse_importance(i);
+            in_facts = false;
         } else if let Some(k) = line.strip_prefix("KIND:") {
             // Clamp to the known set; unrecognized values collapse to `session`.
             kind = Some(crate::db::clamp_kind(k).to_string());
+            in_facts = false;
+        } else if in_facts {
+            push_fact(&mut facts, line);
         }
     }
 
@@ -120,6 +151,23 @@ fn parse_response(text: &str) -> CompressionResult {
         tags,
         importance: importance.unwrap_or(DEFAULT_IMPORTANCE),
         kind: kind.unwrap_or_else(|| "session".to_string()),
+        facts,
+    }
+}
+
+/// Append a FACTS-block line as a fact when it is a non-empty "- …" bullet.
+/// Skips blanks, lines without bullet syntax, and the "- none" sentinel the
+/// prompt asks for when a session has no concrete facts.
+fn push_fact(facts: &mut Vec<String>, line: &str) {
+    let trimmed = line.trim();
+    let bullet = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix('-'));
+    if let Some(f) = bullet {
+        let f = f.trim();
+        if !f.is_empty() && !f.eq_ignore_ascii_case("none") {
+            facts.push(f.to_string());
+        }
     }
 }
 
@@ -397,6 +445,29 @@ async fn google_text(prompt: &str, model: &str, api_key: &str) -> Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_response_extracts_facts_block() {
+        let r = parse_response("SUMMARY: s\nFACTS:\n- Caroline joined the LGBTQ group on 7 May 2023\n- Melanie painted a sunrise in 2022\nTAGS: a b\nIMPORTANCE: 6");
+        assert_eq!(r.facts.len(), 2);
+        assert!(r.facts[0].contains("7 May 2023"));
+        // Other fields still parse around the block.
+        assert_eq!(r.summary, "s");
+        assert_eq!(r.tags, "a b");
+        assert_eq!(r.importance, 6);
+    }
+
+    #[test]
+    fn parse_response_without_facts_yields_empty_vec() {
+        let r = parse_response("SUMMARY: s\nTAGS: a b\nIMPORTANCE: 5");
+        assert!(r.facts.is_empty());
+    }
+
+    #[test]
+    fn prompt_emits_facts_section() {
+        let p = build_prompt(&[]);
+        assert!(p.contains("FACTS:"), "prompt must request a FACTS block");
+    }
 
     #[test]
     fn prompt_preserves_specifics_and_is_domain_agnostic() {

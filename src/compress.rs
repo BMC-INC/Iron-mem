@@ -119,8 +119,67 @@ pub async fn persist(
         }
     }
 
-    tracing::info!("Session {session_id} compressed → memory_id={memory_id}");
+    // Dual-output compression: persist each extracted atomic fact as its own
+    // searchable kind=fact memory in the same project/session. This bakes the
+    // benchmark's separate "explicit fact" extraction into the write path so
+    // specifics (dates, names, quantities) survive compression and resolve on
+    // direct lookup. Best-effort per fact — a single failure is logged, never
+    // fatal (local-first posture, matching the inline-embed handling above).
+    for fact in &result.facts {
+        persist_fact(
+            db, embedder, store, project, session_id, memory_id, result.importance, fact,
+        )
+        .await;
+    }
+
+    tracing::info!(
+        "Session {session_id} compressed → memory_id={memory_id} (+{} facts)",
+        result.facts.len()
+    );
     Ok(memory_id)
+}
+
+/// Persist one extracted fact as a `kind=fact`, project-scoped memory tied to the
+/// originating session, inheriting the parent's importance and (best-effort)
+/// carrying its own embedding. Errors are logged against `parent_id` and
+/// swallowed so one bad fact never fails an otherwise-successful compression.
+#[allow(clippy::too_many_arguments)] // each arg is an independent field of the fact memory
+async fn persist_fact(
+    db: &Database,
+    embedder: Option<&dyn Embedder>,
+    store: &dyn VectorStore,
+    project: &str,
+    session_id: &str,
+    parent_id: i64,
+    importance: u8,
+    fact: &str,
+) {
+    let tags = format!("fact session:{session_id}");
+    let fid = match db::insert_memory(db, project, session_id, fact, Some(&tags)).await {
+        Ok(fid) => fid,
+        Err(e) => {
+            tracing::warn!("fact store failed (parent memory {parent_id}): {e}");
+            return;
+        }
+    };
+    if let Err(e) = db::upsert_memory_meta(db, fid, importance as f64 / 10.0).await {
+        tracing::warn!("fact meta failed (fact memory {fid}): {e}");
+    }
+    if let Err(e) = db::set_memory_scope_kind(db, fid, "project", "fact").await {
+        tracing::warn!("fact kind tag failed (fact memory {fid}): {e}");
+    }
+    if let Some(emb) = embedder {
+        match emb.embed(&[fact.to_string()]).await {
+            Ok(mut vecs) => {
+                if let Some(vec) = vecs.drain(..).next() {
+                    if let Err(e) = store.upsert(db, fid, emb.id(), emb.dim(), &vec).await {
+                        tracing::warn!("fact embed upsert failed (fact memory {fid}): {e}");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("fact embed failed (fact memory {fid}): {e}"),
+        }
+    }
 }
 
 /// Store an explicit, user-curated memory (the Supermemory "add memory" pattern):
@@ -208,6 +267,7 @@ mod tests {
             tags: "rust retrieval rrf".into(),
             importance: 8,
             kind: "architecture".into(),
+            ..Default::default()
         };
 
         let id = persist(&db, Some(&emb), &store, "/tmp/p", &session, result)
@@ -231,6 +291,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persist_stores_facts_as_searchable_memories() {
+        let path = std::env::temp_dir().join(format!("ironmem-facts-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::new(&path.to_string_lossy()).await.unwrap();
+        db.migrate().await.unwrap();
+        db.ensure_ann(8).await.unwrap();
+        let session = create_session(&db, "/tmp/p").await.unwrap();
+
+        let emb = FakeEmbedder::new(8);
+        let store = SqliteVecStore;
+        let result = CompressionResult {
+            summary: "Caroline attended community events".into(),
+            tags: "caroline community".into(),
+            importance: 6,
+            kind: "session".into(),
+            facts: vec![
+                "Caroline joined the LGBTQ support group on 7 May 2023".into(),
+                "Melanie painted a sunrise in 2022".into(),
+            ],
+            ..Default::default()
+        };
+
+        let id = persist(&db, Some(&emb), &store, "/tmp/p", &session, result)
+            .await
+            .unwrap();
+
+        // Narrative memory exists.
+        assert!(db::get_memory_by_id(&db, id).await.unwrap().is_some());
+
+        // The date-bearing fact is retrievable by its date and tagged kind=fact,
+        // as a memory distinct from the narrative.
+        let hits = db::search_memories(&db, "/tmp/p", "7 May 2023", 10)
+            .await
+            .unwrap();
+        let fact_hit = hits
+            .iter()
+            .find(|m| m.summary.contains("7 May 2023"))
+            .expect("date fact must be retrievable by its date");
+        assert_ne!(fact_hit.id, id, "fact is a memory distinct from the narrative");
+        let meta = db::get_memory_meta_full(&db, fact_hit.id).await.unwrap();
+        assert_eq!(meta.kind, "fact", "fact memory must be tagged kind=fact");
+
+        // The fact also carries an embedding (semantic recall path).
+        assert!(db::get_embedding(&db, "memory", fact_hit.id, emb.id())
+            .await
+            .unwrap()
+            .is_some());
+
+        // The second fact is its own memory too.
+        let melanie = db::search_memories(&db, "/tmp/p", "Melanie sunrise", 10)
+            .await
+            .unwrap();
+        assert!(melanie.iter().any(|m| m.summary.contains("Melanie")));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn persist_without_embedder_still_writes_meta() {
         let path = std::env::temp_dir().join(format!("ironmem-cmp2-{}.db", uuid::Uuid::new_v4()));
         let db = Database::new(&path.to_string_lossy()).await.unwrap();
@@ -242,6 +359,7 @@ mod tests {
             tags: "fts only".into(),
             importance: 3,
             kind: "session".into(),
+            ..Default::default()
         };
 
         let id = persist(&db, None, &store, "/tmp/p", &session, result)
@@ -330,6 +448,7 @@ mod tests {
             tags: "t".into(),
             importance: 5,
             kind: "session".into(),
+            ..Default::default()
         };
         let memory_id = persist(&db, None, &store, "/tmp/p", &session, result)
             .await
