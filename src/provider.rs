@@ -51,9 +51,9 @@ const DEFAULT_IMPORTANCE: u8 = 5;
 
 fn build_prompt(observations: &[Observation]) -> String {
     let mut lines = vec![
-        "You are a technical memory system. Analyze these tool calls from a coding session and produce a concise memory entry.".to_string(),
+        "You are a memory system. Analyze this session and produce a faithful, compact memory entry. The session may be software development, a conversation, research, planning, or any other activity — adapt to its content and never assume it is code.".to_string(),
         String::new(),
-        "TOOL CALLS:".to_string(),
+        "SESSION ACTIVITY:".to_string(),
     ];
 
     for (i, obs) in observations.iter().enumerate() {
@@ -74,7 +74,7 @@ fn build_prompt(observations: &[Observation]) -> String {
 
     lines.push(String::new());
     lines.push("Respond with EXACTLY this format, nothing else:".to_string());
-    lines.push("SUMMARY: [3-5 sentences describing what was built, changed, or decided. Include specific file names, key decisions, errors resolved, and patterns established.]".to_string());
+    lines.push("SUMMARY: [3-6 sentences. PRESERVE every specific: exact dates and times, proper nouns (people, places, organizations, events), quantities, file names, and key quoted statements. Keep causal relationships (X because Y). When the work involves code, still capture what was built/changed/decided, errors resolved, and patterns established. Do not generalize specifics away — write \"attended an LGBTQ support group on 7 May 2023\", never \"attended social events\".]".to_string());
     lines.push(
         "TAGS: [8-12 space-separated lowercase keywords: technologies, file names, concepts]"
             .to_string(),
@@ -397,6 +397,20 @@ async fn google_text(prompt: &str, model: &str, api_key: &str) -> Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_preserves_specifics_and_is_domain_agnostic() {
+        let p = build_prompt(&[]);
+        assert!(p.contains("dates"), "must ask to keep dates");
+        assert!(
+            p.contains("proper nouns") || p.contains("names"),
+            "must ask to keep proper nouns/names"
+        );
+        assert!(
+            !p.contains("coding session"),
+            "must not assume the session is coding"
+        );
+    }
 
     #[test]
     fn parses_importance_line() {
