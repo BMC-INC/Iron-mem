@@ -169,6 +169,24 @@ pub async fn persist(
         }
     }
 
+    // Procedural memory: durable "how work should be done" rules are stored as
+    // first-class typed memories so agents can retrieve operating instructions
+    // without mixing them into ordinary narrative/fact recall.
+    for procedure in &result.procedures {
+        persist_procedure(
+            db,
+            embedder,
+            store,
+            project,
+            session_id,
+            memory_id,
+            result.importance,
+            procedure,
+            &result.entities,
+        )
+        .await;
+    }
+
     // Dual-output compression: persist each extracted atomic fact as its own
     // searchable kind=fact memory in the same project/session. This bakes the
     // benchmark's separate "explicit fact" extraction into the write path so
@@ -192,10 +210,59 @@ pub async fn persist(
     }
 
     tracing::info!(
-        "Session {session_id} compressed → memory_id={memory_id} (+{} facts)",
-        result.facts.len()
+        "Session {session_id} compressed → memory_id={memory_id} (+{} facts, +{} procedures)",
+        result.facts.len(),
+        result.procedures.len()
     );
     Ok(memory_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_procedure(
+    db: &Database,
+    embedder: Option<&dyn Embedder>,
+    store: &dyn VectorStore,
+    project: &str,
+    session_id: &str,
+    parent_id: i64,
+    importance: u8,
+    procedure: &str,
+    entities: &[String],
+) {
+    let tags = format!("procedural session:{session_id}");
+    let pid = match db::insert_memory(db, project, session_id, procedure, Some(&tags)).await {
+        Ok(pid) => pid,
+        Err(e) => {
+            tracing::warn!("procedural store failed (parent memory {parent_id}): {e}");
+            return;
+        }
+    };
+    if let Err(e) = db::upsert_memory_meta(db, pid, (importance as f64 / 10.0).max(0.75)).await {
+        tracing::warn!("procedural meta failed (memory {pid}): {e}");
+    }
+    if let Err(e) = db::set_memory_scope_kind(db, pid, "project", "procedural").await {
+        tracing::warn!("procedural kind tag failed (memory {pid}): {e}");
+    }
+    let proc_lower = procedure.to_lowercase();
+    for entity in entities {
+        if proc_lower.contains(&entity.to_lowercase()) {
+            if let Err(e) = db::insert_memory_entity(db, pid, entity).await {
+                tracing::warn!("procedural entity index failed (memory {pid}): {e}");
+            }
+        }
+    }
+    if let Some(emb) = embedder {
+        match emb.embed(&[procedure.to_string()]).await {
+            Ok(mut vecs) => {
+                if let Some(vec) = vecs.drain(..).next() {
+                    if let Err(e) = store.upsert(db, pid, emb.id(), emb.dim(), &vec).await {
+                        tracing::warn!("procedural embed upsert failed (memory {pid}): {e}");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("procedural embed failed (memory {pid}): {e}"),
+        }
+    }
 }
 
 /// Persist one extracted fact as a `kind=fact`, project-scoped memory tied to the
@@ -475,6 +542,43 @@ mod tests {
         );
         let meta = db::get_memory_meta_full(&db, fact.id).await.unwrap();
         assert_eq!(meta.event_time.as_deref(), Some("2023-05-08"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn persist_stores_procedures_as_typed_memories() {
+        let path = std::env::temp_dir().join(format!("ironmem-proc-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::new(&path.to_string_lossy()).await.unwrap();
+        db.migrate().await.unwrap();
+        let session = create_session(&db, "/tmp/p").await.unwrap();
+        let store = crate::vectorstore::BruteForceStore;
+        let result = CompressionResult {
+            summary: "Operator OS memory planning".into(),
+            tags: "operator-os memory".into(),
+            importance: 7,
+            kind: "session".into(),
+            entities: vec!["Operator OS".into()],
+            procedures: vec![
+                "For Operator OS, keep tenant isolation explicit before shared memory.".into(),
+            ],
+            ..Default::default()
+        };
+
+        let parent = persist(&db, None, &store, "/tmp/p", &session, result)
+            .await
+            .unwrap();
+        let hits = db::search_memories(&db, "/tmp/p", "tenant isolation", 10)
+            .await
+            .unwrap();
+        let proc_mem = hits
+            .iter()
+            .find(|m| m.summary.contains("tenant isolation"))
+            .expect("procedural memory should be searchable");
+        assert_ne!(proc_mem.id, parent);
+        let meta = db::get_memory_meta_full(&db, proc_mem.id).await.unwrap();
+        assert_eq!(meta.kind, "procedural");
+        assert!(meta.importance >= 0.75);
+
         let _ = std::fs::remove_file(path);
     }
 

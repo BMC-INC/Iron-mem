@@ -278,9 +278,21 @@ impl IronMemServer {
                         "entity": { "type": "string", "description": "Entity to query (person, project, organization, concept)" },
                         "project": { "type": "string", "description": "Optional project root path; omit for all projects" },
                         "include_superseded": { "type": "boolean", "description": "Include duplicate/superseded historical edges (default false)" },
+                        "at_time": { "type": "string", "description": "Optional YYYY-MM-DD valid-time filter" },
                         "limit": { "type": "integer", "description": "Max graph edges (default 20)" }
                     },
                     "required": ["entity"]
+                })),
+            ),
+            Tool::new(
+                "reconcile_memory_graph",
+                "Scan temporal graph edges and mark duplicates/current-state supersessions. Use dry_run=true to preview.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project": { "type": "string", "description": "Optional project root path; omit for all projects" },
+                        "dry_run": { "type": "boolean", "description": "Report what would change without writing (default false)" }
+                    }
                 })),
             ),
             Tool::new(
@@ -750,13 +762,23 @@ impl IronMemServer {
             .get("include_superseded")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let at_time = args.get("at_time").and_then(|v| v.as_str());
+        if let Some(at) = at_time {
+            if !crate::provider::is_valid_memory_date(at) {
+                return Err(ErrorData::invalid_params(
+                    "at_time must be a valid YYYY-MM-DD date",
+                    None,
+                ));
+            }
+        }
         let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
 
-        let edges = db::memory_edges_for_entity(
+        let edges = db::memory_edges_for_entity_at(
             &self.db,
             project,
             entity,
             include_superseded,
+            at_time,
             limit.max(1) as usize,
         )
         .await
@@ -767,8 +789,27 @@ impl IronMemServer {
             "entity": entity,
             "project": project,
             "include_superseded": include_superseded,
+            "at_time": at_time,
             "edges": edges,
         });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json).unwrap(),
+        )]))
+    }
+
+    async fn handle_reconcile_memory_graph(
+        &self,
+        args: &JsonObject,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project = args.get("project").and_then(|v| v.as_str());
+        let dry_run = args
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let report = db::reconcile_memory_graph(&self.db, project, dry_run)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::json!({ "ok": true, "report": report });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -893,6 +934,7 @@ impl ServerHandler for IronMemServer {
             "refresh_profile" => self.handle_refresh_profile().await,
             "list_corrections" => self.handle_list_corrections(&args).await,
             "memory_graph" => self.handle_memory_graph(&args).await,
+            "reconcile_memory_graph" => self.handle_reconcile_memory_graph(&args).await,
             "wipe_project" => self.handle_wipe_project(&args).await,
             _ => Err(ErrorData::invalid_params(
                 format!("unknown tool: {}", request.name),

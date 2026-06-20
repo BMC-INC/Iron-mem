@@ -50,11 +50,11 @@
 > Lossless, reversible memory — plus a real memory model: scoping, typed memories, an always-on user profile, and a correction miner.
 
 - **CCR — losslessly reversible memory** (Headroom pattern) — every truncated tool output and the verbatim pre-LLM session transcript is preserved in a content-addressed, deduplicated, byte-exact compressed blob store inside the DB. The new **`retrieve_original`** tool pulls the exact original back behind any compressed memory. No more lossy truncation.
-- **Memory scoping & typed memories** (Supermemory patterns) — memories carry a **scope** (`project` vs. `user`/cross-project) and a **kind** (`session`, `error_solution`, `preference`, `architecture`, `learned_pattern`, `project_config`, `profile`). Session-start injection ranks **project ∪ user** memories and boosts durable kinds.
+- **Memory scoping & typed memories** (Supermemory patterns) — memories carry a **scope** (`project` vs. `user`/cross-project) and a **kind** (`session`, `error_solution`, `preference`, `procedural`, `architecture`, `learned_pattern`, `project_config`, `profile`). Session-start injection ranks **project ∪ user** memories and boosts durable kinds.
 - **`remember` tool** — store an explicit, typed memory in one call (`scope`, `kind`, `text`, `tags`). User-scope facts follow you into every project.
 - **User profile** — your cross-project memories are distilled into a single always-injected profile (LLM summary, or a deterministic local rollup when offline). Read/regenerate with **`get_profile`** / **`refresh_profile`**.
 - **Correction miner** — error→fix loops in a session (a failing command, edits, then the same command passing) are mined into `error_solution` memories and surfaced via **`list_corrections`**, so past fixes resurface when the work recurs.
-- **18 MCP tools** now — adds `retrieve_original`, `remember`, `get_profile`, `refresh_profile`, `list_corrections`.
+- **20 MCP tools** now — adds `retrieve_original`, `remember`, `get_profile`, `refresh_profile`, `list_corrections`, `memory_graph`, and `reconcile_memory_graph`.
 - **Still zero telemetry. Still local-first. Your data stays yours.**
 
 <details>
@@ -267,7 +267,10 @@ ironmem inject              # Manually rebuild IRONMEM.md (relevance-ranked)
 ironmem remember "..."      # Store an explicit memory (--scope user, --kind preference, --tags)
 ironmem profile             # Show the user profile (--refresh to regenerate it)
 ironmem corrections         # List mined error→fix memories (--all for every project)
-ironmem graph "Operator OS" # Query temporal graph edges (--history includes superseded edges)
+ironmem graph "Operator OS" # Query temporal graph edges (--history includes superseded edges, --at filters valid time)
+ironmem reconcile --dry-run # Preview duplicate/current-state graph reconciliation
+ironmem graph-backfill --limit 50 # Extract graph relations from older memories
+ironmem eval                # Run deterministic memory-quality evals into docs/evals
 ironmem compress <id>       # Manually compress a session
 ironmem embed               # Backfill semantic embeddings for existing memories
 ironmem gc                  # Reclaim unreferenced CCR blobs (after wipes)
@@ -747,13 +750,16 @@ This starts IronMem with Streamable HTTP on `http://localhost:37779/mcp` and Pos
 
 ### Shipped in v0.4.0
 
-- [x] **Semantic foundation** — hybrid FTS + vector (RRF) retrieval, local-first embeddings, and relevance-ranked session-start injection
+- [x] **Semantic foundation** — hybrid FTS + vector + temporal graph (RRF) retrieval, local-first embeddings, and relevance-ranked session-start injection
 - [x] **Reliability & security hardening** — stdio MCP stream is no longer corrupted by log output, UTF-8-safe truncation prevents a crash on multibyte tool output, and 7 dependency advisories were patched
 - [x] **CCR — losslessly reversible memory** (Headroom pattern): a content-addressed, deduplicated blob store + byte-exact per-content-type compression (zstd + per-type dictionaries) + a `retrieve_original` tool, so the verbatim original behind any compressed memory is always recoverable — no more lossy truncation. Refcount GC (`ironmem gc`) + storage stats in `get_status`. [Design »](docs/superpowers/plans/2026-06-07-ironmem-ccr-supermemory.md)
-- [x] **Memory scoping & types** (Supermemory patterns): project vs. user (cross-project) scope, typed memories (`error_solution` / `preference` / `architecture` / `learned_pattern` / …), scope-aware injection with per-kind boosts, and a `remember` tool
+- [x] **Memory scoping & types** (Supermemory patterns): project vs. user (cross-project) scope, typed memories (`error_solution` / `preference` / `procedural` / `architecture` / `learned_pattern` / …), scope-aware injection with per-kind boosts, and a `remember` tool
 - [x] **Always-injected user profile** — cross-project facts distilled into one profile memory (LLM summary or deterministic local rollup); `get_profile` / `refresh_profile`
 - [x] **Correction miner** — error→fix loops become `error_solution` memories, surfaced via `list_corrections`
-- [x] **Temporal graph lite** — compression now extracts structured `source | relation | target` edges with dates, confidence, memory provenance, and reconciliation. Exact duplicates and superseded current-state edges are marked in history rather than deleted. Query with `ironmem graph`, REST `/graph`, or MCP `memory_graph`.
+- [x] **Temporal graph lite** — compression now extracts structured `source | relation | target` edges with dates, confidence, memory provenance, and reconciliation. Exact duplicates and superseded current-state edges are marked in history rather than deleted. Query with `ironmem graph`, REST `/graph`, or MCP `memory_graph`; active edges also feed hybrid search as a relation-ranked retrieval signal.
+- [x] **Graph operations** — `ironmem reconcile` / MCP `reconcile_memory_graph` repair legacy duplicate/current-state edges with dry-run counts, and `ironmem graph-backfill` extracts graph relations for older memories without mutating summaries.
+- [x] **Temporal and procedural recall** — graph queries support valid-time filters (`--at`, `at_time`, REST `at`), compression validates dates, and reusable workflow rules are extracted/stored as `kind=procedural` memories.
+- [x] **Operator OS adapter + eval harness** — `docs/operator-os-memory-adapter.md` defines tenant/worker/work-item memory mapping, and `ironmem eval` writes repeatable graph/temporal/procedural eval reports with command, model, and commit metadata.
 
 ### Next
 

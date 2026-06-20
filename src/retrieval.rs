@@ -1,7 +1,7 @@
-//! Hybrid retrieval: Reciprocal Rank Fusion over FTS + vector results, plus
-//! the blended relevance/recency/importance ranking used for session-start
-//! injection. Pure scoring helpers are unit-tested; the search/rank entry
-//! points compose them with the db + vector store.
+//! Hybrid retrieval: Reciprocal Rank Fusion over FTS + vector + temporal graph
+//! results, plus the blended relevance/recency/importance ranking used for
+//! session-start injection. Pure scoring helpers are unit-tested; the search/rank
+//! entry points compose them with the db + vector store.
 
 use anyhow::Result;
 use chrono::Utc;
@@ -22,6 +22,12 @@ pub const RRF_K: i64 = 60;
 /// and measurably hurt LoCoMo precision. FTS + vector already match the named
 /// person; the index is retained for future relevance-ranked entity retrieval.
 const FUSE_ENTITY_SIGNAL: bool = false;
+
+/// Graph fusion is intentionally narrower than the old entity signal: only a
+/// handful of explicit entity phrases from the query are expanded, and edges are
+/// ranked by relation/source/target relevance before their memory ids enter RRF.
+const MAX_GRAPH_ENTITIES: usize = 8;
+const GRAPH_EDGES_PER_ENTITY: usize = 12;
 
 /// Fuse several ranked id-lists into one ordering by Σ 1/(k + rank).
 /// `rank` is 0-indexed (top of a list contributes the most). Ties keep
@@ -74,10 +80,154 @@ fn query_entities(query: &str) -> Vec<String> {
         .collect()
 }
 
+fn is_question_word(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "what"
+            | "when"
+            | "where"
+            | "which"
+            | "who"
+            | "whom"
+            | "whose"
+            | "why"
+            | "how"
+            | "did"
+            | "does"
+            | "do"
+            | "is"
+            | "are"
+            | "was"
+            | "were"
+            | "show"
+            | "tell"
+            | "list"
+            | "give"
+    )
+}
+
+fn is_graph_entity_token(token: &str) -> bool {
+    let len = token.chars().count();
+    if len < 2 || is_question_word(token) {
+        return false;
+    }
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_uppercase() && (len >= 3 || token.chars().all(|c| c.is_uppercase()))
+}
+
+/// Capitalized entity phrases for graph lookup. This keeps multi-word names like
+/// "Operator OS" intact while also trying useful single-token names like
+/// "Caroline". Common question words are dropped so the graph signal stays
+/// narrow and does not become the disabled broad entity signal in disguise.
+fn query_graph_entities(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut phrase: Vec<String> = Vec::new();
+
+    let flush_phrase =
+        |phrase: &mut Vec<String>, out: &mut Vec<String>, seen: &mut HashSet<String>| {
+            if phrase.len() > 1 {
+                let joined = phrase.join(" ");
+                if seen.insert(joined.to_lowercase()) {
+                    out.push(joined);
+                }
+            }
+            for token in phrase.drain(..) {
+                if seen.insert(token.to_lowercase()) {
+                    out.push(token);
+                }
+            }
+        };
+
+    for token in query.split(|c: char| !c.is_alphanumeric()) {
+        if is_graph_entity_token(token) {
+            phrase.push(token.to_string());
+        } else {
+            flush_phrase(&mut phrase, &mut out, &mut seen);
+        }
+    }
+    flush_phrase(&mut phrase, &mut out, &mut seen);
+    out.truncate(MAX_GRAPH_ENTITIES);
+    out
+}
+
+fn graph_terms(text: &str) -> HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 3)
+        .map(|t| t.to_lowercase())
+        .collect()
+}
+
+fn graph_overlap_score(terms: &HashSet<String>, text: &str, weight: f64) -> f64 {
+    graph_terms(text)
+        .iter()
+        .filter(|term| terms.contains(*term))
+        .count() as f64
+        * weight
+}
+
+fn graph_edge_score(edge: &db::MemoryEdge, query_terms: &HashSet<String>) -> f64 {
+    graph_overlap_score(query_terms, &edge.relation, 3.0)
+        + graph_overlap_score(query_terms, &edge.source, 1.0)
+        + graph_overlap_score(query_terms, &edge.target, 1.0)
+        + edge.confidence.clamp(0.0, 1.0)
+}
+
+async fn graph_ids_for_query(
+    db: &Database,
+    project: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<i64>> {
+    let entities = query_graph_entities(query);
+    if entities.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let query_terms = graph_terms(query);
+    let mut best: HashMap<i64, (f64, i64, usize)> = HashMap::new();
+    let mut first_seen = 0_usize;
+
+    for entity in &entities {
+        let edges = db::memory_edges_for_entity(db, project, entity, false, GRAPH_EDGES_PER_ENTITY)
+            .await
+            .unwrap_or_default();
+        for edge in edges {
+            let score = graph_edge_score(&edge, &query_terms);
+            let current =
+                best.entry(edge.memory_id)
+                    .or_insert((score, edge.observed_at, first_seen));
+            if score > current.0 || (score == current.0 && edge.observed_at > current.1) {
+                *current = (score, edge.observed_at, first_seen);
+            }
+            first_seen += 1;
+        }
+    }
+
+    let mut scored: Vec<(i64, f64, i64, usize)> = best
+        .into_iter()
+        .map(|(id, (score, observed_at, order))| (id, score, observed_at, order))
+        .collect();
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.3.cmp(&b.3))
+    });
+    Ok(scored
+        .into_iter()
+        .take(limit)
+        .map(|(id, _, _, _)| id)
+        .collect())
+}
+
 /// Hybrid search: fuse keyword (FTS), semantic (vector), temporal (event_time),
-/// and entity (proper-noun index) signals via RRF. With none of the auxiliary
-/// signals present this returns the exact FTS ordering, reproducing legacy
-/// behavior.
+/// temporal graph, and entity (proper-noun index) signals via RRF. With none of
+/// the auxiliary signals present this returns the exact FTS ordering,
+/// reproducing legacy behavior.
 pub async fn hybrid_search(
     db: &Database,
     embedder: Option<&dyn Embedder>,
@@ -158,8 +308,14 @@ pub async fn hybrid_search(
         Vec::new()
     };
 
+    // Graph side: active temporal graph edges contribute their provenance memory
+    // ids when the query names an entity present as an edge source or target.
+    // Unlike the disabled entity signal, graph ids are relation-ranked before
+    // fusion so specific relationship questions beat generic recency.
+    let graph_ids = graph_ids_for_query(db, project, query, pool).await?;
+
     // Candidate ordering: RRF over keyword + any auxiliary signals (semantic,
-    // temporal, entity). With no auxiliary signal this is the FTS order.
+    // temporal, graph, entity). With no auxiliary signal this is the FTS order.
     let fts_ids: Vec<i64> = fts.iter().map(|m| m.id).collect();
     let by_id: HashMap<i64, Memory> = fts.into_iter().map(|m| (m.id, m)).collect();
 
@@ -169,6 +325,9 @@ pub async fn hybrid_search(
     }
     if !time_ids.is_empty() {
         aux.push(time_ids);
+    }
+    if !graph_ids.is_empty() {
+        aux.push(graph_ids);
     }
     if !entity_ids.is_empty() {
         aux.push(entity_ids);
@@ -201,7 +360,11 @@ pub async fn hybrid_search(
 /// cross-turn (multi-hop) links out of the top-`limit`. Guarantee up to ~40% of
 /// the slots to narratives (in rank order) before filling the rest by rank, so
 /// facts AUGMENT rather than REPLACE narratives. Final order follows rank.
-async fn reserve_narrative_slots(db: &Database, candidates: &[i64], limit: usize) -> Result<Vec<i64>> {
+async fn reserve_narrative_slots(
+    db: &Database,
+    candidates: &[i64],
+    limit: usize,
+) -> Result<Vec<i64>> {
     if candidates.len() <= limit {
         return Ok(candidates.to_vec());
     }
@@ -233,7 +396,11 @@ async fn reserve_narrative_slots(db: &Database, candidates: &[i64], limit: usize
         }
     }
     // Restore rank order for a coherent final ordering.
-    let rank: HashMap<i64, usize> = candidates.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    let rank: HashMap<i64, usize> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, i))
+        .collect();
     chosen.sort_by_key(|id| rank[id]);
     Ok(chosen)
 }
@@ -303,7 +470,10 @@ fn fuse_rerank(base: &[Memory], order: &[usize], limit: usize) -> Vec<Memory> {
         return Vec::new();
     }
     let base_ids: Vec<i64> = base.iter().map(|m| m.id).collect();
-    let llm_ids: Vec<i64> = order.iter().filter_map(|&i| base.get(i).map(|m| m.id)).collect();
+    let llm_ids: Vec<i64> = order
+        .iter()
+        .filter_map(|&i| base.get(i).map(|m| m.id))
+        .collect();
     let fused = if llm_ids.is_empty() {
         base_ids
     } else {
@@ -426,7 +596,8 @@ pub async fn injection_rank(
     // user-scope preference surfaces even in a brand-new project. The two scopes
     // are disjoint by construction; dedup defensively all the same.
     let window = ((limit as i64) * 10).max(50);
-    let mut candidates = db::get_recent_memories_scoped(db, "project", Some(project), window).await?;
+    let mut candidates =
+        db::get_recent_memories_scoped(db, "project", Some(project), window).await?;
     let mut seen: HashSet<i64> = candidates.iter().map(|m| m.id).collect();
     for m in db::get_recent_memories_scoped(db, "user", None, window).await? {
         if seen.insert(m.id) {
@@ -518,7 +689,7 @@ async fn embed_one(embedder: &dyn Embedder, text: &str) -> Option<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{create_session, insert_memory};
+    use crate::db::{create_session, insert_memory, NewMemoryEdge};
     use crate::embedder::FakeEmbedder;
     use crate::embedding_codec::normalize;
     use crate::vectorstore::SqliteVecStore;
@@ -540,7 +711,10 @@ mod tests {
 
     #[test]
     fn query_years_extracts_valid_years_only() {
-        assert_eq!(query_years("what did Caroline do in May 2023?"), vec!["2023"]);
+        assert_eq!(
+            query_years("what did Caroline do in May 2023?"),
+            vec!["2023"]
+        );
         assert_eq!(query_years("between 2021 and 2099"), vec!["2021", "2099"]);
         assert!(query_years("no years, just 42 and 12345").is_empty());
         assert!(query_years("1899 is out of range").is_empty());
@@ -553,7 +727,27 @@ mod tests {
             vec!["What", "Caroline", "Melanie"]
         );
         // Lowercased duplicates collapse; sub-3-char tokens drop.
-        assert_eq!(query_entities("Al and Bo met Caroline and Caroline"), vec!["Caroline"]);
+        assert_eq!(
+            query_entities("Al and Bo met Caroline and Caroline"),
+            vec!["Caroline"]
+        );
+    }
+
+    #[test]
+    fn query_graph_entities_keeps_phrases_and_drops_question_words() {
+        assert_eq!(
+            query_graph_entities("What memory does Operator OS share with Caroline?"),
+            vec![
+                "Operator OS".to_string(),
+                "Operator".to_string(),
+                "OS".to_string(),
+                "Caroline".to_string()
+            ]
+        );
+        assert_eq!(
+            query_graph_entities("When did Caroline tell Melanie?"),
+            vec!["Caroline".to_string(), "Melanie".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -567,13 +761,17 @@ mod tests {
             let f = insert_memory(&db, "/tmp/p", &s, &format!("fact {i}"), Some("fact"))
                 .await
                 .unwrap();
-            db::set_memory_scope_kind(&db, f, "project", "fact").await.unwrap();
+            db::set_memory_scope_kind(&db, f, "project", "fact")
+                .await
+                .unwrap();
             facts.push(f);
         }
         let narr = insert_memory(&db, "/tmp/p", &s, "the connecting narrative", Some("x"))
             .await
             .unwrap();
-        db::set_memory_scope_kind(&db, narr, "project", "session").await.unwrap();
+        db::set_memory_scope_kind(&db, narr, "project", "session")
+            .await
+            .unwrap();
 
         let mut candidates = facts.clone();
         candidates.push(narr); // narrative is the lowest-ranked candidate
@@ -592,13 +790,15 @@ mod tests {
     #[tokio::test]
     async fn hybrid_search_time_boost_surfaces_dated_memory() {
         let (db, path) = seeded_db().await; // ids 1,2,3 under /tmp/p, all undated
-        // A 4th memory whose wording shares no keyword with the query and which
-        // has no embedding, but is tagged with an event_time in 2023.
+                                            // A 4th memory whose wording shares no keyword with the query and which
+                                            // has no embedding, but is tagged with an event_time in 2023.
         let s = create_session(&db, "/tmp/p").await.unwrap();
         let dated = insert_memory(&db, "/tmp/p", &s, "zzz unrelated wording", Some("x"))
             .await
             .unwrap();
-        db::set_memory_event_time(&db, dated, "2023-05-07").await.unwrap();
+        db::set_memory_event_time(&db, dated, "2023-05-07")
+            .await
+            .unwrap();
 
         // No embedder ⇒ vector side empty; query keyword misses every summary in
         // FTS, but names the year 2023 ⇒ the temporal signal surfaces the memory.
@@ -616,6 +816,65 @@ mod tests {
             res.iter().any(|m| m.id == dated),
             "time-boost must surface the dated memory FTS+vector miss: {res:?}"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_graph_signal_surfaces_relation_ranked_memory() {
+        let (db, path) = seeded_db().await;
+        let s = create_session(&db, "/tmp/p").await.unwrap();
+        let answer = insert_memory(&db, "/tmp/p", &s, "zzz provenance alpha", Some("x"))
+            .await
+            .unwrap();
+        db::insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: "/tmp/p".to_string(),
+                memory_id: answer,
+                source: "Caroline".to_string(),
+                relation: "assigned_to".to_string(),
+                target: "Operator OS".to_string(),
+                valid_from: None,
+                valid_until: None,
+                confidence: 0.9,
+            },
+        )
+        .await
+        .unwrap();
+
+        let generic = insert_memory(&db, "/tmp/p", &s, "yyy provenance beta", Some("x"))
+            .await
+            .unwrap();
+        db::insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: "/tmp/p".to_string(),
+                memory_id: generic,
+                source: "Caroline".to_string(),
+                relation: "favorite_color".to_string(),
+                target: "blue".to_string(),
+                valid_from: None,
+                valid_until: None,
+                confidence: 0.9,
+            },
+        )
+        .await
+        .unwrap();
+
+        // No embedder and summaries share no query words. The graph signal must
+        // still surface the relationship-bearing provenance memory, and relation
+        // overlap ("assigned_to") must beat the newer generic Caroline edge.
+        let res = hybrid_search(
+            &db,
+            None,
+            &crate::vectorstore::BruteForceStore,
+            Some("/tmp/p"),
+            "What is Caroline assigned to?",
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.first().map(|m| m.id), Some(answer), "{res:?}");
         let _ = std::fs::remove_file(path);
     }
 
@@ -651,7 +910,13 @@ mod tests {
 
     #[test]
     fn fuse_rerank_promotes_llm_favored_buried_candidate() {
-        let cands = vec![mk(10, "a"), mk(11, "b"), mk(12, "c"), mk(13, "d"), mk(14, "e")];
+        let cands = vec![
+            mk(10, "a"),
+            mk(11, "b"),
+            mk(12, "c"),
+            mk(13, "d"),
+            mk(14, "e"),
+        ];
         // The model's single favorite is the LAST base candidate (id 14, base rank
         // 4) — a buried answer. Fusion promotes it to #1…
         let out = fuse_rerank(&cands, &[4], 5);
@@ -682,10 +947,19 @@ mod tests {
     fn reanchor_keeps_narrow_order_then_appends_newcomers() {
         let narrow = vec![mk(10, "a"), mk(11, "b"), mk(12, "c")];
         // Wide pool: a different (degraded) order, same ids plus newcomers 9 and 8.
-        let wide = vec![mk(12, "c"), mk(9, "x"), mk(10, "a"), mk(8, "y"), mk(11, "b")];
+        let wide = vec![
+            mk(12, "c"),
+            mk(9, "x"),
+            mk(10, "a"),
+            mk(8, "y"),
+            mk(11, "b"),
+        ];
         let out = reanchor(narrow, wide);
         // Narrow order preserved on top; only the wide-pool newcomers (9, 8) trail.
-        assert_eq!(out.iter().map(|m| m.id).collect::<Vec<_>>(), vec![10, 11, 12, 9, 8]);
+        assert_eq!(
+            out.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![10, 11, 12, 9, 8]
+        );
     }
 
     #[test]
@@ -755,7 +1029,10 @@ mod tests {
             (3, "gamma database schema"),
         ] {
             let v = emb.embed(&[text.to_string()]).await.unwrap();
-            store.upsert(db, id, emb.id(), emb.dim(), &v[0]).await.unwrap();
+            store
+                .upsert(db, id, emb.id(), emb.dim(), &v[0])
+                .await
+                .unwrap();
         }
     }
 
@@ -768,8 +1045,14 @@ mod tests {
 
         // Query whose embedding matches memory 3, but whose keyword has no FTS
         // overlap with any summary — pure FTS returns nothing.
-        let qvec = emb.embed(&["gamma database schema".to_string()]).await.unwrap();
-        let knn = store.knn(&db, Some("/tmp/p"), &qvec[0], emb.id(), 3).await.unwrap();
+        let qvec = emb
+            .embed(&["gamma database schema".to_string()])
+            .await
+            .unwrap();
+        let knn = store
+            .knn(&db, Some("/tmp/p"), &qvec[0], emb.id(), 3)
+            .await
+            .unwrap();
         assert_eq!(knn[0].0, 3);
 
         let res = hybrid_search(&db, Some(&emb), &store, Some("/tmp/p"), "zzznomatch", 5)
@@ -799,7 +1082,11 @@ mod tests {
         embed_all(&db, &emb, &store).await;
         let weights = Weights::default();
 
-        let qvec = normalize(&emb.embed(&["gamma database schema".to_string()]).await.unwrap()[0]);
+        let qvec = normalize(
+            &emb.embed(&["gamma database schema".to_string()])
+                .await
+                .unwrap()[0],
+        );
         let ranked = injection_rank(
             &db,
             Some(&emb),
@@ -834,12 +1121,20 @@ mod tests {
     #[tokio::test]
     async fn injection_includes_cross_project_user_memory() {
         let (db, path) = seeded_db().await; // 3 project memories under /tmp/p
-        // A user-scope preference created from a DIFFERENT project.
+                                            // A user-scope preference created from a DIFFERENT project.
         let s2 = create_session(&db, "/tmp/other").await.unwrap();
-        let uid = insert_memory(&db, "/tmp/other", &s2, "user prefers tabs over spaces", Some("pref"))
+        let uid = insert_memory(
+            &db,
+            "/tmp/other",
+            &s2,
+            "user prefers tabs over spaces",
+            Some("pref"),
+        )
+        .await
+        .unwrap();
+        db::set_memory_scope_kind(&db, uid, "user", "preference")
             .await
             .unwrap();
-        db::set_memory_scope_kind(&db, uid, "user", "preference").await.unwrap();
 
         let store = crate::vectorstore::BruteForceStore;
         let weights = Weights::default();
@@ -873,7 +1168,9 @@ mod tests {
         )
         .await
         .unwrap();
-        db::set_memory_scope_kind(&db, pid, "user", "profile").await.unwrap();
+        db::set_memory_scope_kind(&db, pid, "user", "profile")
+            .await
+            .unwrap();
 
         let store = crate::vectorstore::BruteForceStore;
         let weights = Weights::default();
@@ -881,7 +1178,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ranked[0].id, pid, "profile must inject first: {ranked:?}");
-        assert!(ranked.len() <= 3, "limit is respected even with the profile");
+        assert!(
+            ranked.len() <= 3,
+            "limit is respected even with the profile"
+        );
         // Exactly one copy (deduped, not duplicated by the user-scope candidate).
         assert_eq!(ranked.iter().filter(|m| m.id == pid).count(), 1);
         let _ = std::fs::remove_file(path);
@@ -900,18 +1200,25 @@ mod tests {
         let pref = insert_memory(&db, "/tmp/p", &s, "a durable preference", Some("x"))
             .await
             .unwrap();
-        db::set_memory_scope_kind(&db, pref, "project", "preference").await.unwrap();
+        db::set_memory_scope_kind(&db, pref, "project", "preference")
+            .await
+            .unwrap();
         let sess = insert_memory(&db, "/tmp/p", &s, "a plain session note", Some("x"))
             .await
             .unwrap();
-        db::set_memory_scope_kind(&db, sess, "project", "session").await.unwrap();
+        db::set_memory_scope_kind(&db, sess, "project", "session")
+            .await
+            .unwrap();
 
         let store = crate::vectorstore::BruteForceStore;
         let weights = Weights::default();
         let ranked = injection_rank(&db, None, &store, "/tmp/p", None, &weights, 30.0, 2)
             .await
             .unwrap();
-        assert_eq!(ranked[0].id, pref, "kind-boosted preference must rank first: {ranked:?}");
+        assert_eq!(
+            ranked[0].id, pref,
+            "kind-boosted preference must rank first: {ranked:?}"
+        );
         let _ = std::fs::remove_file(path);
     }
 

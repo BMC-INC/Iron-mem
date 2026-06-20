@@ -8,6 +8,7 @@ mod db;
 mod e2e;
 mod embedder;
 mod embedding_codec;
+mod eval;
 mod hooks;
 mod mcp;
 mod profile;
@@ -160,9 +161,41 @@ enum Commands {
         /// Include superseded/duplicate historical edges
         #[arg(long)]
         history: bool,
+        /// Query graph edges valid at a YYYY-MM-DD date
+        #[arg(long)]
+        at: Option<String>,
         /// Max graph edges
         #[arg(short, long, default_value = "20")]
         limit: i64,
+    },
+
+    /// Reconcile duplicate/superseded temporal graph edges
+    Reconcile {
+        /// Project root path (defaults to current directory; use --all for every project)
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Reconcile graph edges across every project
+        #[arg(short, long)]
+        all: bool,
+        /// Report what would change without mutating graph history
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Backfill temporal graph relations for memories created before RELATIONS extraction
+    GraphBackfill {
+        /// Project root path (defaults to current directory; use --all for every project)
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Backfill across every project
+        #[arg(short, long)]
+        all: bool,
+        /// Max memories to inspect
+        #[arg(short, long, default_value = "50")]
+        limit: i64,
+        /// Report extracted relation counts without writing edges
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Manually compress a session
@@ -185,6 +218,13 @@ enum Commands {
         /// Rebuild the index from scratch, re-embedding every memory
         #[arg(short, long)]
         force: bool,
+    },
+
+    /// Run deterministic memory-quality evaluation suites
+    Eval {
+        /// Directory for markdown eval reports
+        #[arg(long, default_value = "docs/evals")]
+        out: String,
     },
 
     /// Start the MCP server (stdio transport, for Claude Desktop/Code)
@@ -271,8 +311,31 @@ async fn main() -> Result<()> {
             project,
             all,
             history,
+            at,
             limit,
-        } => run_graph(&cfg, &entity, project.as_deref(), all, history, limit).await?,
+        } => {
+            run_graph(
+                &cfg,
+                &entity,
+                project.as_deref(),
+                all,
+                history,
+                at.as_deref(),
+                limit,
+            )
+            .await?
+        }
+        Commands::Reconcile {
+            project,
+            all,
+            dry_run,
+        } => run_reconcile(&cfg, project.as_deref(), all, dry_run).await?,
+        Commands::GraphBackfill {
+            project,
+            all,
+            limit,
+            dry_run,
+        } => run_graph_backfill(&cfg, project.as_deref(), all, limit, dry_run).await?,
         Commands::Compress { session_id } => run_compress_cmd(&cfg, &session_id).await?,
         Commands::Gc => run_gc(&cfg).await?,
         Commands::Embed {
@@ -280,6 +343,7 @@ async fn main() -> Result<()> {
             all,
             force,
         } => run_embed(&cfg, project.as_deref(), all, force).await?,
+        Commands::Eval { out } => run_eval(&cfg, &out).await?,
         Commands::Config => {
             println!("{}", serde_json::to_string_pretty(&cfg)?);
         }
@@ -324,6 +388,26 @@ async fn run_server(cfg: config::Config) -> Result<()> {
     }
 
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn run_eval(cfg: &config::Config, out: &str) -> Result<()> {
+    let report = eval::run(cfg, std::path::Path::new(out)).await?;
+    if let Some(path) = &report.output_path {
+        println!(
+            "IronMem eval: {}/{} passed; report={}",
+            report.passed(),
+            report.cases.len(),
+            path.display()
+        );
+    } else {
+        println!(
+            "IronMem eval: {}/{} passed",
+            report.passed(),
+            report.cases.len()
+        );
+    }
+    eval::ensure_passed(&report)?;
     Ok(())
 }
 
@@ -816,21 +900,29 @@ async fn run_graph(
     project: Option<&str>,
     all: bool,
     history: bool,
+    at: Option<&str>,
     limit: i64,
 ) -> Result<()> {
     let database = db::Database::new(&cfg.effective_database_url()).await?;
     database.migrate().await?;
 
+    if let Some(at) = at {
+        anyhow::ensure!(
+            provider::is_valid_memory_date(at),
+            "--at must be a valid YYYY-MM-DD date"
+        );
+    }
     let filter = if all {
         None
     } else {
         Some(resolve_project(project)?)
     };
-    let edges = db::memory_edges_for_entity(
+    let edges = db::memory_edges_for_entity_at(
         &database,
         filter.as_deref(),
         entity,
         history,
+        at,
         limit.max(1) as usize,
     )
     .await?;
@@ -843,7 +935,10 @@ async fn run_graph(
         return Ok(());
     }
 
-    println!("{} graph edge(s) for {entity:?}:", edges.len());
+    match at {
+        Some(at) => println!("{} graph edge(s) for {entity:?} at {at}:", edges.len()),
+        None => println!("{} graph edge(s) for {entity:?}:", edges.len()),
+    }
     for e in &edges {
         let mut suffix = String::new();
         if let Some(from) = &e.valid_from {
@@ -860,6 +955,105 @@ async fn run_graph(
             e.source, e.relation, e.target, suffix, e.memory_id, e.confidence
         );
     }
+    Ok(())
+}
+
+async fn run_reconcile(
+    cfg: &config::Config,
+    project: Option<&str>,
+    all: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+
+    let filter = if all {
+        None
+    } else {
+        Some(resolve_project(project)?)
+    };
+    let report = db::reconcile_memory_graph(&database, filter.as_deref(), dry_run).await?;
+    println!(
+        "Graph reconciliation{}: scanned={}, duplicates={}, current_state_updates={}, active_edges={}",
+        if dry_run { " dry-run" } else { "" },
+        report.scanned,
+        report.duplicates,
+        report.current_state_updates,
+        report.active_edges
+    );
+    Ok(())
+}
+
+async fn run_graph_backfill(
+    cfg: &config::Config,
+    project: Option<&str>,
+    all: bool,
+    limit: i64,
+    dry_run: bool,
+) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+
+    if let Err(e) = provider::resolve_api_key(cfg.provider) {
+        println!("Graph backfill skipped: provider is not configured ({e}).");
+        return Ok(());
+    }
+
+    let filter = if all {
+        None
+    } else {
+        Some(resolve_project(project)?)
+    };
+    let memories =
+        db::memories_without_edges(&database, filter.as_deref(), limit.max(1) as usize).await?;
+    let mut scanned = 0_usize;
+    let mut with_relations = 0_usize;
+    let mut inserted = 0_usize;
+
+    for memory in &memories {
+        scanned += 1;
+        let relations = provider::extract_relations_from_memory_text(
+            &memory.summary,
+            memory.tags.as_deref(),
+            cfg,
+        )
+        .await?;
+        if !relations.is_empty() {
+            with_relations += 1;
+        }
+        if dry_run {
+            inserted += relations.len();
+            continue;
+        }
+        for relation in relations {
+            let edge = db::NewMemoryEdge {
+                project: memory.project.clone(),
+                memory_id: memory.id,
+                source: relation.source.clone(),
+                relation: relation.relation.clone(),
+                target: relation.target.clone(),
+                valid_from: relation.valid_from.clone(),
+                valid_until: relation.valid_until.clone(),
+                confidence: relation.confidence,
+            };
+            match db::insert_memory_edge(&database, &edge).await {
+                Ok(_) => {
+                    inserted += 1;
+                    let _ = db::insert_memory_entity(&database, memory.id, &relation.source).await;
+                    let _ = db::insert_memory_entity(&database, memory.id, &relation.target).await;
+                }
+                Err(e) => tracing::warn!("graph backfill edge skipped (memory {}): {e}", memory.id),
+            }
+        }
+    }
+
+    println!(
+        "Graph backfill{}: scanned={}, memories_with_relations={}, edges={}",
+        if dry_run { " dry-run" } else { "" },
+        scanned,
+        with_relations,
+        inserted
+    );
     Ok(())
 }
 

@@ -356,12 +356,13 @@ async fn list_corrections(
     Ok(Json(CorrectionsResponse { corrections }))
 }
 
-// GET /graph?entity=&project=&history=&limit=  (temporal memory graph)
+// GET /graph?entity=&project=&history=&at=&limit=  (temporal memory graph)
 #[derive(Deserialize)]
 pub struct GraphQuery {
     pub entity: String,
     pub project: Option<String>,
     pub history: Option<bool>,
+    pub at: Option<String>,
     pub limit: Option<usize>,
 }
 
@@ -370,6 +371,7 @@ pub struct GraphResponse {
     pub entity: String,
     pub project: Option<String>,
     pub include_superseded: bool,
+    pub at: Option<String>,
     pub edges: Vec<db::MemoryEdge>,
 }
 
@@ -384,11 +386,20 @@ async fn memory_graph(
         ));
     }
     let include_superseded = params.history.unwrap_or(false);
-    let edges = db::memory_edges_for_entity(
+    if let Some(at) = &params.at {
+        if !crate::provider::is_valid_memory_date(at) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "'at' must be a valid YYYY-MM-DD date".to_string(),
+            ));
+        }
+    }
+    let edges = db::memory_edges_for_entity_at(
         &state.db,
         params.project.as_deref(),
         &params.entity,
         include_superseded,
+        params.at.as_deref(),
         params.limit.unwrap_or(20).max(1),
     )
     .await
@@ -398,6 +409,7 @@ async fn memory_graph(
         entity: params.entity,
         project: params.project,
         include_superseded,
+        at: params.at,
         edges,
     }))
 }

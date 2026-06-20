@@ -136,6 +136,7 @@ impl Weights {
         match kind {
             "profile" => 1.4,
             "error_solution" => 1.3,
+            "procedural" => 1.28,
             "preference" => 1.25,
             "architecture" | "learned_pattern" => 1.15,
             "project_config" => 1.1,
@@ -282,10 +283,16 @@ mod tests {
     #[test]
     fn missing_rerank_key_yields_defaults() {
         let cfg: Config = serde_json::from_str(BASE).unwrap();
-        assert!(!cfg.rerank.enabled, "rerank is off unless explicitly enabled");
+        assert!(
+            !cfg.rerank.enabled,
+            "rerank is off unless explicitly enabled"
+        );
         assert_eq!(cfg.rerank.pool, 20);
         // Empty default ⇒ rerank falls back to the compression model.
-        assert!(cfg.rerank.model.is_empty(), "default rerank model defers to compression model");
+        assert!(
+            cfg.rerank.model.is_empty(),
+            "default rerank model defers to compression model"
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -57,6 +58,9 @@ pub struct CompressionResult {
     /// Structured relation edges extracted from the session (`RELATIONS:`).
     /// Persisted as temporal graph edges with source-memory provenance.
     pub relations: Vec<MemoryRelation>,
+    /// Durable operating rules / workflow instructions extracted from the
+    /// session. Persisted as separate `kind=procedural` memories.
+    pub procedures: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +87,7 @@ impl Default for CompressionResult {
             event_time: None,
             entities: Vec::new(),
             relations: Vec::new(),
+            procedures: Vec::new(),
         }
     }
 }
@@ -125,7 +130,7 @@ fn build_prompt(observations: &[Observation]) -> String {
             .to_string(),
     );
     lines.push(
-        "KIND: [single word classifying this session: session | error_solution | preference | architecture | learned_pattern | project_config — default 'session']"
+        "KIND: [single word classifying this session: session | error_solution | preference | procedural | architecture | learned_pattern | project_config — default 'session']"
             .to_string(),
     );
     lines.push(
@@ -138,6 +143,10 @@ fn build_prompt(observations: &[Observation]) -> String {
     );
     lines.push(
         "RELATIONS: [one structured relation per line, each starting with \"- \". Format exactly: source | relation | target | valid_from | valid_until | confidence. Use concise relation names like works_at, lives_at, status, depends_on, decided, owns, uses, part_of. Put 'none' for unknown dates. Confidence is 0.0-1.0. Example: \"- Caroline | status | approved | 2026-06-05 | none | 0.9\". If there are no durable relationships, write \"- none\".]"
+            .to_string(),
+    );
+    lines.push(
+        "PROCEDURES: [one durable workflow rule or operating instruction per line, each starting with \"- \". Only include reusable rules about how future work should be done, not one-off facts. Examples: \"- For Operator OS, keep tenant isolation explicit before shared/team memory\" or \"- Use env files for secrets; never print raw keys\". If none, write \"- none\".]"
             .to_string(),
     );
 
@@ -153,45 +162,54 @@ fn parse_response(text: &str) -> CompressionResult {
     let mut event_time: Option<String> = None;
     let mut entities: Vec<String> = Vec::new();
     let mut relations: Vec<MemoryRelation> = Vec::new();
+    let mut procedures: Vec<String> = Vec::new();
     // FACTS is a multi-line block: once the marker is seen, subsequent "- "
     // bullet lines are facts until the next known marker ends the block.
     let mut in_facts = false;
     let mut in_relations = false;
+    let mut in_procedures = false;
 
     for line in text.lines() {
         if let Some(s) = line.strip_prefix("SUMMARY:") {
             summary = s.trim().to_string();
             in_facts = false;
             in_relations = false;
+            in_procedures = false;
         } else if let Some(rest) = line.strip_prefix("FACTS:") {
             in_facts = true;
             in_relations = false;
+            in_procedures = false;
             // Tolerate a first fact placed on the marker line itself.
             push_fact(&mut facts, rest);
         } else if let Some(t) = line.strip_prefix("TAGS:") {
             tags = t.trim().to_string();
             in_facts = false;
             in_relations = false;
+            in_procedures = false;
         } else if let Some(i) = line.strip_prefix("IMPORTANCE:") {
             importance = parse_importance(i);
             in_facts = false;
             in_relations = false;
+            in_procedures = false;
         } else if let Some(k) = line.strip_prefix("KIND:") {
             // Clamp to the known set; unrecognized values collapse to `session`.
             kind = Some(crate::db::clamp_kind(k).to_string());
             in_facts = false;
             in_relations = false;
+            in_procedures = false;
         } else if let Some(w) = line.strip_prefix("WHEN:") {
             let w = w.trim();
             // Treat blank / "none" / "unknown" as undated.
             if !w.is_empty()
                 && !w.eq_ignore_ascii_case("none")
                 && !w.eq_ignore_ascii_case("unknown")
+                && is_valid_memory_date_or_range(w)
             {
                 event_time = Some(w.to_string());
             }
             in_facts = false;
             in_relations = false;
+            in_procedures = false;
         } else if let Some(e) = line.strip_prefix("ENTITIES:") {
             for ent in e.split(',') {
                 let ent = ent.trim();
@@ -201,14 +219,23 @@ fn parse_response(text: &str) -> CompressionResult {
             }
             in_facts = false;
             in_relations = false;
+            in_procedures = false;
         } else if let Some(rest) = line.strip_prefix("RELATIONS:") {
             in_facts = false;
             in_relations = true;
+            in_procedures = false;
             push_relation(&mut relations, rest);
+        } else if let Some(rest) = line.strip_prefix("PROCEDURES:") {
+            in_facts = false;
+            in_relations = false;
+            in_procedures = true;
+            push_procedure(&mut procedures, rest);
         } else if in_facts {
             push_fact(&mut facts, line);
         } else if in_relations {
             push_relation(&mut relations, line);
+        } else if in_procedures {
+            push_procedure(&mut procedures, line);
         }
     }
 
@@ -226,6 +253,7 @@ fn parse_response(text: &str) -> CompressionResult {
         event_time,
         entities,
         relations,
+        procedures,
     }
 }
 
@@ -249,9 +277,31 @@ fn optional_relation_date(s: &str) -> Option<String> {
     let s = s.trim();
     if s.is_empty() || s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("unknown") {
         None
-    } else {
+    } else if is_valid_memory_date(s) {
         Some(s.to_string())
+    } else {
+        None
     }
+}
+
+pub fn is_valid_memory_date(s: &str) -> bool {
+    s.len() == 10 && NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+}
+
+pub fn is_valid_memory_date_or_range(s: &str) -> bool {
+    if is_valid_memory_date(s) {
+        return true;
+    }
+    let Some((start, end)) = s.split_once("..") else {
+        return false;
+    };
+    let Ok(start) = NaiveDate::parse_from_str(start.trim(), "%Y-%m-%d") else {
+        return false;
+    };
+    let Ok(end) = NaiveDate::parse_from_str(end.trim(), "%Y-%m-%d") else {
+        return false;
+    };
+    start <= end
 }
 
 fn push_relation(relations: &mut Vec<MemoryRelation>, line: &str) {
@@ -285,6 +335,19 @@ fn push_relation(relations: &mut Vec<MemoryRelation>, line: &str) {
         valid_until: optional_relation_date(parts[4]),
         confidence,
     });
+}
+
+fn push_procedure(procedures: &mut Vec<String>, line: &str) {
+    let trimmed = line.trim();
+    let bullet = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix('-'));
+    if let Some(p) = bullet {
+        let p = p.trim();
+        if !p.is_empty() && !p.eq_ignore_ascii_case("none") {
+            procedures.push(p.to_string());
+        }
+    }
 }
 
 /// Parse the IMPORTANCE value, taking the first integer found and clamping to
@@ -353,6 +416,27 @@ pub async fn complete_with(prompt: &str, model: &str, config: &Config) -> Result
         Provider::Openai => openai_text(prompt, model, &api_key).await,
         Provider::Google => google_text(prompt, model, &api_key).await,
     }
+}
+
+/// Extract only structured relation lines from an existing memory summary. Used
+/// by graph backfill so older memories can gain graph edges without rewriting
+/// their summaries or facts.
+pub async fn extract_relations_from_memory_text(
+    summary: &str,
+    tags: Option<&str>,
+    config: &Config,
+) -> Result<Vec<MemoryRelation>> {
+    let prompt = format!(
+        "You are backfilling a temporal memory graph from an existing compressed memory.\n\
+         Extract durable relationships only. Do not rewrite the memory.\n\n\
+         MEMORY SUMMARY:\n{}\n\nTAGS:\n{}\n\n\
+         Respond with EXACTLY this format:\n\
+         RELATIONS: [one structured relation per line, each starting with \"- \". Format exactly: source | relation | target | valid_from | valid_until | confidence. Use concise relation names like works_at, lives_at, status, depends_on, decided, owns, uses, part_of. Put 'none' for unknown dates. Confidence is 0.0-1.0. If there are no durable relationships, write \"- none\".]",
+        summary,
+        tags.unwrap_or("")
+    );
+    let reply = complete(&prompt, config).await?;
+    Ok(parse_response(&reply).relations)
 }
 
 // ── Anthropic ───────────────────────────────────────────────────────
@@ -654,6 +738,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_validates_temporal_dates() {
+        let r = parse_response(
+            "SUMMARY: s\nWHEN: 2026-02-30\nRELATIONS:\n- Caroline | status | approved | 2026-13-05 | none | 0.9",
+        );
+        assert!(r.event_time.is_none());
+        assert_eq!(r.relations.len(), 1);
+        assert!(r.relations[0].valid_from.is_none());
+
+        let ok = parse_response(
+            "SUMMARY: s\nWHEN: 2026-06-01..2026-06-05\nRELATIONS:\n- Caroline | status | approved | 2026-06-05 | none | 0.9",
+        );
+        assert_eq!(ok.event_time.as_deref(), Some("2026-06-01..2026-06-05"));
+        assert_eq!(ok.relations[0].valid_from.as_deref(), Some("2026-06-05"));
+    }
+
+    #[test]
     fn parse_response_ignores_malformed_or_none_relations() {
         let r = parse_response(
             "SUMMARY: s\nRELATIONS:\n- none\n- missing | fields\n-  | status | draft | none | none | 0.8\n- James | role | operator | none | none | 1.4",
@@ -664,10 +764,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_extracts_procedures_block() {
+        let r = parse_response(
+            "SUMMARY: s\nPROCEDURES:\n- Keep tenant isolation explicit before shared memory.\n- Use env files for secrets.\n- none",
+        );
+        assert_eq!(
+            r.procedures,
+            vec![
+                "Keep tenant isolation explicit before shared memory.".to_string(),
+                "Use env files for secrets.".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn prompt_emits_relations_section() {
         assert!(
             build_prompt(&[]).contains("RELATIONS:"),
             "prompt must request RELATIONS"
+        );
+    }
+
+    #[test]
+    fn prompt_emits_procedures_section() {
+        assert!(
+            build_prompt(&[]).contains("PROCEDURES:"),
+            "prompt must request PROCEDURES"
         );
     }
 

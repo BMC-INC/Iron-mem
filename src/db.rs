@@ -3,6 +3,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Backend {
@@ -80,6 +81,15 @@ pub struct MemoryEdge {
     pub superseded_by: Option<i64>,
     pub superseded_reason: Option<String>,
     pub created_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct ReconcileReport {
+    pub scanned: usize,
+    pub duplicates: usize,
+    pub current_state_updates: usize,
+    pub active_edges: usize,
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1143,6 +1153,7 @@ pub const MEMORY_KINDS: &[&str] = &[
     "session",
     "error_solution",
     "preference",
+    "procedural",
     "architecture",
     "learned_pattern",
     "project_config",
@@ -1619,6 +1630,290 @@ pub async fn memory_edges_for_entity(
     }
     let rows: Vec<sqlx::any::AnyRow> = q.bind(limit as i64).fetch_all(&db.pool).await?;
     Ok(rows.into_iter().map(memory_edge_from_row).collect())
+}
+
+/// Query graph edges by entity at a valid-time instant. `at_time` must be a
+/// YYYY-MM-DD string validated by the caller/parser. When absent, this behaves
+/// like [`memory_edges_for_entity`].
+pub async fn memory_edges_for_entity_at(
+    db: &Database,
+    project: Option<&str>,
+    entity: &str,
+    include_superseded: bool,
+    at_time: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MemoryEdge>> {
+    let entity_norm = normalize_graph_text(entity);
+    if entity_norm.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut sql =
+        "SELECT id, project, memory_id, source, relation, target, valid_from, valid_until,
+                          observed_at, confidence, superseded_by, superseded_reason, created_at
+                   FROM memory_edges
+                   WHERE (source_norm = $1 OR target_norm = $1)"
+            .to_string();
+    if !include_superseded {
+        sql.push_str(" AND superseded_by IS NULL");
+    }
+
+    let mut next = 2;
+    let at_ph = if at_time.is_some() {
+        let ph = format!("${next}");
+        next += 1;
+        sql.push_str(&format!(
+            " AND (valid_from IS NULL OR valid_from <= {ph})
+              AND (valid_until IS NULL OR {ph} < valid_until)"
+        ));
+        Some(ph)
+    } else {
+        None
+    };
+    let project_ph = if project.is_some() {
+        let ph = format!("${next}");
+        next += 1;
+        sql.push_str(&format!(" AND project = {ph}"));
+        Some(ph)
+    } else {
+        None
+    };
+    let limit_ph = format!("${next}");
+    let _ = at_ph;
+    let _ = project_ph;
+    sql.push_str(&format!(
+        " ORDER BY observed_at DESC, id DESC LIMIT {limit_ph}"
+    ));
+
+    let mut q = sqlx::query(&sql).bind(&entity_norm);
+    if let Some(at) = at_time {
+        q = q.bind(at);
+    }
+    if let Some(p) = project {
+        q = q.bind(p);
+    }
+    let rows: Vec<sqlx::any::AnyRow> = q.bind(limit as i64).fetch_all(&db.pool).await?;
+    Ok(rows.into_iter().map(memory_edge_from_row).collect())
+}
+
+async fn all_memory_edges(db: &Database, project: Option<&str>) -> Result<Vec<MemoryEdge>> {
+    let mut sql =
+        "SELECT id, project, memory_id, source, relation, target, valid_from, valid_until,
+                observed_at, confidence, superseded_by, superseded_reason, created_at
+         FROM memory_edges"
+            .to_string();
+    if project.is_some() {
+        sql.push_str(" WHERE project = $1");
+    }
+    sql.push_str(" ORDER BY project ASC, source ASC, relation ASC, observed_at ASC, id ASC");
+    let mut q = sqlx::query(&sql);
+    if let Some(p) = project {
+        q = q.bind(p);
+    }
+    let rows: Vec<sqlx::any::AnyRow> = q.fetch_all(&db.pool).await?;
+    Ok(rows.into_iter().map(memory_edge_from_row).collect())
+}
+
+fn edge_exact_key(edge: &MemoryEdge) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        edge.project,
+        normalize_graph_text(&edge.source),
+        normalize_relation(&edge.relation),
+        normalize_graph_text(&edge.target),
+        edge.valid_from.clone().unwrap_or_default()
+    )
+}
+
+fn edge_state_key(edge: &MemoryEdge) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        edge.project,
+        normalize_graph_text(&edge.source),
+        normalize_relation(&edge.relation)
+    )
+}
+
+fn edge_sort_newest(edges: &mut [&MemoryEdge]) {
+    edges.sort_by(|a, b| {
+        b.observed_at
+            .cmp(&a.observed_at)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| b.id.cmp(&a.id))
+    });
+}
+
+/// Re-run graph reconciliation over existing rows. This is useful after imports,
+/// migrations, or older databases that predate insert-time reconciliation.
+pub async fn reconcile_memory_graph(
+    db: &Database,
+    project: Option<&str>,
+    dry_run: bool,
+) -> Result<ReconcileReport> {
+    let edges = all_memory_edges(db, project).await?;
+    let scanned = edges.len();
+
+    let mut exact: HashMap<String, Vec<&MemoryEdge>> = HashMap::new();
+    for edge in edges.iter().filter(|e| e.superseded_by.is_none()) {
+        exact.entry(edge_exact_key(edge)).or_default().push(edge);
+    }
+
+    let mut duplicate_updates: Vec<(i64, i64)> = Vec::new();
+    for group in exact.values_mut() {
+        if group.len() <= 1 {
+            continue;
+        }
+        edge_sort_newest(group);
+        let winner = group[0].id;
+        for duplicate in group.iter().skip(1) {
+            duplicate_updates.push((duplicate.id, winner));
+        }
+    }
+
+    let mut active_after_duplicates: Vec<&MemoryEdge> = edges
+        .iter()
+        .filter(|e| e.superseded_by.is_none())
+        .filter(|e| !duplicate_updates.iter().any(|(id, _)| *id == e.id))
+        .collect();
+
+    let mut state_groups: HashMap<String, Vec<&MemoryEdge>> = HashMap::new();
+    for edge in active_after_duplicates.drain(..) {
+        let relation_norm = normalize_relation(&edge.relation);
+        if is_current_state_relation(&relation_norm) && edge.valid_until.is_none() {
+            state_groups
+                .entry(edge_state_key(edge))
+                .or_default()
+                .push(edge);
+        }
+    }
+
+    let mut state_updates: Vec<(i64, i64, String)> = Vec::new();
+    for group in state_groups.values_mut() {
+        if group.len() <= 1 {
+            continue;
+        }
+        edge_sort_newest(group);
+        let winner = group[0];
+        let winner_target = normalize_graph_text(&winner.target);
+        let closes_at = winner
+            .valid_from
+            .clone()
+            .unwrap_or_else(|| winner.observed_at.to_string());
+        for older in group.iter().skip(1) {
+            if normalize_graph_text(&older.target) != winner_target {
+                state_updates.push((older.id, winner.id, closes_at.clone()));
+            }
+        }
+    }
+
+    if !dry_run {
+        for (id, winner) in &duplicate_updates {
+            sqlx::query(
+                "UPDATE memory_edges
+                 SET superseded_by = $1, superseded_reason = 'duplicate'
+                 WHERE id = $2 AND superseded_by IS NULL",
+            )
+            .bind(winner)
+            .bind(id)
+            .execute(&db.pool)
+            .await?;
+        }
+        for (id, winner, closes_at) in &state_updates {
+            sqlx::query(
+                "UPDATE memory_edges
+                 SET superseded_by = $1,
+                     superseded_reason = 'current_state_update',
+                     valid_until = COALESCE(valid_until, $2)
+                 WHERE id = $3 AND superseded_by IS NULL",
+            )
+            .bind(winner)
+            .bind(closes_at)
+            .bind(id)
+            .execute(&db.pool)
+            .await?;
+        }
+    }
+
+    let active_edges = if dry_run {
+        scanned
+            .saturating_sub(duplicate_updates.len())
+            .saturating_sub(state_updates.len())
+    } else {
+        count_active_memory_edges(db, project).await?
+    };
+
+    Ok(ReconcileReport {
+        scanned,
+        duplicates: duplicate_updates.len(),
+        current_state_updates: state_updates.len(),
+        active_edges,
+        dry_run,
+    })
+}
+
+pub async fn count_active_memory_edges(db: &Database, project: Option<&str>) -> Result<usize> {
+    let row: sqlx::any::AnyRow = if let Some(p) = project {
+        sqlx::query(
+            "SELECT COUNT(*) AS cnt FROM memory_edges WHERE superseded_by IS NULL AND project = $1",
+        )
+        .bind(p)
+        .fetch_one(&db.pool)
+        .await?
+    } else {
+        sqlx::query("SELECT COUNT(*) AS cnt FROM memory_edges WHERE superseded_by IS NULL")
+            .fetch_one(&db.pool)
+            .await?
+    };
+    Ok(row.get::<i64, _>("cnt").max(0) as usize)
+}
+
+/// Existing memories that have no graph edges yet, newest first. Used by
+/// graph-backfill. Summaries are not mutated; returned ids become edge provenance.
+pub async fn memories_without_edges(
+    db: &Database,
+    project: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Memory>> {
+    let id_col = match db.backend {
+        Backend::Sqlite => "m.rowid",
+        Backend::Postgres => "m.id",
+    };
+    let rows: Vec<sqlx::any::AnyRow> = match project {
+        Some(p) => {
+            sqlx::query(&format!(
+                "SELECT {id_col} AS id, m.project, m.session_id, m.summary, m.tags, m.created_at
+                 FROM memories m
+                 WHERE m.project = $1
+                   AND NOT EXISTS (SELECT 1 FROM memory_edges e WHERE e.memory_id = {id_col})
+                 ORDER BY m.created_at DESC LIMIT $2"
+            ))
+            .bind(p)
+            .bind(limit as i64)
+            .fetch_all(&db.pool)
+            .await?
+        }
+        None => {
+            sqlx::query(&format!(
+                "SELECT {id_col} AS id, m.project, m.session_id, m.summary, m.tags, m.created_at
+                 FROM memories m
+                 WHERE NOT EXISTS (SELECT 1 FROM memory_edges e WHERE e.memory_id = {id_col})
+                 ORDER BY m.created_at DESC LIMIT $1"
+            ))
+            .bind(limit as i64)
+            .fetch_all(&db.pool)
+            .await?
+        }
+    };
+    Ok(rows
+        .into_iter()
+        .map(|r| Memory {
+            id: r.get("id"),
+            project: r.get("project"),
+            session_id: r.get("session_id"),
+            summary: r.get("summary"),
+            tags: r.try_get("tags").ok().flatten(),
+            created_at: r.get("created_at"),
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -2531,6 +2826,7 @@ mod tests {
     fn clamp_kind_and_scope_normalize_to_known_sets() {
         assert_eq!(clamp_kind("error_solution"), "error_solution");
         assert_eq!(clamp_kind("  PREFERENCE  "), "preference");
+        assert_eq!(clamp_kind("procedural"), "procedural");
         assert_eq!(clamp_kind("not-a-kind"), "session");
         assert_eq!(clamp_kind(""), "session");
         assert_eq!(clamp_scope("user"), "user");
@@ -2729,6 +3025,142 @@ mod tests {
             Some("current_state_update")
         );
         assert_eq!(replaced.valid_until.as_deref(), Some("2026-06-05"));
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_memory_graph_dry_run_then_marks_legacy_edges() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let p = "/tmp/reconcile-scan";
+        let s = create_session(&db, p).await?;
+        let first = insert_memory(&db, p, &s, "Caroline status draft", Some("t")).await?;
+        let second = insert_memory(&db, p, &s, "Caroline status draft again", Some("t")).await?;
+        let third = insert_memory(&db, p, &s, "Caroline status approved", Some("t")).await?;
+
+        let e1 = insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: p.into(),
+                memory_id: first,
+                source: "Caroline".into(),
+                relation: "status".into(),
+                target: "draft".into(),
+                valid_from: Some("2026-06-01".into()),
+                valid_until: None,
+                confidence: 0.8,
+            },
+        )
+        .await?;
+        let e2 = insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: p.into(),
+                memory_id: second,
+                source: "Caroline".into(),
+                relation: "status".into(),
+                target: "draft".into(),
+                valid_from: Some("2026-06-01".into()),
+                valid_until: None,
+                confidence: 0.9,
+            },
+        )
+        .await?;
+        let e3 = insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: p.into(),
+                memory_id: third,
+                source: "Caroline".into(),
+                relation: "status".into(),
+                target: "approved".into(),
+                valid_from: Some("2026-06-05".into()),
+                valid_until: None,
+                confidence: 0.95,
+            },
+        )
+        .await?;
+
+        // Simulate legacy/imported graph rows that never went through
+        // insert-time reconciliation.
+        sqlx::query(
+            "UPDATE memory_edges
+             SET superseded_by = NULL, superseded_reason = NULL, valid_until = NULL",
+        )
+        .execute(&db.pool)
+        .await?;
+
+        let dry = reconcile_memory_graph(&db, Some(p), true).await?;
+        assert_eq!(dry.scanned, 3);
+        assert_eq!(dry.duplicates, 1);
+        assert_eq!(dry.current_state_updates, 1);
+        assert_eq!(dry.active_edges, 1);
+        assert!(dry.dry_run);
+        assert!(memory_edges_for_entity(&db, Some(p), "Caroline", false, 10)
+            .await?
+            .iter()
+            .all(|e| e.superseded_by.is_none()));
+
+        let report = reconcile_memory_graph(&db, Some(p), false).await?;
+        assert_eq!(report.duplicates, 1);
+        assert_eq!(report.current_state_updates, 1);
+        assert_eq!(report.active_edges, 1);
+
+        let history = memory_edges_for_entity(&db, Some(p), "Caroline", true, 10).await?;
+        assert_eq!(
+            history.iter().find(|e| e.id == e1).unwrap().superseded_by,
+            Some(e2)
+        );
+        assert_eq!(
+            history.iter().find(|e| e.id == e2).unwrap().superseded_by,
+            Some(e3)
+        );
+
+        let current =
+            memory_edges_for_entity_at(&db, Some(p), "Caroline", false, Some("2026-06-06"), 10)
+                .await?;
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, e3);
+        let past =
+            memory_edges_for_entity_at(&db, Some(p), "Caroline", true, Some("2026-06-03"), 10)
+                .await?;
+        assert!(
+            past.iter().any(|e| e.target == "draft"),
+            "history at 2026-06-03 should include draft state: {past:?}"
+        );
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memories_without_edges_skips_existing_graph_provenance() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let p = "/tmp/backfill";
+        let s = create_session(&db, p).await?;
+        let with_edge = insert_memory(&db, p, &s, "Caroline uses IronMem", Some("a")).await?;
+        let missing = insert_memory(&db, p, &s, "Operator OS uses IronMem", Some("b")).await?;
+        insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: p.into(),
+                memory_id: with_edge,
+                source: "Caroline".into(),
+                relation: "uses".into(),
+                target: "IronMem".into(),
+                valid_from: None,
+                valid_until: None,
+                confidence: 0.8,
+            },
+        )
+        .await?;
+
+        let candidates = memories_without_edges(&db, Some(p), 10).await?;
+        assert_eq!(
+            candidates.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![missing]
+        );
 
         let _ = std::fs::remove_file(path);
         Ok(())
