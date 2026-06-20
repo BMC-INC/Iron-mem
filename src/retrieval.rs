@@ -224,6 +224,42 @@ async fn graph_ids_for_query(
         .collect())
 }
 
+/// LoCoMo-style temporal questions are overwhelmingly event→time lookups:
+/// "when did X happen?", "what date/day/year...", "how long...", or
+/// before/after ordering. Graph edges are useful for relationship questions, but
+/// for these queries they tend to promote nearby entity relationships over the
+/// date-bearing event memory. Keep temporal retrieval on keyword/vector/date
+/// channels unless the query is actually relational.
+fn is_temporal_lookup_query(query: &str) -> bool {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return false;
+    }
+    q.starts_with("when ")
+        || q.starts_with("when did ")
+        || q.starts_with("when was ")
+        || q.starts_with("when were ")
+        || q.starts_with("when is ")
+        || q.contains("what date")
+        || q.contains("which date")
+        || q.contains("what day")
+        || q.contains("which day")
+        || q.contains("what month")
+        || q.contains("which month")
+        || q.contains("what year")
+        || q.contains("which year")
+        || q.contains("what time")
+        || q.contains("how long")
+        || q.contains("how many days")
+        || q.contains("how many weeks")
+        || q.contains("how many months")
+        || q.contains("how many years")
+        || q.contains(" before ")
+        || q.contains(" after ")
+        || q.contains(" prior to ")
+        || q.contains(" following ")
+}
+
 /// Hybrid search: fuse keyword (FTS), semantic (vector), temporal (event_time),
 /// temporal graph, and entity (proper-noun index) signals via RRF. With none of
 /// the auxiliary signals present this returns the exact FTS ordering,
@@ -312,7 +348,11 @@ pub async fn hybrid_search(
     // ids when the query names an entity present as an edge source or target.
     // Unlike the disabled entity signal, graph ids are relation-ranked before
     // fusion so specific relationship questions beat generic recency.
-    let graph_ids = graph_ids_for_query(db, project, query, pool).await?;
+    let graph_ids = if is_temporal_lookup_query(query) {
+        Vec::new()
+    } else {
+        graph_ids_for_query(db, project, query, pool).await?
+    };
 
     // Candidate ordering: RRF over keyword + any auxiliary signals (semantic,
     // temporal, graph, entity). With no auxiliary signal this is the FTS order.
@@ -875,6 +915,69 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(res.first().map(|m| m.id), Some(answer), "{res:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn temporal_lookup_detection_matches_locomo_question_shapes() {
+        for q in [
+            "When did Caroline go to the LGBTQ support group?",
+            "What date did Dave buy the vintage camera?",
+            "Which year did John start surfing?",
+            "How long did the car workshop last?",
+            "Which city was John in before traveling to Chicago?",
+        ] {
+            assert!(is_temporal_lookup_query(q), "{q}");
+        }
+        for q in [
+            "What is Caroline assigned to?",
+            "Who is Dave connected to?",
+            "Which project does Operator OS depend on?",
+        ] {
+            assert!(!is_temporal_lookup_query(q), "{q}");
+        }
+    }
+
+    #[tokio::test]
+    async fn temporal_lookup_suppresses_graph_only_hits() {
+        let (db, path) = seeded_db().await;
+        let s = create_session(&db, "/tmp/p").await.unwrap();
+        let graph_only = insert_memory(&db, "/tmp/p", &s, "zzz provenance alpha", Some("x"))
+            .await
+            .unwrap();
+        db::insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: "/tmp/p".to_string(),
+                memory_id: graph_only,
+                source: "Caroline".to_string(),
+                relation: "assigned_to".to_string(),
+                target: "Operator OS".to_string(),
+                valid_from: None,
+                valid_until: None,
+                confidence: 0.9,
+            },
+        )
+        .await
+        .unwrap();
+
+        // This temporal form has no FTS/vector/date evidence. Before query-type
+        // gating, the graph edge alone could surface the relationship memory and
+        // crowd out actual dated facts in LoCoMo-style "when did..." questions.
+        let res = hybrid_search(
+            &db,
+            None,
+            &crate::vectorstore::BruteForceStore,
+            Some("/tmp/p"),
+            "When did Caroline get assigned?",
+            5,
+        )
+        .await
+        .unwrap();
+        assert!(
+            res.iter().all(|m| m.id != graph_only),
+            "temporal lookup should not be answered by graph-only evidence: {res:?}"
+        );
         let _ = std::fs::remove_file(path);
     }
 
