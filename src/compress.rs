@@ -26,14 +26,32 @@ pub async fn run(
 
     let observations = db::get_observations_for_session(db, session_id).await?;
     let result = provider::compress(&observations, cfg).await?;
+    let chunk_result = result.clone();
 
     let memory_id = persist(db, embedder, store, &session.project, session_id, result).await?;
 
     // CCR: preserve the verbatim pre-LLM transcript behind the lossy summary so
     // it can be retrieved later. Best-effort — never fail a successful
     // compression because the transcript blob could not be stored.
-    if let Err(e) = store_session_transcript(db, memory_id, &observations).await {
-        tracing::warn!("CCR session transcript store failed (memory {memory_id}): {e}");
+    match store_session_transcript(db, memory_id, &observations).await {
+        Ok(hash) => {
+            if let Err(e) = persist_memory_skim(
+                db,
+                memory_id,
+                &session.project,
+                session_id,
+                &chunk_result,
+                &observations,
+                hash.as_deref(),
+            )
+            .await
+            {
+                tracing::warn!("memory skim store failed (memory {memory_id}): {e}");
+            }
+        }
+        Err(e) => {
+            tracing::warn!("CCR session transcript store failed (memory {memory_id}): {e}");
+        }
     }
 
     // Feedback loop: mine error→fix corrections into error_solution memories.
@@ -53,10 +71,24 @@ pub async fn run(
     Ok(memory_id)
 }
 
-/// Render observations into a plain-text transcript (the pre-LLM session view).
-fn build_transcript(observations: &[db::Observation]) -> String {
+#[derive(Debug, Clone)]
+struct TranscriptSection {
+    observation_id: i64,
+    tool: String,
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+/// Render observations into a plain-text transcript (the pre-LLM session view)
+/// and retain byte ranges for chunk-level exact expansion.
+fn build_transcript_with_sections(
+    observations: &[db::Observation],
+) -> (String, Vec<TranscriptSection>) {
     let mut s = String::new();
+    let mut sections = Vec::new();
     for o in observations {
+        let start = s.len();
         s.push_str("## ");
         s.push_str(&o.tool);
         s.push('\n');
@@ -71,8 +103,21 @@ fn build_transcript(observations: &[db::Observation]) -> String {
             s.push('\n');
         }
         s.push('\n');
+        let end = s.len();
+        sections.push(TranscriptSection {
+            observation_id: o.id,
+            tool: o.tool.clone(),
+            start,
+            end,
+            text: s[start..end].to_string(),
+        });
     }
-    s
+    (s, sections)
+}
+
+/// Render observations into a plain-text transcript (the pre-LLM session view).
+fn build_transcript(observations: &[db::Observation]) -> String {
+    build_transcript_with_sections(observations).0
 }
 
 /// Store the verbatim session transcript as a CCR blob and link it to `memory_id`
@@ -92,6 +137,184 @@ pub async fn store_session_transcript(
         .hash;
     db::set_memory_session_blob(db, memory_id, &hash).await?;
     Ok(Some(hash))
+}
+
+fn word_count(s: &str) -> usize {
+    s.split_whitespace().count()
+}
+
+fn token_estimate(s: &str) -> i64 {
+    ((word_count(s) * 4).saturating_add(2) / 3).max(1) as i64
+}
+
+fn clip_words(s: &str, max_words: usize) -> String {
+    let words: Vec<&str> = s.split_whitespace().collect();
+    if words.len() <= max_words {
+        return s.trim().to_string();
+    }
+    format!("{}...", words[..max_words].join(" "))
+}
+
+fn memory_density(result: &CompressionResult) -> &'static str {
+    if result.kind == "fact"
+        || result.kind == "procedural"
+        || result.kind == "error_solution"
+        || result.event_time.is_some()
+        || !result.facts.is_empty()
+        || !result.procedures.is_empty()
+        || result.importance >= 8
+    {
+        "high"
+    } else if matches!(
+        result.kind.as_str(),
+        "architecture" | "learned_pattern" | "project_config" | "preference" | "profile"
+    ) || result.importance >= 6
+    {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+fn section_density(section: &TranscriptSection, parent_density: &str) -> &'static str {
+    let text = section.text.to_ascii_lowercase();
+    if text.contains("error")
+        || text.contains("failed")
+        || text.contains("panic")
+        || text.contains("fix")
+        || text.contains("test result")
+        || text.contains("commit")
+        || text.contains("push")
+    {
+        "high"
+    } else if parent_density == "high" || word_count(&section.text) > 160 {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+fn chunk_summary(text: &str, density: &str) -> String {
+    match density {
+        "high" => clip_words(text, 90),
+        "medium" => clip_words(text, 48),
+        _ => clip_words(text, 24),
+    }
+}
+
+fn chunk_title(prefix: &str, text: &str) -> String {
+    let first_line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(prefix)
+        .trim()
+        .trim_start_matches("## ")
+        .trim();
+    let clipped = clip_words(first_line, 10);
+    if clipped.is_empty() {
+        prefix.to_string()
+    } else {
+        clipped
+    }
+}
+
+async fn persist_memory_skim(
+    db: &Database,
+    memory_id: i64,
+    project: &str,
+    session_id: &str,
+    result: &CompressionResult,
+    observations: &[db::Observation],
+    source_hash: Option<&str>,
+) -> Result<()> {
+    let parent_density = memory_density(result);
+    let mut chunks = Vec::new();
+    let mut ordinal = 0_i64;
+
+    chunks.push(db::NewMemoryChunk {
+        chunk_id: format!("mem:{memory_id}:overview"),
+        project: project.to_string(),
+        memory_id,
+        session_id: session_id.to_string(),
+        ordinal,
+        density: parent_density.to_string(),
+        kind: result.kind.clone(),
+        title: "Memory overview".to_string(),
+        summary: chunk_summary(&result.summary, parent_density),
+        source_hash: None,
+        source_start: None,
+        source_end: None,
+        token_estimate: token_estimate(&result.summary),
+    });
+    ordinal += 1;
+
+    for (idx, fact) in result.facts.iter().enumerate() {
+        chunks.push(db::NewMemoryChunk {
+            chunk_id: format!("mem:{memory_id}:fact:{}", idx + 1),
+            project: project.to_string(),
+            memory_id,
+            session_id: session_id.to_string(),
+            ordinal,
+            density: "high".to_string(),
+            kind: "fact".to_string(),
+            title: chunk_title("Fact", fact),
+            summary: fact.trim().to_string(),
+            source_hash: None,
+            source_start: None,
+            source_end: None,
+            token_estimate: token_estimate(fact),
+        });
+        ordinal += 1;
+    }
+
+    for (idx, procedure) in result.procedures.iter().enumerate() {
+        chunks.push(db::NewMemoryChunk {
+            chunk_id: format!("mem:{memory_id}:procedure:{}", idx + 1),
+            project: project.to_string(),
+            memory_id,
+            session_id: session_id.to_string(),
+            ordinal,
+            density: "high".to_string(),
+            kind: "procedural".to_string(),
+            title: chunk_title("Procedure", procedure),
+            summary: procedure.trim().to_string(),
+            source_hash: None,
+            source_start: None,
+            source_end: None,
+            token_estimate: token_estimate(procedure),
+        });
+        ordinal += 1;
+    }
+
+    if source_hash.is_some() && !observations.is_empty() {
+        let (_, sections) = build_transcript_with_sections(observations);
+        for section in sections {
+            let density = section_density(&section, parent_density);
+            let title = format!(
+                "{} observation {}",
+                chunk_title(&section.tool, &section.text),
+                section.observation_id
+            );
+            chunks.push(db::NewMemoryChunk {
+                chunk_id: format!("mem:{memory_id}:obs:{}", section.observation_id),
+                project: project.to_string(),
+                memory_id,
+                session_id: session_id.to_string(),
+                ordinal,
+                density: density.to_string(),
+                kind: result.kind.clone(),
+                title,
+                summary: chunk_summary(&section.text, density),
+                source_hash: source_hash.map(str::to_string),
+                source_start: Some(section.start as i64),
+                source_end: Some(section.end as i64),
+                token_estimate: token_estimate(&section.text),
+            });
+            ordinal += 1;
+        }
+    }
+
+    db::replace_memory_chunks(db, memory_id, &chunks).await
 }
 
 /// Persist an already-computed compression result. Inserts the memory, marks
@@ -118,6 +341,11 @@ pub async fn persist(
         if let Err(e) = db::set_memory_event_time(db, memory_id, when).await {
             tracing::warn!("event_time store failed (memory {memory_id}): {e}");
         }
+    }
+    if let Err(e) =
+        persist_memory_skim(db, memory_id, project, session_id, &result, &[], None).await
+    {
+        tracing::warn!("memory skim store failed (memory {memory_id}): {e}");
     }
 
     if let Some(emb) = embedder {
@@ -358,6 +586,28 @@ pub async fn remember(
     // Deliberately curated → slightly above the neutral default importance.
     db::upsert_memory_meta(db, memory_id, 0.7).await?;
     db::set_memory_scope_kind(db, memory_id, scope, kind).await?;
+    let explicit = CompressionResult {
+        summary: text.to_string(),
+        tags: tags.unwrap_or_default().to_string(),
+        importance: 7,
+        kind: db::clamp_kind(kind).to_string(),
+        facts: if db::clamp_kind(kind) == "fact" {
+            vec![text.to_string()]
+        } else {
+            Vec::new()
+        },
+        procedures: if db::clamp_kind(kind) == "procedural" {
+            vec![text.to_string()]
+        } else {
+            Vec::new()
+        },
+        ..Default::default()
+    };
+    if let Err(e) =
+        persist_memory_skim(db, memory_id, project, "remember", &explicit, &[], None).await
+    {
+        tracing::warn!("remember skim store failed (memory {memory_id}): {e}");
+    }
 
     if let Some(emb) = embedder {
         let embed_text = match tags {
@@ -442,6 +692,13 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+        let chunks = db::chunks_for_memories(&db, &[id]).await.unwrap();
+        let memory_chunks = chunks.get(&id).expect("skim chunks written");
+        assert!(memory_chunks
+            .iter()
+            .any(|c| c.chunk_id == format!("mem:{id}:overview")
+                && c.density == "high"
+                && c.kind == "architecture"));
 
         let _ = std::fs::remove_file(path);
     }

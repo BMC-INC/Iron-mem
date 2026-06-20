@@ -47,6 +47,49 @@ pub struct Memory {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct DatedMemory {
+    pub memory: Memory,
+    pub kind: String,
+    pub event_time: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryChunk {
+    pub id: i64,
+    pub chunk_id: String,
+    pub project: String,
+    pub memory_id: i64,
+    pub session_id: String,
+    pub ordinal: i64,
+    pub density: String,
+    pub kind: String,
+    pub title: String,
+    pub summary: String,
+    pub source_hash: Option<String>,
+    pub source_start: Option<i64>,
+    pub source_end: Option<i64>,
+    pub token_estimate: i64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewMemoryChunk {
+    pub chunk_id: String,
+    pub project: String,
+    pub memory_id: i64,
+    pub session_id: String,
+    pub ordinal: i64,
+    pub density: String,
+    pub kind: String,
+    pub title: String,
+    pub summary: String,
+    pub source_hash: Option<String>,
+    pub source_start: Option<i64>,
+    pub source_end: Option<i64>,
+    pub token_estimate: i64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProjectSummary {
     pub project: String,
@@ -463,6 +506,71 @@ impl Database {
         .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_memory_edges_memory ON memory_edges(memory_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Working-memory skim layer: durable, model-agnostic chunk maps over
+        // compressed memories and their CCR-backed originals. Agents can scan
+        // these cheaply, then expand a chunk_id only when exact evidence is
+        // needed.
+        match self.backend {
+            Backend::Sqlite => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS memory_chunks (
+                        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chunk_id       TEXT NOT NULL UNIQUE,
+                        project        TEXT NOT NULL,
+                        memory_id      BIGINT NOT NULL,
+                        session_id     TEXT NOT NULL,
+                        ordinal        BIGINT NOT NULL,
+                        density        TEXT NOT NULL,
+                        kind           TEXT NOT NULL,
+                        title          TEXT NOT NULL,
+                        summary        TEXT NOT NULL,
+                        source_hash    TEXT,
+                        source_start   BIGINT,
+                        source_end     BIGINT,
+                        token_estimate BIGINT NOT NULL,
+                        created_at     BIGINT NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+            Backend::Postgres => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS memory_chunks (
+                        id             BIGSERIAL PRIMARY KEY,
+                        chunk_id       TEXT NOT NULL UNIQUE,
+                        project        TEXT NOT NULL,
+                        memory_id      BIGINT NOT NULL,
+                        session_id     TEXT NOT NULL,
+                        ordinal        BIGINT NOT NULL,
+                        density        TEXT NOT NULL,
+                        kind           TEXT NOT NULL,
+                        title          TEXT NOT NULL,
+                        summary        TEXT NOT NULL,
+                        source_hash    TEXT,
+                        source_start   BIGINT,
+                        source_end     BIGINT,
+                        token_estimate BIGINT NOT NULL,
+                        created_at     BIGINT NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memory_chunks_project
+             ON memory_chunks(project, created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memory_chunks_memory
+             ON memory_chunks(memory_id, ordinal)",
         )
         .execute(&self.pool)
         .await?;
@@ -1329,6 +1437,70 @@ pub async fn memories_by_event_time(
     Ok(rows.into_iter().map(|r| r.get::<i64, _>("id")).collect())
 }
 
+/// Date-bearing memories for temporal event lookup. Unlike
+/// [`memories_by_event_time`], this does not require the query to name a year:
+/// LoCoMo-style questions usually ask "when did event X happen?", so the answer
+/// date lives in the memory, not the query. Retrieval scores these rows by event
+/// term overlap and kind.
+pub async fn dated_memories(
+    db: &Database,
+    project: Option<&str>,
+    limit: usize,
+) -> Result<Vec<DatedMemory>> {
+    let id_col = match db.backend {
+        Backend::Sqlite => "m.rowid",
+        Backend::Postgres => "m.id",
+    };
+    let select = format!(
+        "SELECT {id_col} AS id, m.project, m.session_id, m.summary, m.tags,
+                m.created_at, COALESCE(mm.kind, 'session') AS kind,
+                mm.event_time AS event_time
+         FROM memories m
+         JOIN memory_meta mm ON mm.memory_id = {id_col}
+         WHERE mm.event_time IS NOT NULL AND TRIM(mm.event_time) <> ''"
+    );
+    let rows: Vec<sqlx::any::AnyRow> = match project {
+        Some(p) => {
+            let sql = format!("{select} AND m.project = $1 ORDER BY m.created_at DESC LIMIT $2");
+            sqlx::query(&sql)
+                .bind(p)
+                .bind(limit as i64)
+                .fetch_all(&db.pool)
+                .await?
+        }
+        None => {
+            let sql = format!("{select} ORDER BY m.created_at DESC LIMIT $1");
+            sqlx::query(&sql)
+                .bind(limit as i64)
+                .fetch_all(&db.pool)
+                .await?
+        }
+    };
+    Ok(rows
+        .into_iter()
+        .map(|r| DatedMemory {
+            memory: Memory {
+                id: r.get("id"),
+                project: r.get("project"),
+                session_id: r.get("session_id"),
+                summary: r.get("summary"),
+                tags: r.try_get("tags").ok().flatten(),
+                created_at: r.get("created_at"),
+            },
+            kind: r
+                .try_get::<Option<String>, _>("kind")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "session".to_string()),
+            event_time: r
+                .try_get::<Option<String>, _>("event_time")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        })
+        .collect())
+}
+
 /// Index a memory under an entity (proper noun). The entity is split into word
 /// tokens, lowercased, and stored one row per token (≥3 chars) so a single-token
 /// query resolves any token of a multi-word entity ("York" of "New York").
@@ -1939,6 +2111,156 @@ pub async fn delete_memory_edges(db: &Database, memory_id: i64) -> Result<()> {
     Ok(())
 }
 
+fn clamp_chunk_density(density: &str) -> &'static str {
+    match density.trim().to_ascii_lowercase().as_str() {
+        "high" => "high",
+        "medium" => "medium",
+        "low" => "low",
+        _ => "medium",
+    }
+}
+
+fn memory_chunk_from_row(r: sqlx::any::AnyRow) -> MemoryChunk {
+    MemoryChunk {
+        id: r.get("id"),
+        chunk_id: r.get("chunk_id"),
+        project: r.get("project"),
+        memory_id: r.get("memory_id"),
+        session_id: r.get("session_id"),
+        ordinal: r.get("ordinal"),
+        density: r.get("density"),
+        kind: r.get("kind"),
+        title: r.get("title"),
+        summary: r.get("summary"),
+        source_hash: r.try_get::<Option<String>, _>("source_hash").ok().flatten(),
+        source_start: r.try_get::<Option<i64>, _>("source_start").ok().flatten(),
+        source_end: r.try_get::<Option<i64>, _>("source_end").ok().flatten(),
+        token_estimate: r.get("token_estimate"),
+        created_at: r.get("created_at"),
+    }
+}
+
+/// Replace a memory's working-context chunk map. Called after compression so
+/// agents can skim high-signal chunks before expanding exact originals.
+pub async fn replace_memory_chunks(
+    db: &Database,
+    memory_id: i64,
+    chunks: &[NewMemoryChunk],
+) -> Result<()> {
+    sqlx::query("DELETE FROM memory_chunks WHERE memory_id = $1")
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
+    let now = Utc::now().timestamp();
+    for chunk in chunks {
+        sqlx::query(
+            "INSERT INTO memory_chunks
+             (chunk_id, project, memory_id, session_id, ordinal, density, kind, title, summary,
+              source_hash, source_start, source_end, token_estimate, created_at)
+             VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+        )
+        .bind(&chunk.chunk_id)
+        .bind(&chunk.project)
+        .bind(chunk.memory_id)
+        .bind(&chunk.session_id)
+        .bind(chunk.ordinal)
+        .bind(clamp_chunk_density(&chunk.density))
+        .bind(clamp_kind(&chunk.kind))
+        .bind(&chunk.title)
+        .bind(&chunk.summary)
+        .bind(chunk.source_hash.as_deref())
+        .bind(chunk.source_start)
+        .bind(chunk.source_end)
+        .bind(chunk.token_estimate)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+    }
+    Ok(())
+}
+
+pub async fn delete_memory_chunks(db: &Database, memory_id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM memory_chunks WHERE memory_id = $1")
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn get_memory_chunk(db: &Database, chunk_id: &str) -> Result<Option<MemoryChunk>> {
+    let row = sqlx::query(
+        "SELECT id, chunk_id, project, memory_id, session_id, ordinal, density, kind, title,
+                summary, source_hash, source_start, source_end, token_estimate, created_at
+         FROM memory_chunks
+         WHERE chunk_id = $1",
+    )
+    .bind(chunk_id)
+    .fetch_optional(&db.pool)
+    .await?;
+    Ok(row.map(memory_chunk_from_row))
+}
+
+pub async fn chunks_for_memories(
+    db: &Database,
+    memory_ids: &[i64],
+) -> Result<std::collections::HashMap<i64, Vec<MemoryChunk>>> {
+    let mut out: std::collections::HashMap<i64, Vec<MemoryChunk>> =
+        std::collections::HashMap::new();
+    if memory_ids.is_empty() {
+        return Ok(out);
+    }
+    let in_list = memory_ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, chunk_id, project, memory_id, session_id, ordinal, density, kind, title,
+                summary, source_hash, source_start, source_end, token_estimate, created_at
+         FROM memory_chunks
+         WHERE memory_id IN ({in_list})
+         ORDER BY memory_id ASC, ordinal ASC"
+    );
+    let rows = sqlx::query(&sql).fetch_all(&db.pool).await?;
+    for row in rows {
+        let chunk = memory_chunk_from_row(row);
+        out.entry(chunk.memory_id).or_default().push(chunk);
+    }
+    Ok(out)
+}
+
+pub async fn recent_memory_chunks(
+    db: &Database,
+    project: Option<&str>,
+    limit: i64,
+) -> Result<Vec<MemoryChunk>> {
+    let rows = match project {
+        Some(p) => sqlx::query(
+            "SELECT id, chunk_id, project, memory_id, session_id, ordinal, density, kind, title,
+                        summary, source_hash, source_start, source_end, token_estimate, created_at
+                 FROM memory_chunks
+                 WHERE project = $1
+                 ORDER BY created_at DESC, memory_id DESC, ordinal ASC
+                 LIMIT $2",
+        )
+        .bind(p)
+        .bind(limit)
+        .fetch_all(&db.pool)
+        .await?,
+        None => sqlx::query(
+            "SELECT id, chunk_id, project, memory_id, session_id, ordinal, density, kind, title,
+                        summary, source_hash, source_start, source_end, token_estimate, created_at
+                 FROM memory_chunks
+                 ORDER BY created_at DESC, memory_id DESC, ordinal ASC
+                 LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&db.pool)
+        .await?,
+    };
+    Ok(rows.into_iter().map(memory_chunk_from_row).collect())
+}
+
 /// Kind for each of `ids`, in one query. Ids absent from `memory_meta` (legacy
 /// rows / no meta) are simply omitted — callers treat a missing id as a narrative
 /// (non-fact) default. Used by the retrieval narrative-reserve quota.
@@ -2413,6 +2735,7 @@ pub struct DbStats {
     pub total_memories: i64,
     pub total_observations: i64,
     pub total_memory_edges: i64,
+    pub total_memory_chunks: i64,
     /// Distinct CCR blobs stored.
     pub ccr_blobs: i64,
     /// Sum of original (uncompressed) bytes across distinct blobs.
@@ -2471,6 +2794,11 @@ pub async fn get_stats(db: &Database) -> Result<DbStats> {
         .await?;
     let memory_edges: i64 = r.get("cnt");
 
+    let r: sqlx::any::AnyRow = sqlx::query("SELECT COUNT(*) as cnt FROM memory_chunks")
+        .fetch_one(&db.pool)
+        .await?;
+    let memory_chunks: i64 = r.get("cnt");
+
     let r: sqlx::any::AnyRow = sqlx::query(
         "SELECT COUNT(*) AS cnt,
                 COALESCE(SUM(orig_len), 0) AS orig,
@@ -2486,6 +2814,7 @@ pub async fn get_stats(db: &Database) -> Result<DbStats> {
         total_memories: memories,
         total_observations: observations,
         total_memory_edges: memory_edges,
+        total_memory_chunks: memory_chunks,
         ccr_blobs: r.get("cnt"),
         ccr_orig_bytes: r.get("orig"),
         ccr_comp_bytes: r.get("comp"),
@@ -2843,6 +3172,7 @@ mod tests {
 
         // One dated memory, one undated, same project.
         let dated = insert_memory(&db, p, &s, "Caroline joined a support group", Some("t")).await?;
+        set_memory_scope_kind(&db, dated, "project", "fact").await?;
         set_memory_event_time(&db, dated, "2023-05-07").await?;
         let undated = insert_memory(&db, p, &s, "some other note", Some("t")).await?;
 
@@ -2864,6 +3194,15 @@ mod tests {
             .is_empty());
         // Project scoping: a different project sees nothing.
         assert!(memories_by_event_time(&db, Some("/tmp/other"), "2023", 10)
+            .await?
+            .is_empty());
+
+        let dated_rows = dated_memories(&db, Some(p), 10).await?;
+        assert_eq!(dated_rows.len(), 1);
+        assert_eq!(dated_rows[0].memory.id, dated);
+        assert_eq!(dated_rows[0].kind, "fact");
+        assert_eq!(dated_rows[0].event_time, "2023-05-07");
+        assert!(dated_memories(&db, Some("/tmp/other"), 10)
             .await?
             .is_empty());
 

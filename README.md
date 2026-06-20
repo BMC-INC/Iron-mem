@@ -47,14 +47,18 @@
 
 ## What's New in v0.4.0
 
-> Lossless, reversible memory — plus a real memory model: scoping, typed memories, an always-on user profile, and a correction miner.
+> IronMem is now a full durable memory stack: reversible originals, typed memories, temporal graph recall, procedural memory, adaptive skim/expand context, and 21 MCP tools.
 
-- **CCR — losslessly reversible memory** (Headroom pattern) — every truncated tool output and the verbatim pre-LLM session transcript is preserved in a content-addressed, deduplicated, byte-exact compressed blob store inside the DB. The new **`retrieve_original`** tool pulls the exact original back behind any compressed memory. No more lossy truncation.
-- **Memory scoping & typed memories** (Supermemory patterns) — memories carry a **scope** (`project` vs. `user`/cross-project) and a **kind** (`session`, `error_solution`, `preference`, `procedural`, `architecture`, `learned_pattern`, `project_config`, `profile`). Session-start injection ranks **project ∪ user** memories and boosts durable kinds.
-- **`remember` tool** — store an explicit, typed memory in one call (`scope`, `kind`, `text`, `tags`). User-scope facts follow you into every project.
-- **User profile** — your cross-project memories are distilled into a single always-injected profile (LLM summary, or a deterministic local rollup when offline). Read/regenerate with **`get_profile`** / **`refresh_profile`**.
+- **CCR — losslessly reversible memory** (Headroom pattern) — every truncated tool output and the verbatim pre-LLM session transcript is preserved in a content-addressed, deduplicated, byte-exact compressed blob store inside the DB. **`retrieve_original`** pulls the exact original back by `observation_id`, `memory_id`, raw blob `hash`, or the new `chunk_id` expansion handle.
+- **Memory scoping & typed memories** (Supermemory patterns) — memories carry a **scope** (`project` vs. `user`/cross-project) and a **kind** (`session`, `fact`, `error_solution`, `preference`, `procedural`, `architecture`, `learned_pattern`, `project_config`, `profile`). Session-start injection ranks **project ∪ user** memories and boosts durable kinds.
+- **Dual-output compression** — session compression writes both a narrative memory and separate searchable `kind=fact` memories, so dates, names, quantities, and direct answers survive summarization.
+- **Temporal recall + graph recall** — dated facts and `event_time` metadata power timestamp lookup, while `memory_edges` stores structured `source | relation | target` edges with valid-time filters and provenance. Temporal questions route toward date-bearing facts; relationship questions route toward graph edges.
+- **Adaptive working-memory skim** — every compressed or explicit memory gets durable `memory_chunks` with density (`high`, `medium`, `low`), kind, title, token estimate, and optional exact transcript offsets. Agents can skim broadly with **`memory_skim`**, then expand exact evidence with **`retrieve_original(chunk_id=...)`**.
+- **`remember` tool** — store an explicit, typed memory in one call (`scope`, `kind`, `text`, `tags`). User-scope facts follow you into every project and also enter the skim layer.
+- **User profile** — cross-project memories are distilled into a single always-injected profile (LLM summary, or deterministic local rollup when offline). Read/regenerate with **`get_profile`** / **`refresh_profile`**.
 - **Correction miner** — error→fix loops in a session (a failing command, edits, then the same command passing) are mined into `error_solution` memories and surfaced via **`list_corrections`**, so past fixes resurface when the work recurs.
-- **20 MCP tools** now — adds `retrieve_original`, `remember`, `get_profile`, `refresh_profile`, `list_corrections`, `memory_graph`, and `reconcile_memory_graph`.
+- **21 MCP tools** now — including `memory_skim`, `retrieve_original`, `remember`, `get_profile`, `refresh_profile`, `list_corrections`, `memory_graph`, and `reconcile_memory_graph`.
+- **Current verification:** `cargo test --bin ironmem -- --nocapture` passes **157 tests** with **1 ignored benchmark**, and `cargo clippy --bin ironmem -- -D warnings` is clean.
 - **Still zero telemetry. Still local-first. Your data stays yours.**
 
 <details>
@@ -139,12 +143,15 @@ With IronMem:
 - [The Fix](#the-fix)
 - [Who Should Use This?](#who-should-use-this)
 - [How It Works](#how-it-works)
+- [Current Memory Stack](#current-memory-stack)
 - [Install](#install)
 - [CLI](#cli)
 - [Multi-Provider Support](#multi-provider-support)
 - [MCP Setup](#mcp-setup)
+- [MCP Tools](#mcp-tools)
 - [Web UI](#web-ui)
 - [Configuration](#configuration)
+- [Testing Status](#testing-status)
 - [Troubleshooting](#troubleshooting)
 - [Architecture](#architecture)
 - [Why Rust?](#why-rust)
@@ -208,6 +215,32 @@ flowchart LR
 ```
 
 Everything runs locally. Your data stays on your machine.
+
+---
+
+## Current Memory Stack
+
+IronMem now stores memory in several cooperating layers rather than one flat summary:
+
+| Layer | What it stores | Why it matters |
+| ----- | -------------- | -------------- |
+| **Session transcript CCR** | Verbatim pre-LLM session transcripts and large/truncated tool outputs in content-addressed compressed blobs | Exact originals are recoverable; summaries are never the only copy |
+| **Narrative memories** | Concise session summaries in the `memories` FTS table | Fast project history and ordinary session recall |
+| **Typed facts** | Separate `kind=fact` memories extracted from compression | Direct answers, dates, names, quantities, and benchmark-style lookup survive summarization |
+| **Procedural memories** | Reusable workflow rules as `kind=procedural` | Future agents can recall “how we work” without mixing procedures into narrative memory |
+| **Error solutions** | Mined fail→edit→pass loops as `kind=error_solution` | Past fixes come back when the same failure pattern appears |
+| **User profile** | Global `scope=user`, `kind=profile` memory | Stable cross-project facts are always injected |
+| **Temporal graph** | `source | relation | target` edges with valid-time fields, confidence, and memory provenance | Relationship questions and Operator OS entity state can use graph traversal instead of only vector similarity |
+| **Adaptive skim chunks** | `memory_chunks` rows with `chunk_id`, density, kind, title, summary, token estimate, and optional exact transcript byte offsets | Agents can scan broad compressed history, then expand exact evidence on demand |
+
+Retrieval is routed by query shape:
+
+- **Temporal lookup queries** (`when`, `what date`, `which year`, `before`, `after`, etc.) prioritize date-bearing `kind=fact` memories and suppress graph-only hits that would otherwise promote relationship memories over timestamp answers.
+- **Relationship queries** keep graph fusion enabled and rank edges by relation/source/target overlap.
+- **General project recall** blends FTS, vectors when available, event-time boosts, graph signals, kind boosts, importance, and recency.
+- **Skim/expand workflows** use `memory_skim` or `/skim` first, then `retrieve_original` with a `chunk_id` for exact transcript evidence.
+
+This is intentionally model-agnostic. The durable store is hard-token, structured, and auditable, so Claude, Codex, Operator OS, desktop clients, and remote MCP clients can share the same backing memory.
 
 ---
 
@@ -313,11 +346,7 @@ IronMem supports two MCP transports:
 - **stdio** — for local clients that launch the server themselves (Claude Code, Claude Desktop, Cursor)
 - **Streamable HTTP** — for remote/cloud clients that connect over HTTP. Uses standard request/response and bearer-token auth, so it works through tunnels and reverse proxies for clients that support static bearer tokens.
 
-Once connected over MCP, IronMem now supports project discovery directly:
-
-- `list_projects` — show every project with stored memories
-- `search_global` — search across all projects
-- `list_sessions` — inspect session history inside a project
+Once connected over MCP, clients can record sessions, retrieve memories, inspect graph state, scan adaptive skims, and expand exact originals directly.
 
 ### Claude Code MCP Setup
 
@@ -458,6 +487,40 @@ For clients that support **Streamable HTTP**, start the server and point the cli
 ironmem serve
 ```
 
+## MCP Tools
+
+IronMem currently exposes **21 MCP tools**:
+
+| Tool | Purpose |
+| ---- | ------- |
+| `session_start` | Start a new project session and return a `session_id` |
+| `record_event` | Record a tool call observation |
+| `session_end` | End a session and trigger compression |
+| `compress_session` | Manually compress a session |
+| `get_context` | Retrieve project memories; results include expansion chunks with `chunk_id` handles |
+| `memory_skim` | Return project or global compressed skim chunks for broad working-memory scan |
+| `retrieve_original` | Expand exact original text by `chunk_id`, `observation_id`, `memory_id`, or blob `hash` |
+| `get_status` | Return DB stats, CCR stats, graph edge count, and memory chunk count |
+| `list_memories` | List recent memories for a project |
+| `search_memories` | Hybrid search inside one project |
+| `search_global` | Hybrid search across every project |
+| `list_projects` | List known projects with stored memories |
+| `list_sessions` | List session history for a project |
+| `inject_context` | Write `IRONMEM.md` into a project root |
+| `remember` | Store an explicit typed/scoped memory |
+| `get_profile` | Return the current cross-project user profile |
+| `refresh_profile` | Regenerate the user profile |
+| `list_corrections` | List mined `error_solution` memories |
+| `memory_graph` | Query temporal graph edges for an entity, with optional valid-time filtering |
+| `reconcile_memory_graph` | Dry-run or apply duplicate/current-state graph reconciliation |
+| `wipe_project` | Delete all memories for one project |
+
+The intended agent loop is:
+
+1. Call `get_context` for focused recall or `memory_skim` for a broader scan.
+2. Inspect returned `chunk_id` values.
+3. Call `retrieve_original` with the chosen `chunk_id` when exact evidence is needed.
+
 ### Neovim Plugin
 
 IronMem includes a native Neovim plugin that communicates via MCP stdio.
@@ -499,6 +562,26 @@ http://localhost:37778/ui
 
 The UI shows sessions, memories, and database stats. You can browse, search, and delete memories directly from the browser.
 
+### REST API
+
+The REST server runs on `http://localhost:37778` by default. Current high-signal endpoints:
+
+| Endpoint | Purpose |
+| -------- | ------- |
+| `POST /session/start` | Start a session |
+| `POST /event` | Record an observation |
+| `POST /session/end` | End and compress a session |
+| `POST /compress` | Manually compress a session |
+| `GET /context?project=&query=&limit=&rerank=` | Retrieve project memories plus expansion chunks |
+| `GET /skim?project=&limit=` | Return adaptive project skim chunks |
+| `GET /skim?global=true&limit=` | Return adaptive global skim chunks |
+| `POST /retrieve_original` | Expand by `chunk_id`, `observation_id`, `memory_id`, or `hash` |
+| `POST /remember` | Store an explicit typed/scoped memory |
+| `GET /profile` / `POST /refresh_profile` | Read or regenerate the user profile |
+| `GET /corrections` | List mined error-solution memories |
+| `GET /graph?entity=&project=&history=&at=&limit=` | Query temporal graph edges |
+| `GET /status` | Health, DB stats, CCR stats, graph edge count, and memory chunk count |
+
 ---
 
 ## Configuration
@@ -521,13 +604,23 @@ The UI shows sessions, memories, and database stats. You can browse, search, and
     "provider": "auto",
     "model": null,
     "ollama_url": "http://localhost:11434",
-    "weights": { "relevance": 0.5, "recency": 0.3, "importance": 0.2 },
+    "weights": {
+      "relevance": 0.5,
+      "recency": 0.3,
+      "importance": 0.2,
+      "kind_boosts": {}
+    },
     "recency_half_life_days": 30
+  },
+  "rerank": {
+    "enabled": false,
+    "model": "",
+    "pool": 20
   }
 }
 ```
 
-All fields optional. Sensible defaults provided. `auth_token` is generated automatically the first time you run `ironmem serve` without `--no-auth`. The `embedding` block is optional — omit it entirely and IronMem behaves exactly as before (keyword-only search, recency injection).
+All fields optional. Sensible defaults provided. `auth_token` is generated automatically the first time you run `ironmem serve` without `--no-auth`. The `embedding` block is optional — omit it entirely and IronMem behaves exactly as before (keyword-only search, recency injection). The `rerank` block is off by default because it makes one LLM call per reranked query.
 
 ### Semantic Search & Embeddings
 
@@ -559,6 +652,8 @@ cargo install --path . --features local-onnx
 ```
 
 **Blend weights** (`embedding.weights`) control session-start injection ranking: `relevance` (semantic match to your current git context), `recency` (true half-life decay set by `recency_half_life_days`), and `importance` (an LLM-assigned 1–10 score per memory). They need not sum to 1.
+
+**Reranking** (`rerank.enabled`) is optional and disabled by default. When enabled, IronMem pulls a wider candidate pool, asks the configured LLM to rerank compact snippets, then re-anchors results so strong base temporal answers are not lost. Per-request REST callers can override with `?rerank=true` or `?rerank=false`.
 
 **Backfill existing memories** — after enabling embeddings, index memories created before:
 
@@ -597,6 +692,26 @@ IronMem needs an LLM API key to compress session observations into memories.
 **Recommended (Anthropic):** write the key to `~/.ironmem/api_key` (`echo "your-key" > ~/.ironmem/api_key && chmod 600 ~/.ironmem/api_key`). Keeping it in this file rather than a global `ANTHROPIC_API_KEY` export avoids changing how other tools bill — Claude Code, for instance, charges pay-as-you-go API credit whenever `ANTHROPIC_API_KEY` is set in the environment, instead of using your subscription. IronMem reads the file automatically (it also works when the background server is spawned via `nohup`, where some shells strip env vars from child processes).
 
 IronMem still honors the per-provider environment variable if you prefer it — `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GOOGLE_API_KEY`. The file fallback applies to the default Anthropic provider.
+
+---
+
+## Testing Status
+
+Current local verification for this README state:
+
+```bash
+CARGO_TARGET_DIR=/tmp/ironmem-codex-target cargo test --bin ironmem -- --nocapture
+CARGO_TARGET_DIR=/tmp/ironmem-codex-target cargo clippy --bin ironmem -- -D warnings
+```
+
+Result:
+
+- **157 tests passed**
+- **1 benchmark intentionally ignored** (`bench_ccr_dict_vs_floor`)
+- **0 failed**
+- **Clippy clean with `-D warnings`**
+
+Coverage includes CCR round trips and corruption checks, UTF-8-safe truncation, typed/scoped memories, user profile regeneration, correction mining, semantic retrieval, temporal lookup routing, graph reconciliation, chunk skim/expand flows, MCP auth/tools, REST-facing behavior through shared handlers, vector backfill/purge, provider parsing, and the end-to-end semantic pipeline.
 
 ---
 
@@ -640,7 +755,7 @@ Check that `~/.claude/settings.json` has the hooks registered under the `"hooks"
 ```text
 ~/.ironmem/
 ├── bin/ironmem          # Single compiled binary
-├── mem.db               # SQLite DB: memories (FTS5) + vectors + CCR blob store
+├── mem.db               # SQLite DB: FTS memories, metadata, vectors, graph edges, chunks, CCR blobs
 ├── settings.json        # Configuration
 ├── api_key              # Anthropic API key (chmod 600; keeps it out of your shell env)
 ├── current_session      # Active session ID (ephemeral)
@@ -653,7 +768,7 @@ Check that `~/.claude/settings.json` has the hooks registered under the `"hooks"
 └── session-end.sh       # Cleanup
 ```
 
-**~9,000 lines of Rust.** MCP-native. SQLite or Postgres. Lossless, reversible memory. One binary. No external runtimes.
+**~14,000 lines of Rust.** MCP-native. SQLite or Postgres. Lossless, reversible memory. Temporal graph. Adaptive skim/expand chunks. One binary. No external runtimes.
 
 ---
 
@@ -754,12 +869,15 @@ This starts IronMem with Streamable HTTP on `http://localhost:37779/mcp` and Pos
 - [x] **Reliability & security hardening** — stdio MCP stream is no longer corrupted by log output, UTF-8-safe truncation prevents a crash on multibyte tool output, and 7 dependency advisories were patched
 - [x] **CCR — losslessly reversible memory** (Headroom pattern): a content-addressed, deduplicated blob store + byte-exact per-content-type compression (zstd + per-type dictionaries) + a `retrieve_original` tool, so the verbatim original behind any compressed memory is always recoverable — no more lossy truncation. Refcount GC (`ironmem gc`) + storage stats in `get_status`. [Design »](docs/superpowers/plans/2026-06-07-ironmem-ccr-supermemory.md)
 - [x] **Memory scoping & types** (Supermemory patterns): project vs. user (cross-project) scope, typed memories (`error_solution` / `preference` / `procedural` / `architecture` / `learned_pattern` / …), scope-aware injection with per-kind boosts, and a `remember` tool
+- [x] **Dual-output compression** — every compressed session can persist a narrative memory plus separate `kind=fact` memories; facts inherit event-time metadata when available and are indexed for direct retrieval.
 - [x] **Always-injected user profile** — cross-project facts distilled into one profile memory (LLM summary or deterministic local rollup); `get_profile` / `refresh_profile`
 - [x] **Correction miner** — error→fix loops become `error_solution` memories, surfaced via `list_corrections`
 - [x] **Temporal graph lite** — compression now extracts structured `source | relation | target` edges with dates, confidence, memory provenance, and reconciliation. Exact duplicates and superseded current-state edges are marked in history rather than deleted. Query with `ironmem graph`, REST `/graph`, or MCP `memory_graph`; active edges also feed hybrid search as a relation-ranked retrieval signal.
 - [x] **Graph operations** — `ironmem reconcile` / MCP `reconcile_memory_graph` repair legacy duplicate/current-state edges with dry-run counts, and `ironmem graph-backfill` extracts graph relations for older memories without mutating summaries.
-- [x] **Temporal and procedural recall** — graph queries support valid-time filters (`--at`, `at_time`, REST `at`), compression validates dates, and reusable workflow rules are extracted/stored as `kind=procedural` memories.
+- [x] **Temporal and procedural recall** — graph queries support valid-time filters (`--at`, `at_time`, REST `at`), compression validates dates, reusable workflow rules are extracted/stored as `kind=procedural`, and temporal lookup queries route toward date-bearing facts instead of graph-only relationship hits.
+- [x] **Adaptive working-memory skim** — `memory_chunks` store model-agnostic compressed chunk maps with density, kind, title, token estimate, source offsets, and `chunk_id` expansion handles. Use MCP `memory_skim`, REST `/skim`, or `get_context` expansions, then expand exact evidence with `retrieve_original`.
 - [x] **Operator OS adapter + eval harness** — `docs/operator-os-memory-adapter.md` defines tenant/worker/work-item memory mapping, and `ironmem eval` writes repeatable graph/temporal/procedural eval reports with command, model, and commit metadata.
+- [x] **Current verification** — 157 Rust tests pass, 1 benchmark is intentionally ignored, and clippy is clean with `-D warnings`.
 
 ### Next
 

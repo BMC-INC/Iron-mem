@@ -43,6 +43,7 @@ pub fn router(state: AppState) -> Router {
         .route("/event", post(record_event))
         .route("/compress", post(compress_session))
         .route("/context", get(get_context))
+        .route("/skim", get(get_skim))
         .route("/status", get(get_status))
         .route("/retrieve_original", post(retrieve_original))
         .route("/remember", post(remember))
@@ -184,56 +185,42 @@ pub struct RetrieveOriginalRequest {
     pub observation_id: Option<i64>,
     pub memory_id: Option<i64>,
     pub hash: Option<String>,
+    pub chunk_id: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct RetrieveOriginalResponse {
-    pub hash: String,
+    pub hash: Option<String>,
     pub bytes: usize,
     pub original: String,
+    pub chunk_id: Option<String>,
+    pub memory_id: Option<i64>,
+    pub source_start: Option<i64>,
+    pub source_end: Option<i64>,
 }
 
 async fn retrieve_original(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RetrieveOriginalRequest>,
 ) -> Result<Json<RetrieveOriginalResponse>, (StatusCode, String)> {
-    let hash = if let Some(h) = body.hash {
-        h
-    } else if let Some(oid) = body.observation_id {
-        db::get_observation_output_blob(&state.db, oid)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    format!("observation {oid} has no stored original"),
-                )
-            })?
-    } else if let Some(mid) = body.memory_id {
-        db::get_memory_session_blob(&state.db, mid)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    format!("memory {mid} has no stored session transcript"),
-                )
-            })?
-    } else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "provide 'observation_id', 'memory_id', or 'hash'".to_string(),
-        ));
-    };
-
-    let bytes = crate::ccr::load_blob(&state.db, &hash)
-        .await
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let expanded = crate::expansion::retrieve_original(
+        &state.db,
+        body.observation_id,
+        body.memory_id,
+        body.hash.as_deref(),
+        body.chunk_id.as_deref(),
+    )
+    .await
+    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     Ok(Json(RetrieveOriginalResponse {
-        hash,
-        bytes: bytes.len(),
-        original: String::from_utf8_lossy(&bytes).into_owned(),
+        hash: expanded.hash,
+        bytes: expanded.bytes,
+        original: expanded.original,
+        chunk_id: expanded.chunk_id,
+        memory_id: expanded.memory_id,
+        source_start: expanded.source_start,
+        source_end: expanded.source_end,
     }))
 }
 
@@ -461,6 +448,13 @@ fn truthy(v: &Option<String>) -> Option<bool> {
 #[derive(Serialize)]
 pub struct ContextResponse {
     pub memories: Vec<db::Memory>,
+    pub expansions: Vec<ContextExpansion>,
+}
+
+#[derive(Serialize)]
+pub struct ContextExpansion {
+    pub memory_id: i64,
+    pub chunks: Vec<db::MemoryChunk>,
 }
 
 async fn get_context(
@@ -496,7 +490,51 @@ async fn get_context(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
 
-    Ok(Json(ContextResponse { memories }))
+    let memory_ids: Vec<i64> = memories.iter().map(|m| m.id).collect();
+    let chunks = db::chunks_for_memories(&state.db, &memory_ids)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let expansions = memory_ids
+        .into_iter()
+        .map(|memory_id| ContextExpansion {
+            memory_id,
+            chunks: chunks.get(&memory_id).cloned().unwrap_or_default(),
+        })
+        .collect();
+
+    Ok(Json(ContextResponse {
+        memories,
+        expansions,
+    }))
+}
+
+// GET /skim?project=&limit=&global=
+#[derive(Deserialize)]
+pub struct SkimQuery {
+    pub project: Option<String>,
+    pub limit: Option<i64>,
+    pub global: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SkimResponse {
+    pub chunks: Vec<db::MemoryChunk>,
+}
+
+async fn get_skim(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SkimQuery>,
+) -> Result<Json<SkimResponse>, (StatusCode, String)> {
+    let limit = params.limit.unwrap_or(state.config.inject_limit as i64 * 3);
+    let project = if truthy(&params.global).unwrap_or(false) {
+        None
+    } else {
+        params.project.as_deref()
+    };
+    let chunks = db::recent_memory_chunks(&state.db, project, limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(SkimResponse { chunks }))
 }
 
 // GET /status
@@ -507,6 +545,7 @@ pub struct StatusResponse {
     pub memories: i64,
     pub observations: i64,
     pub memory_edges: i64,
+    pub memory_chunks: i64,
     pub db_path: String,
     pub ccr: serde_json::Value,
 }
@@ -524,6 +563,7 @@ async fn get_status(
         memories: stats.total_memories,
         observations: stats.total_observations,
         memory_edges: stats.total_memory_edges,
+        memory_chunks: stats.total_memory_chunks,
         db_path: state.config.db_path.clone(),
         ccr: stats.ccr_json(),
     }))

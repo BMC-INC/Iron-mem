@@ -28,6 +28,7 @@ const FUSE_ENTITY_SIGNAL: bool = false;
 /// ranked by relation/source/target relevance before their memory ids enter RRF.
 const MAX_GRAPH_ENTITIES: usize = 8;
 const GRAPH_EDGES_PER_ENTITY: usize = 12;
+const TEMPORAL_EVENT_POOL: usize = 512;
 
 /// Fuse several ranked id-lists into one ordering by Σ 1/(k + rank).
 /// `rank` is 0-indexed (top of a list contributes the most). Ties keep
@@ -157,7 +158,7 @@ fn query_graph_entities(query: &str) -> Vec<String> {
 fn graph_terms(text: &str) -> HashSet<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|t| t.chars().count() >= 3)
-        .map(|t| t.to_lowercase())
+        .map(normalize_event_token)
         .collect()
 }
 
@@ -260,6 +261,144 @@ fn is_temporal_lookup_query(query: &str) -> bool {
         || q.contains(" following ")
 }
 
+fn is_temporal_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "when"
+            | "what"
+            | "which"
+            | "where"
+            | "who"
+            | "whom"
+            | "whose"
+            | "why"
+            | "how"
+            | "did"
+            | "does"
+            | "do"
+            | "was"
+            | "were"
+            | "is"
+            | "are"
+            | "has"
+            | "have"
+            | "had"
+            | "the"
+            | "this"
+            | "that"
+            | "with"
+            | "from"
+            | "into"
+            | "onto"
+            | "about"
+            | "date"
+            | "day"
+            | "time"
+            | "year"
+            | "month"
+            | "week"
+            | "weeks"
+            | "days"
+            | "months"
+            | "years"
+            | "long"
+            | "many"
+            | "before"
+            | "after"
+            | "prior"
+            | "following"
+            | "happen"
+            | "happened"
+            | "first"
+            | "last"
+            | "latest"
+            | "recent"
+            | "more"
+            | "most"
+    )
+}
+
+fn normalize_event_token(token: &str) -> String {
+    let mut t = token.to_ascii_lowercase();
+    for suffix in ["'s", "ing", "edly", "ed", "es", "s"] {
+        if t.len() > suffix.len() + 3 && t.ends_with(suffix) {
+            t.truncate(t.len() - suffix.len());
+            break;
+        }
+    }
+    t
+}
+
+fn temporal_event_terms(query: &str) -> HashSet<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|t| t.chars().count() >= 3)
+        .map(normalize_event_token)
+        .filter(|t| !is_temporal_stopword(t))
+        .collect()
+}
+
+fn event_text_terms(memory: &Memory) -> HashSet<String> {
+    let mut text = memory.summary.clone();
+    if let Some(tags) = &memory.tags {
+        text.push(' ');
+        text.push_str(tags);
+    }
+    graph_terms(&text)
+}
+
+async fn temporal_event_ids_for_query(
+    db: &Database,
+    project: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<i64>> {
+    let query_terms = temporal_event_terms(query);
+    if query_terms.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut scored = Vec::new();
+    for candidate in db::dated_memories(db, project, TEMPORAL_EVENT_POOL.max(limit)).await? {
+        let text_terms = event_text_terms(&candidate.memory);
+        let overlap = query_terms
+            .iter()
+            .filter(|term| text_terms.contains(*term))
+            .count();
+        if overlap == 0 {
+            continue;
+        }
+
+        let kind_bonus = if candidate.kind == "fact" { 4.0 } else { 1.0 };
+        let date_specificity_bonus = if candidate
+            .event_time
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .count()
+            >= 8
+        {
+            1.0
+        } else {
+            0.0
+        };
+        let specificity = overlap as f64 / query_terms.len().max(1) as f64;
+        let score = overlap as f64 * 10.0 + specificity * 3.0 + kind_bonus + date_specificity_bonus;
+        scored.push((candidate.memory.id, score, candidate.memory.created_at));
+    }
+
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    Ok(scored
+        .into_iter()
+        .take(limit)
+        .map(|(id, _, _)| id)
+        .collect())
+}
+
 /// Hybrid search: fuse keyword (FTS), semantic (vector), temporal (event_time),
 /// temporal graph, and entity (proper-noun index) signals via RRF. With none of
 /// the auxiliary signals present this returns the exact FTS ordering,
@@ -322,6 +461,16 @@ pub async fn hybrid_search(
         }
     };
 
+    // Temporal lookup side: most LoCoMo temporal questions ask for the date of
+    // an event ("when did X happen?") and do not name the answer year. Rank
+    // date-bearing event/fact memories by event-term overlap so old exact facts
+    // can beat newer broad memories that only share the same person/topic.
+    let temporal_event_ids = if is_temporal_lookup_query(query) {
+        temporal_event_ids_for_query(db, project, query, pool).await?
+    } else {
+        Vec::new()
+    };
+
     // Entity signal (see FUSE_ENTITY_SIGNAL): off by default — its recency-ordered
     // matches demote older-but-exact facts in person-centric data. FTS + vector
     // already cover the named person.
@@ -373,9 +522,17 @@ pub async fn hybrid_search(
         aux.push(entity_ids);
     }
     let candidates: Vec<i64> = if aux.is_empty() {
-        fts_ids
+        if temporal_event_ids.is_empty() {
+            fts_ids
+        } else {
+            rrf_fuse(&[temporal_event_ids, fts_ids], RRF_K)
+        }
     } else {
-        let mut lists: Vec<Vec<i64>> = Vec::with_capacity(aux.len() + 1);
+        let mut lists: Vec<Vec<i64>> =
+            Vec::with_capacity(aux.len() + 1 + usize::from(!temporal_event_ids.is_empty()));
+        if !temporal_event_ids.is_empty() {
+            lists.push(temporal_event_ids);
+        }
         lists.push(fts_ids);
         lists.append(&mut aux);
         rrf_fuse(&lists, RRF_K)
@@ -936,6 +1093,74 @@ mod tests {
         ] {
             assert!(!is_temporal_lookup_query(q), "{q}");
         }
+    }
+
+    #[test]
+    fn temporal_event_terms_drop_question_words_and_normalize_events() {
+        let terms = temporal_event_terms("When did Dave start his car maintenance shop?");
+        assert!(terms.contains("dave"));
+        assert!(terms.contains("start"));
+        assert!(terms.contains("car"));
+        assert!(terms.contains("maintenance"));
+        assert!(terms.contains("shop"));
+        assert!(!terms.contains("when"));
+        assert!(!terms.contains("did"));
+    }
+
+    #[tokio::test]
+    async fn temporal_lookup_prefers_dated_event_fact_over_newer_broad_match() {
+        let (db, path) = seeded_db().await;
+        let s = create_session(&db, "/tmp/p").await.unwrap();
+        let dated = insert_memory(
+            &db,
+            "/tmp/p",
+            &s,
+            "Dave started his car maintenance shop on May 1, 2023",
+            Some("car maintenance shop"),
+        )
+        .await
+        .unwrap();
+        db::set_memory_scope_kind(&db, dated, "project", "fact")
+            .await
+            .unwrap();
+        db::set_memory_event_time(&db, dated, "2023-05-01")
+            .await
+            .unwrap();
+
+        let broad = insert_memory(
+            &db,
+            "/tmp/p",
+            &s,
+            "Dave recently discussed car maintenance and shop planning",
+            Some("car maintenance shop"),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE memories SET created_at = $1 WHERE rowid = $2")
+            .bind(9_999_999_i64)
+            .bind(broad)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE memories SET created_at = $1 WHERE rowid = $2")
+            .bind(1_i64)
+            .bind(dated)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let res = hybrid_search(
+            &db,
+            None,
+            &crate::vectorstore::BruteForceStore,
+            Some("/tmp/p"),
+            "When did Dave start his car maintenance shop?",
+            5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.first().map(|m| m.id), Some(dated), "{res:?}");
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

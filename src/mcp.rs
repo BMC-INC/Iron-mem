@@ -123,7 +123,7 @@ impl IronMemServer {
             ),
             Tool::new(
                 "get_context",
-                "Retrieve memories for a project. Optionally search with a query.",
+                "Retrieve memories for a project. Optionally search with a query. Results include expansion chunks with chunk_id handles for retrieve_original.",
                 schema(serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -132,6 +132,18 @@ impl IronMemServer {
                         "query": { "type": "string", "description": "Search query (optional)" }
                     },
                     "required": ["project"]
+                })),
+            ),
+            Tool::new(
+                "memory_skim",
+                "Return the compressed working-memory skim chunks for one project or globally. Use chunk_id with retrieve_original to expand exact evidence on demand.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project": { "type": "string", "description": "Project root path. Omit when global=true." },
+                        "limit": { "type": "integer", "description": "Max chunks (default 15)" },
+                        "global": { "type": "boolean", "description": "When true, skim across all projects." }
+                    }
                 })),
             ),
             Tool::new(
@@ -144,13 +156,14 @@ impl IronMemServer {
             ),
             Tool::new(
                 "retrieve_original",
-                "Retrieve the verbatim original behind a compressed/truncated memory. Provide observation_id (full tool output), memory_id (full pre-LLM session transcript), or a blob hash.",
+                "Retrieve the verbatim original behind a compressed/truncated memory. Provide chunk_id (preferred expansion handle), observation_id, memory_id, or a blob hash.",
                 schema(serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "chunk_id": { "type": "string", "description": "Chunk id returned by get_context or memory_skim; expands exact source span when available" },
                         "observation_id": { "type": "integer", "description": "Observation id whose full original output to retrieve" },
                         "memory_id": { "type": "integer", "description": "Memory id whose verbatim pre-LLM session transcript to retrieve" },
-                        "hash": { "type": "string", "description": "Blob content hash (alternative to observation_id / memory_id)" }
+                        "hash": { "type": "string", "description": "Blob content hash (alternative to chunk_id / observation_id / memory_id)" }
                     }
                 })),
             ),
@@ -414,48 +427,20 @@ impl IronMemServer {
         &self,
         args: &JsonObject,
     ) -> Result<CallToolResult, ErrorData> {
-        // Resolve the blob hash from an explicit `hash`, or via `observation_id`.
-        let hash = if let Some(h) = args.get("hash").and_then(|v| v.as_str()) {
-            h.to_string()
-        } else if let Some(oid) = args.get("observation_id").and_then(|v| v.as_i64()) {
-            match db::get_observation_output_blob(&self.db, oid)
-                .await
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
-            {
-                Some(h) => h,
-                None => {
-                    return Ok(error_result(format!(
-                        "observation {oid} has no stored original (output fit under the preview cap, or the id is unknown)"
-                    )))
+        match crate::expansion::retrieve_original(
+            &self.db,
+            args.get("observation_id").and_then(|v| v.as_i64()),
+            args.get("memory_id").and_then(|v| v.as_i64()),
+            args.get("hash").and_then(|v| v.as_str()),
+            args.get("chunk_id").and_then(|v| v.as_str()),
+        )
+        .await
+        {
+            Ok(expanded) => {
+                let mut json = serde_json::to_value(expanded).unwrap();
+                if let Some(obj) = json.as_object_mut() {
+                    obj.insert("ok".to_string(), serde_json::json!(true));
                 }
-            }
-        } else if let Some(mid) = args.get("memory_id").and_then(|v| v.as_i64()) {
-            match db::get_memory_session_blob(&self.db, mid)
-                .await
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
-            {
-                Some(h) => h,
-                None => {
-                    return Ok(error_result(format!(
-                        "memory {mid} has no stored session transcript"
-                    )))
-                }
-            }
-        } else {
-            return Err(ErrorData::invalid_params(
-                "provide 'observation_id', 'memory_id', or 'hash'",
-                None,
-            ));
-        };
-
-        match crate::ccr::load_blob(&self.db, &hash).await {
-            Ok(bytes) => {
-                let json = serde_json::json!({
-                    "ok": true,
-                    "hash": hash,
-                    "bytes": bytes.len(),
-                    "original": String::from_utf8_lossy(&bytes),
-                });
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&json).unwrap(),
                 )]))
@@ -506,7 +491,41 @@ impl IronMemServer {
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
         };
 
-        let json = serde_json::json!({ "memories": memories });
+        let memory_ids: Vec<i64> = memories.iter().map(|m| m.id).collect();
+        let chunks = db::chunks_for_memories(&self.db, &memory_ids)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let expansions: Vec<_> = memory_ids
+            .into_iter()
+            .map(|memory_id| {
+                serde_json::json!({
+                    "memory_id": memory_id,
+                    "chunks": chunks.get(&memory_id).cloned().unwrap_or_default(),
+                })
+            })
+            .collect();
+
+        let json = serde_json::json!({ "memories": memories, "expansions": expansions });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json).unwrap(),
+        )]))
+    }
+
+    async fn handle_memory_skim(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
+        let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(15);
+        let global = args
+            .get("global")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let project = if global {
+            None
+        } else {
+            args.get("project").and_then(|v| v.as_str())
+        };
+        let chunks = db::recent_memory_chunks(&self.db, project, limit)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::json!({ "chunks": chunks });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -523,6 +542,7 @@ impl IronMemServer {
             "memories": stats.total_memories,
             "observations": stats.total_observations,
             "memory_edges": stats.total_memory_edges,
+            "memory_chunks": stats.total_memory_chunks,
             "db_path": self.config.db_path,
             "ccr": stats.ccr_json(),
         });
@@ -921,6 +941,7 @@ impl ServerHandler for IronMemServer {
             "record_event" => self.handle_record_event(&args).await,
             "compress_session" => self.handle_compress_session(&args).await,
             "get_context" => self.handle_get_context(&args).await,
+            "memory_skim" => self.handle_memory_skim(&args).await,
             "get_status" => self.handle_get_status().await,
             "retrieve_original" => self.handle_retrieve_original(&args).await,
             "list_memories" => self.handle_list_memories(&args).await,
@@ -1121,7 +1142,21 @@ mod tests {
             props.get("observation_id").is_some(),
             "schema has observation_id"
         );
+        assert!(props.get("chunk_id").is_some(), "schema has chunk_id");
         assert!(props.get("hash").is_some(), "schema has hash");
+    }
+
+    #[test]
+    fn tool_list_includes_memory_skim() {
+        let tools = IronMemServer::build_tool_list();
+        let t = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "memory_skim")
+            .expect("memory_skim tool registered");
+        let v = serde_json::to_value(t).unwrap();
+        let props = &v["inputSchema"]["properties"];
+        assert!(props.get("project").is_some(), "schema has project");
+        assert!(props.get("global").is_some(), "schema has global");
     }
 
     #[tokio::test]
@@ -1335,6 +1370,110 @@ mod tests {
         assert_eq!(
             v["original"].as_str().unwrap(),
             "verbatim bytes addressed by hash"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn retrieve_original_by_chunk_id_returns_exact_span() {
+        let (server, path) = test_server().await;
+        let s = db::create_session(&server.db, "/tmp/p").await.unwrap();
+        let mem_id = db::insert_memory(&server.db, "/tmp/p", &s, "summary", Some("t"))
+            .await
+            .unwrap();
+        let transcript = "alpha\nbravo\ncharlie\n";
+        let r = crate::ccr::store_blob(&server.db, transcript.as_bytes(), None)
+            .await
+            .unwrap();
+        db::replace_memory_chunks(
+            &server.db,
+            mem_id,
+            &[db::NewMemoryChunk {
+                chunk_id: format!("mem:{mem_id}:obs:1"),
+                project: "/tmp/p".to_string(),
+                memory_id: mem_id,
+                session_id: s,
+                ordinal: 0,
+                density: "high".to_string(),
+                kind: "session".to_string(),
+                title: "Observation".to_string(),
+                summary: "bravo chunk".to_string(),
+                source_hash: Some(r.hash),
+                source_start: Some(6),
+                source_end: Some(12),
+                token_estimate: 2,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let mut args = JsonObject::new();
+        args.insert(
+            "chunk_id".into(),
+            serde_json::json!(format!("mem:{mem_id}:obs:1")),
+        );
+        let result = server.handle_retrieve_original(&args).await.unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["original"].as_str().unwrap(), "bravo\n");
+        assert_eq!(v["memory_id"].as_i64(), Some(mem_id));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn context_and_memory_skim_return_expansion_chunks() {
+        let (server, path) = test_server().await;
+        let s = db::create_session(&server.db, "/tmp/p").await.unwrap();
+        let mem_id = db::insert_memory(&server.db, "/tmp/p", &s, "alpha summary", Some("t"))
+            .await
+            .unwrap();
+        db::replace_memory_chunks(
+            &server.db,
+            mem_id,
+            &[db::NewMemoryChunk {
+                chunk_id: format!("mem:{mem_id}:overview"),
+                project: "/tmp/p".to_string(),
+                memory_id: mem_id,
+                session_id: s,
+                ordinal: 0,
+                density: "medium".to_string(),
+                kind: "session".to_string(),
+                title: "Memory overview".to_string(),
+                summary: "alpha summary".to_string(),
+                source_hash: None,
+                source_start: None,
+                source_end: None,
+                token_estimate: 3,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let mut context_args = JsonObject::new();
+        context_args.insert("project".into(), serde_json::json!("/tmp/p"));
+        let context: serde_json::Value = serde_json::from_str(&result_text(
+            &server.handle_get_context(&context_args).await.unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            context["expansions"][0]["chunks"][0]["chunk_id"]
+                .as_str()
+                .unwrap(),
+            format!("mem:{mem_id}:overview")
+        );
+
+        let mut skim_args = JsonObject::new();
+        skim_args.insert("project".into(), serde_json::json!("/tmp/p"));
+        let skim: serde_json::Value = serde_json::from_str(&result_text(
+            &server.handle_memory_skim(&skim_args).await.unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            skim["chunks"][0]["chunk_id"].as_str().unwrap(),
+            format!("mem:{mem_id}:overview")
         );
 
         let _ = std::fs::remove_file(path);

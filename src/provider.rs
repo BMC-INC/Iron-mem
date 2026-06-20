@@ -34,7 +34,7 @@ impl Provider {
 
 // ── Compression result ──────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompressionResult {
     pub summary: String,
     pub tags: String,

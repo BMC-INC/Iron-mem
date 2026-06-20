@@ -332,6 +332,7 @@ pub async fn purge_memory(db: &Database, store: &dyn VectorStore, memory_id: i64
     db::delete_memory_meta(db, memory_id).await?;
     db::delete_memory_entities(db, memory_id).await?;
     db::delete_memory_edges(db, memory_id).await?;
+    db::delete_memory_chunks(db, memory_id).await?;
     Ok(())
 }
 

@@ -9,6 +9,7 @@ mod e2e;
 mod embedder;
 mod embedding_codec;
 mod eval;
+mod expansion;
 mod hooks;
 mod mcp;
 mod profile;
