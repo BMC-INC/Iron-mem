@@ -49,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/profile", get(get_profile))
         .route("/refresh_profile", post(refresh_profile))
         .route("/corrections", get(list_corrections))
+        .route("/graph", get(memory_graph))
         // Web UI routes
         .route("/ui", get(web_ui))
         .route("/api/projects", get(api_list_projects))
@@ -258,7 +259,10 @@ async fn remember(
     Json(body): Json<RememberRequest>,
 ) -> Result<Json<RememberResponse>, (StatusCode, String)> {
     if body.text.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "'text' must not be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "'text' must not be empty".to_string(),
+        ));
     }
     let scope = body.scope.as_deref().unwrap_or("project");
     let kind = body.kind.as_deref().unwrap_or("preference");
@@ -341,11 +345,61 @@ async fn list_corrections(
     Query(params): Query<CorrectionsQuery>,
 ) -> Result<Json<CorrectionsResponse>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(10);
-    let corrections =
-        db::get_memories_by_kind(&state.db, params.project.as_deref(), "error_solution", limit)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let corrections = db::get_memories_by_kind(
+        &state.db,
+        params.project.as_deref(),
+        "error_solution",
+        limit,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(CorrectionsResponse { corrections }))
+}
+
+// GET /graph?entity=&project=&history=&limit=  (temporal memory graph)
+#[derive(Deserialize)]
+pub struct GraphQuery {
+    pub entity: String,
+    pub project: Option<String>,
+    pub history: Option<bool>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct GraphResponse {
+    pub entity: String,
+    pub project: Option<String>,
+    pub include_superseded: bool,
+    pub edges: Vec<db::MemoryEdge>,
+}
+
+async fn memory_graph(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<GraphQuery>,
+) -> Result<Json<GraphResponse>, (StatusCode, String)> {
+    if params.entity.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "'entity' must not be empty".to_string(),
+        ));
+    }
+    let include_superseded = params.history.unwrap_or(false);
+    let edges = db::memory_edges_for_entity(
+        &state.db,
+        params.project.as_deref(),
+        &params.entity,
+        include_superseded,
+        params.limit.unwrap_or(20).max(1),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(GraphResponse {
+        entity: params.entity,
+        project: params.project,
+        include_superseded,
+        edges,
+    }))
 }
 
 // POST /compress  (manual trigger)
@@ -440,6 +494,7 @@ pub struct StatusResponse {
     pub sessions: i64,
     pub memories: i64,
     pub observations: i64,
+    pub memory_edges: i64,
     pub db_path: String,
     pub ccr: serde_json::Value,
 }
@@ -456,6 +511,7 @@ async fn get_status(
         sessions: stats.total_sessions,
         memories: stats.total_memories,
         observations: stats.total_observations,
+        memory_edges: stats.total_memory_edges,
         db_path: state.config.db_path.clone(),
         ccr: stats.ccr_json(),
     }))

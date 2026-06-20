@@ -53,6 +53,35 @@ pub struct ProjectSummary {
     pub last_activity: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct NewMemoryEdge {
+    pub project: String,
+    pub memory_id: i64,
+    pub source: String,
+    pub relation: String,
+    pub target: String,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct MemoryEdge {
+    pub id: i64,
+    pub project: String,
+    pub memory_id: i64,
+    pub source: String,
+    pub relation: String,
+    pub target: String,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub observed_at: i64,
+    pub confidence: f64,
+    pub superseded_by: Option<i64>,
+    pub superseded_reason: Option<String>,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SessionHistoryEntry {
     pub id: String,
@@ -355,6 +384,75 @@ impl Database {
         .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Temporal graph lite: structured edges derived from memories/facts.
+        // Edges are append-only provenance records; reconciliation marks stale
+        // rows via superseded_by / superseded_reason instead of deleting history.
+        match self.backend {
+            Backend::Sqlite => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS memory_edges (
+                        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                        project            TEXT NOT NULL,
+                        memory_id          BIGINT NOT NULL,
+                        source             TEXT NOT NULL,
+                        source_norm        TEXT NOT NULL,
+                        relation           TEXT NOT NULL,
+                        relation_norm      TEXT NOT NULL,
+                        target             TEXT NOT NULL,
+                        target_norm        TEXT NOT NULL,
+                        valid_from         TEXT,
+                        valid_until        TEXT,
+                        observed_at        BIGINT NOT NULL,
+                        confidence         REAL NOT NULL DEFAULT 0.5,
+                        superseded_by      BIGINT,
+                        superseded_reason  TEXT,
+                        created_at         BIGINT NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+            Backend::Postgres => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS memory_edges (
+                        id                 BIGSERIAL PRIMARY KEY,
+                        project            TEXT NOT NULL,
+                        memory_id          BIGINT NOT NULL,
+                        source             TEXT NOT NULL,
+                        source_norm        TEXT NOT NULL,
+                        relation           TEXT NOT NULL,
+                        relation_norm      TEXT NOT NULL,
+                        target             TEXT NOT NULL,
+                        target_norm        TEXT NOT NULL,
+                        valid_from         TEXT,
+                        valid_until        TEXT,
+                        observed_at        BIGINT NOT NULL,
+                        confidence         DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+                        superseded_by      BIGINT,
+                        superseded_reason  TEXT,
+                        created_at         BIGINT NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memory_edges_source ON memory_edges(project, source_norm, relation_norm)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memory_edges_target ON memory_edges(project, target_norm)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memory_edges_memory ON memory_edges(memory_id)",
         )
         .execute(&self.pool)
         .await?;
@@ -1005,7 +1103,11 @@ pub async fn upsert_memory_meta(db: &Database, memory_id: i64, importance: f64) 
 
 /// Insert a default importance row only if none exists. Never overwrites an
 /// importance already recorded by compression (used during embedding backfill).
-pub async fn ensure_memory_meta(db: &Database, memory_id: i64, default_importance: f64) -> Result<()> {
+pub async fn ensure_memory_meta(
+    db: &Database,
+    memory_id: i64,
+    default_importance: f64,
+) -> Result<()> {
     let now = Utc::now().timestamp();
     sqlx::query(
         "INSERT INTO memory_meta(memory_id, importance, created_at)
@@ -1103,11 +1205,12 @@ impl Default for MemoryMetaInfo {
 /// Read a memory's importance + scope + kind in one query. Missing rows / null
 /// columns fall back to the defaults in [`MemoryMetaInfo::default`].
 pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<MemoryMetaInfo> {
-    let row: Option<sqlx::any::AnyRow> =
-        sqlx::query("SELECT importance, scope, kind, event_time FROM memory_meta WHERE memory_id = $1")
-            .bind(memory_id)
-            .fetch_optional(&db.pool)
-            .await?;
+    let row: Option<sqlx::any::AnyRow> = sqlx::query(
+        "SELECT importance, scope, kind, event_time FROM memory_meta WHERE memory_id = $1",
+    )
+    .bind(memory_id)
+    .fetch_optional(&db.pool)
+    .await?;
     Ok(match row {
         Some(r) => MemoryMetaInfo {
             importance: r.try_get::<f64, _>("importance").unwrap_or(0.5),
@@ -1282,6 +1385,263 @@ pub async fn memories_for_entity(
         }
     };
     Ok(rows.into_iter().map(|r| r.get::<i64, _>("id")).collect())
+}
+
+fn normalize_graph_text(value: &str) -> String {
+    value
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_relation(value: &str) -> String {
+    normalize_graph_text(value).replace(' ', "_")
+}
+
+fn is_current_state_relation(relation_norm: &str) -> bool {
+    relation_norm.starts_with("current_")
+        || matches!(
+            relation_norm,
+            "is" | "status"
+                | "state"
+                | "role"
+                | "location"
+                | "works_at"
+                | "lives_at"
+                | "assigned_to"
+                | "owner"
+                | "primary"
+        )
+}
+
+fn memory_edge_from_row(r: sqlx::any::AnyRow) -> MemoryEdge {
+    MemoryEdge {
+        id: r.get("id"),
+        project: r.get("project"),
+        memory_id: r.get("memory_id"),
+        source: r.get("source"),
+        relation: r.get("relation"),
+        target: r.get("target"),
+        valid_from: r.try_get("valid_from").ok().flatten(),
+        valid_until: r.try_get("valid_until").ok().flatten(),
+        observed_at: r.get("observed_at"),
+        confidence: r.try_get::<f64, _>("confidence").unwrap_or(0.5),
+        superseded_by: r.try_get("superseded_by").ok().flatten(),
+        superseded_reason: r.try_get("superseded_reason").ok().flatten(),
+        created_at: r.get("created_at"),
+    }
+}
+
+/// Insert a temporal graph edge derived from a memory/fact and reconcile older
+/// active edges in-place. Reconciliation never deletes history:
+/// - exact older duplicates are marked `duplicate`;
+/// - older active current-state edges for the same source+relation but a
+///   different target are marked `current_state_update` and closed with
+///   `valid_until`.
+pub async fn insert_memory_edge(db: &Database, edge: &NewMemoryEdge) -> Result<i64> {
+    let source_norm = normalize_graph_text(&edge.source);
+    let relation_norm = normalize_relation(&edge.relation);
+    let target_norm = normalize_graph_text(&edge.target);
+    if source_norm.is_empty() || relation_norm.is_empty() || target_norm.is_empty() {
+        anyhow::bail!("memory edge source, relation, and target must not be empty");
+    }
+
+    let now = Utc::now().timestamp();
+    let confidence = edge.confidence.clamp(0.0, 1.0);
+    let id = match db.backend {
+        Backend::Sqlite => {
+            let mut conn = db.pool.acquire().await?;
+            sqlx::query(
+                "INSERT INTO memory_edges
+                 (project, memory_id, source, source_norm, relation, relation_norm,
+                  target, target_norm, valid_from, valid_until, observed_at,
+                  confidence, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+            )
+            .bind(&edge.project)
+            .bind(edge.memory_id)
+            .bind(edge.source.trim())
+            .bind(&source_norm)
+            .bind(edge.relation.trim())
+            .bind(&relation_norm)
+            .bind(edge.target.trim())
+            .bind(&target_norm)
+            .bind(edge.valid_from.as_deref())
+            .bind(edge.valid_until.as_deref())
+            .bind(now)
+            .bind(confidence)
+            .bind(now)
+            .execute(&mut *conn)
+            .await?;
+
+            let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() AS id")
+                .fetch_one(&mut *conn)
+                .await?;
+            row.get("id")
+        }
+        Backend::Postgres => {
+            let row: sqlx::any::AnyRow = sqlx::query(
+                "INSERT INTO memory_edges
+                 (project, memory_id, source, source_norm, relation, relation_norm,
+                  target, target_norm, valid_from, valid_until, observed_at,
+                  confidence, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 RETURNING id",
+            )
+            .bind(&edge.project)
+            .bind(edge.memory_id)
+            .bind(edge.source.trim())
+            .bind(&source_norm)
+            .bind(edge.relation.trim())
+            .bind(&relation_norm)
+            .bind(edge.target.trim())
+            .bind(&target_norm)
+            .bind(edge.valid_from.as_deref())
+            .bind(edge.valid_until.as_deref())
+            .bind(now)
+            .bind(confidence)
+            .bind(now)
+            .fetch_one(&db.pool)
+            .await?;
+            row.get("id")
+        }
+    };
+
+    reconcile_inserted_memory_edge(
+        db,
+        id,
+        edge,
+        &source_norm,
+        &relation_norm,
+        &target_norm,
+        now,
+    )
+    .await?;
+    Ok(id)
+}
+
+async fn reconcile_inserted_memory_edge(
+    db: &Database,
+    new_id: i64,
+    edge: &NewMemoryEdge,
+    source_norm: &str,
+    relation_norm: &str,
+    target_norm: &str,
+    observed_at: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE memory_edges
+         SET superseded_by = $1, superseded_reason = 'duplicate'
+         WHERE project = $2
+           AND source_norm = $3
+           AND relation_norm = $4
+           AND target_norm = $5
+           AND COALESCE(valid_from, '') = COALESCE($6, '')
+           AND id <> $1
+           AND superseded_by IS NULL",
+    )
+    .bind(new_id)
+    .bind(&edge.project)
+    .bind(source_norm)
+    .bind(relation_norm)
+    .bind(target_norm)
+    .bind(edge.valid_from.as_deref())
+    .execute(&db.pool)
+    .await?;
+
+    if edge.valid_until.is_none() && is_current_state_relation(relation_norm) {
+        let closes_at = edge
+            .valid_from
+            .clone()
+            .unwrap_or_else(|| observed_at.to_string());
+        sqlx::query(
+            "UPDATE memory_edges
+             SET superseded_by = $1,
+                 superseded_reason = 'current_state_update',
+                 valid_until = COALESCE(valid_until, $2)
+             WHERE project = $3
+               AND source_norm = $4
+               AND relation_norm = $5
+               AND target_norm <> $6
+               AND id <> $1
+               AND superseded_by IS NULL",
+        )
+        .bind(new_id)
+        .bind(closes_at)
+        .bind(&edge.project)
+        .bind(source_norm)
+        .bind(relation_norm)
+        .bind(target_norm)
+        .execute(&db.pool)
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Query graph edges by entity. By default this returns active/current edges
+/// only; set `include_superseded=true` to inspect provenance history.
+pub async fn memory_edges_for_entity(
+    db: &Database,
+    project: Option<&str>,
+    entity: &str,
+    include_superseded: bool,
+    limit: usize,
+) -> Result<Vec<MemoryEdge>> {
+    let entity_norm = normalize_graph_text(entity);
+    if entity_norm.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut sql =
+        "SELECT id, project, memory_id, source, relation, target, valid_from, valid_until,
+                          observed_at, confidence, superseded_by, superseded_reason, created_at
+                   FROM memory_edges
+                   WHERE (source_norm = $1 OR target_norm = $1)"
+            .to_string();
+    if !include_superseded {
+        sql.push_str(" AND superseded_by IS NULL");
+    }
+    let limit_ph = if project.is_some() {
+        sql.push_str(" AND project = $2");
+        "$3"
+    } else {
+        "$2"
+    };
+    sql.push_str(&format!(
+        " ORDER BY observed_at DESC, id DESC LIMIT {limit_ph}"
+    ));
+
+    let mut q = sqlx::query(&sql).bind(&entity_norm);
+    if let Some(p) = project {
+        q = q.bind(p);
+    }
+    let rows: Vec<sqlx::any::AnyRow> = q.bind(limit as i64).fetch_all(&db.pool).await?;
+    Ok(rows.into_iter().map(memory_edge_from_row).collect())
+}
+
+#[cfg(test)]
+pub async fn memory_edges_for_memory(db: &Database, memory_id: i64) -> Result<Vec<MemoryEdge>> {
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(
+        "SELECT id, project, memory_id, source, relation, target, valid_from, valid_until,
+                observed_at, confidence, superseded_by, superseded_reason, created_at
+         FROM memory_edges
+         WHERE memory_id = $1
+         ORDER BY id ASC",
+    )
+    .bind(memory_id)
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows.into_iter().map(memory_edge_from_row).collect())
+}
+
+pub async fn delete_memory_edges(db: &Database, memory_id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM memory_edges WHERE memory_id = $1")
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
 }
 
 /// Kind for each of `ids`, in one query. Ids absent from `memory_meta` (legacy
@@ -1481,7 +1841,11 @@ pub async fn get_memory_session_blob(db: &Database, memory_id: i64) -> Result<Op
             .bind(memory_id)
             .fetch_optional(&db.pool)
             .await?;
-    Ok(row.and_then(|r| r.try_get::<Option<String>, _>("session_blob").ok().flatten()))
+    Ok(row.and_then(|r| {
+        r.try_get::<Option<String>, _>("session_blob")
+            .ok()
+            .flatten()
+    }))
 }
 
 // ── CCR blob store accessors ──────────────────────────────────────────────────
@@ -1560,12 +1924,7 @@ pub async fn get_blob(db: &Database, hash: &str) -> Result<Option<BlobRow>> {
 
 /// Store a content-addressed dictionary (idempotent by hash). Dictionaries are
 /// stored verbatim (not compressed) so they can always be reconstructed.
-pub async fn insert_dict(
-    db: &Database,
-    hash: &str,
-    content_type: &str,
-    data: &[u8],
-) -> Result<()> {
+pub async fn insert_dict(db: &Database, hash: &str, content_type: &str, data: &[u8]) -> Result<()> {
     let now = Utc::now().timestamp();
     sqlx::query(
         "INSERT INTO ccr_dicts(hash, content_type, data, created_at)
@@ -1583,11 +1942,10 @@ pub async fn insert_dict(
 
 /// Fetch dictionary bytes by content hash.
 pub async fn get_dict(db: &Database, hash: &str) -> Result<Option<Vec<u8>>> {
-    let row: Option<sqlx::any::AnyRow> =
-        sqlx::query("SELECT data FROM ccr_dicts WHERE hash = $1")
-            .bind(hash)
-            .fetch_optional(&db.pool)
-            .await?;
+    let row: Option<sqlx::any::AnyRow> = sqlx::query("SELECT data FROM ccr_dicts WHERE hash = $1")
+        .bind(hash)
+        .fetch_optional(&db.pool)
+        .await?;
     Ok(row.map(|r| r.get::<Vec<u8>, _>("data")))
 }
 
@@ -1616,7 +1974,10 @@ pub async fn recent_blob_hashes_by_type(
     .bind(limit)
     .fetch_all(&db.pool)
     .await?;
-    Ok(rows.into_iter().map(|r| r.get::<String, _>("hash")).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| r.get::<String, _>("hash"))
+        .collect())
 }
 
 /// Decrement a blob's reference count, floored at zero. A blob at `refcount = 0`
@@ -1728,7 +2089,8 @@ pub async fn all_memory_ids_with_text(
         Backend::Sqlite => "rowid",
         Backend::Postgres => "id",
     };
-    let mut sql = format!("SELECT m.{id_col} AS id, m.summary AS summary, m.tags AS tags FROM memories m");
+    let mut sql =
+        format!("SELECT m.{id_col} AS id, m.summary AS summary, m.tags AS tags FROM memories m");
     if project.is_some() {
         sql.push_str(" WHERE m.project = $1");
     }
@@ -1755,6 +2117,7 @@ pub struct DbStats {
     pub total_sessions: i64,
     pub total_memories: i64,
     pub total_observations: i64,
+    pub total_memory_edges: i64,
     /// Distinct CCR blobs stored.
     pub ccr_blobs: i64,
     /// Sum of original (uncompressed) bytes across distinct blobs.
@@ -1808,6 +2171,11 @@ pub async fn get_stats(db: &Database) -> Result<DbStats> {
         .await?;
     let observations: i64 = r.get("cnt");
 
+    let r: sqlx::any::AnyRow = sqlx::query("SELECT COUNT(*) as cnt FROM memory_edges")
+        .fetch_one(&db.pool)
+        .await?;
+    let memory_edges: i64 = r.get("cnt");
+
     let r: sqlx::any::AnyRow = sqlx::query(
         "SELECT COUNT(*) AS cnt,
                 COALESCE(SUM(orig_len), 0) AS orig,
@@ -1822,6 +2190,7 @@ pub async fn get_stats(db: &Database) -> Result<DbStats> {
         total_sessions: sessions,
         total_memories: memories,
         total_observations: observations,
+        total_memory_edges: memory_edges,
         ccr_blobs: r.get("cnt"),
         ccr_orig_bytes: r.get("orig"),
         ccr_comp_bytes: r.get("comp"),
@@ -1840,8 +2209,7 @@ mod tests {
     /// pool queries to churn connection hand-out and assert the invariant.
     #[tokio::test]
     async fn insert_memory_returns_correct_distinct_ids() {
-        let path =
-            std::env::temp_dir().join(format!("ironmem-insid-{}.db", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("ironmem-insid-{}.db", uuid::Uuid::new_v4()));
         let db = Database::new(&path.to_string_lossy()).await.unwrap();
         db.migrate().await.unwrap();
         let session = create_session(&db, "/tmp/p").await.unwrap();
@@ -1858,7 +2226,10 @@ mod tests {
         }
 
         // All ids are non-zero and distinct.
-        assert!(ids.iter().all(|&id| id > 0), "ids must be non-zero: {ids:?}");
+        assert!(
+            ids.iter().all(|&id| id > 0),
+            "ids must be non-zero: {ids:?}"
+        );
         let mut distinct = ids.clone();
         distinct.sort();
         distinct.dedup();
@@ -1913,7 +2284,8 @@ mod tests {
             Some("t"),
         )
         .await?;
-        let hits = search_memories(&db, "/p", "When did Caroline join the LGBTQ group?", 10).await?;
+        let hits =
+            search_memories(&db, "/p", "When did Caroline join the LGBTQ group?", 10).await?;
         assert!(
             hits.iter().any(|m| m.summary.contains("LGBTQ")),
             "expected the LGBTQ memory, got {hits:?}"
@@ -1939,7 +2311,8 @@ mod tests {
         )
         .execute(&db.pool)
         .await?;
-        let blob = crate::embedding_codec::encode(&crate::embedding_codec::normalize(&[1.0, 0.0, 0.0]));
+        let blob =
+            crate::embedding_codec::encode(&crate::embedding_codec::normalize(&[1.0, 0.0, 0.0]));
         sqlx::query("INSERT INTO vt_smoke(id, embedding) VALUES (1, ?)")
             .bind(blob.clone())
             .execute(&db.pool)
@@ -1961,9 +2334,13 @@ mod tests {
         let s = create_session(&db, "/tmp/p").await?;
         insert_memory(&db, "/tmp/p", &s, "auth middleware fix", Some("auth")).await?;
 
-        let emb = crate::embedding_codec::encode(&crate::embedding_codec::normalize(&[1.0, 0.0, 0.0]));
+        let emb =
+            crate::embedding_codec::encode(&crate::embedding_codec::normalize(&[1.0, 0.0, 0.0]));
         upsert_embedding(&db, "memory", 1, "m", 3, &emb).await?;
-        assert_eq!(get_embedding(&db, "memory", 1, "m").await?, Some(emb.clone()));
+        assert_eq!(
+            get_embedding(&db, "memory", 1, "m").await?,
+            Some(emb.clone())
+        );
 
         // meta: default when absent, then upsert
         assert_eq!(get_memory_meta(&db, 999).await?, 0.5);
@@ -1981,7 +2358,9 @@ mod tests {
         let missing = memory_ids_missing_embedding(&db, "other", None).await?;
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].0, 1);
-        assert!(memory_ids_missing_embedding(&db, "m", None).await?.is_empty());
+        assert!(memory_ids_missing_embedding(&db, "m", None)
+            .await?
+            .is_empty());
 
         // delete cleans up
         delete_embedding(&db, "memory", 1).await?;
@@ -1997,8 +2376,20 @@ mod tests {
         let (db, path) = test_db().await?;
 
         // First insert creates the row at refcount 1 and stores all fields.
-        insert_blob(&db, "abc123", "text", "zstd", 10, 4, b"\x01\x02\x03\x04", None).await?;
-        let row = get_blob(&db, "abc123").await?.expect("row exists after insert");
+        insert_blob(
+            &db,
+            "abc123",
+            "text",
+            "zstd",
+            10,
+            4,
+            b"\x01\x02\x03\x04",
+            None,
+        )
+        .await?;
+        let row = get_blob(&db, "abc123")
+            .await?
+            .expect("row exists after insert");
         assert_eq!(row.hash, "abc123");
         assert_eq!(row.content_type, "text");
         assert_eq!(row.codec, "zstd");
@@ -2008,7 +2399,17 @@ mod tests {
         assert_eq!(row.refcount, 1);
 
         // Re-inserting the same hash dedups (single row) and bumps the refcount.
-        insert_blob(&db, "abc123", "text", "zstd", 10, 4, b"\x01\x02\x03\x04", None).await?;
+        insert_blob(
+            &db,
+            "abc123",
+            "text",
+            "zstd",
+            10,
+            4,
+            b"\x01\x02\x03\x04",
+            None,
+        )
+        .await?;
         assert_eq!(get_blob(&db, "abc123").await?.unwrap().refcount, 2);
 
         // decref to 0 leaves the row in place for gc_blobs to reclaim.
@@ -2035,7 +2436,10 @@ mod tests {
         let (db, path) = test_db().await?;
 
         insert_dict(&db, "h1", "json", b"dictionary-bytes-1").await?;
-        assert_eq!(get_dict(&db, "h1").await?, Some(b"dictionary-bytes-1".to_vec()));
+        assert_eq!(
+            get_dict(&db, "h1").await?,
+            Some(b"dictionary-bytes-1".to_vec())
+        );
         assert!(get_dict(&db, "missing").await?.is_none());
         assert_eq!(latest_dict_hash(&db, "json").await?, Some("h1".to_string()));
         assert_eq!(latest_dict_hash(&db, "log").await?, None);
@@ -2089,7 +2493,10 @@ mod tests {
         upsert_memory_meta(&db, mid, 0.5).await?;
         insert_blob(&db, "tx", "text", "zstd", 10, 5, b"hello", None).await?; // rc 1
         set_memory_session_blob(&db, mid, "tx").await?;
-        assert_eq!(get_memory_session_blob(&db, mid).await?, Some("tx".to_string()));
+        assert_eq!(
+            get_memory_session_blob(&db, mid).await?,
+            Some("tx".to_string())
+        );
 
         decref_memory_session_blob(&db, mid).await?;
         assert_eq!(gc_blobs(&db).await?.0, 1);
@@ -2146,11 +2553,19 @@ mod tests {
         // event_time round-trips through the meta read; undated reads as None.
         let info = get_memory_meta_full(&db, dated).await?;
         assert_eq!(info.event_time.as_deref(), Some("2023-05-07"));
-        assert!(get_memory_meta_full(&db, undated).await?.event_time.is_none());
+        assert!(get_memory_meta_full(&db, undated)
+            .await?
+            .event_time
+            .is_none());
 
         // Year query matches only the dated memory; a non-matching year finds none.
-        assert_eq!(memories_by_event_time(&db, Some(p), "2023", 10).await?, vec![dated]);
-        assert!(memories_by_event_time(&db, Some(p), "1999", 10).await?.is_empty());
+        assert_eq!(
+            memories_by_event_time(&db, Some(p), "2023", 10).await?,
+            vec![dated]
+        );
+        assert!(memories_by_event_time(&db, Some(p), "1999", 10)
+            .await?
+            .is_empty());
         // Project scoping: a different project sees nothing.
         assert!(memories_by_event_time(&db, Some("/tmp/other"), "2023", 10)
             .await?
@@ -2170,16 +2585,150 @@ mod tests {
         insert_memory_entity(&db, caro, "New York").await?;
 
         // Case-insensitive single-token lookup returns the id.
-        assert_eq!(memories_for_entity(&db, Some(p), "caroline", 10).await?, vec![caro]);
-        assert_eq!(memories_for_entity(&db, Some(p), "CAROLINE", 10).await?, vec![caro]);
+        assert_eq!(
+            memories_for_entity(&db, Some(p), "caroline", 10).await?,
+            vec![caro]
+        );
+        assert_eq!(
+            memories_for_entity(&db, Some(p), "CAROLINE", 10).await?,
+            vec![caro]
+        );
         // Either token of a multi-word entity resolves.
-        assert_eq!(memories_for_entity(&db, Some(p), "York", 10).await?, vec![caro]);
+        assert_eq!(
+            memories_for_entity(&db, Some(p), "York", 10).await?,
+            vec![caro]
+        );
         // Unknown entity / too-short token / wrong project ⇒ nothing.
-        assert!(memories_for_entity(&db, Some(p), "Melanie", 10).await?.is_empty());
-        assert!(memories_for_entity(&db, Some(p), "of", 10).await?.is_empty());
+        assert!(memories_for_entity(&db, Some(p), "Melanie", 10)
+            .await?
+            .is_empty());
+        assert!(memories_for_entity(&db, Some(p), "of", 10)
+            .await?
+            .is_empty());
         assert!(memories_for_entity(&db, Some("/tmp/other"), "caroline", 10)
             .await?
             .is_empty());
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_edges_insert_and_query_active_by_entity() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let p = "/tmp/edge";
+        let s = create_session(&db, p).await?;
+        let mid = insert_memory(&db, p, &s, "Caroline works at Acme", Some("t")).await?;
+
+        let edge_id = insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: p.into(),
+                memory_id: mid,
+                source: "Caroline".into(),
+                relation: "works at".into(),
+                target: "Acme Corp".into(),
+                valid_from: Some("2026-01-01".into()),
+                valid_until: None,
+                confidence: 0.92,
+            },
+        )
+        .await?;
+
+        let edges = memory_edges_for_entity(&db, Some(p), "Caroline", false, 10).await?;
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].id, edge_id);
+        assert_eq!(edges[0].source, "Caroline");
+        assert_eq!(edges[0].relation, "works at");
+        assert_eq!(edges[0].target, "Acme Corp");
+        assert_eq!(edges[0].valid_from.as_deref(), Some("2026-01-01"));
+        assert!(edges[0].superseded_by.is_none());
+
+        let by_memory = memory_edges_for_memory(&db, mid).await?;
+        assert_eq!(by_memory.len(), 1);
+        assert_eq!(by_memory[0].id, edge_id);
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_edges_reconcile_duplicates_and_current_state_updates() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let p = "/tmp/edge-reconcile";
+        let s = create_session(&db, p).await?;
+        let first = insert_memory(&db, p, &s, "Caroline status draft", Some("t")).await?;
+        let second =
+            insert_memory(&db, p, &s, "Caroline status draft duplicate", Some("t")).await?;
+        let third = insert_memory(&db, p, &s, "Caroline status approved", Some("t")).await?;
+
+        let e1 = insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: p.into(),
+                memory_id: first,
+                source: "Caroline".into(),
+                relation: "status".into(),
+                target: "draft".into(),
+                valid_from: Some("2026-06-01".into()),
+                valid_until: None,
+                confidence: 0.8,
+            },
+        )
+        .await?;
+        let e2 = insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: p.into(),
+                memory_id: second,
+                source: "Caroline".into(),
+                relation: "status".into(),
+                target: "draft".into(),
+                valid_from: Some("2026-06-01".into()),
+                valid_until: None,
+                confidence: 0.9,
+            },
+        )
+        .await?;
+        let e3 = insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: p.into(),
+                memory_id: third,
+                source: "Caroline".into(),
+                relation: "status".into(),
+                target: "approved".into(),
+                valid_from: Some("2026-06-05".into()),
+                valid_until: None,
+                confidence: 0.95,
+            },
+        )
+        .await?;
+
+        let active = memory_edges_for_entity(&db, Some(p), "Caroline", false, 10).await?;
+        assert_eq!(
+            active.len(),
+            1,
+            "only the latest current-state edge stays active"
+        );
+        assert_eq!(active[0].id, e3);
+        assert_eq!(active[0].target, "approved");
+
+        let history = memory_edges_for_entity(&db, Some(p), "Caroline", true, 10).await?;
+        let old_duplicate = history.iter().find(|e| e.id == e1).unwrap();
+        assert_eq!(old_duplicate.superseded_by, Some(e2));
+        assert_eq!(
+            old_duplicate.superseded_reason.as_deref(),
+            Some("duplicate")
+        );
+
+        let replaced = history.iter().find(|e| e.id == e2).unwrap();
+        assert_eq!(replaced.superseded_by, Some(e3));
+        assert_eq!(
+            replaced.superseded_reason.as_deref(),
+            Some("current_state_update")
+        );
+        assert_eq!(replaced.valid_until.as_deref(), Some("2026-06-05"));
 
         let _ = std::fs::remove_file(path);
         Ok(())
@@ -2207,38 +2756,65 @@ mod tests {
 
         // Defaults: a plain upsert_memory_meta row is project/session.
         let i1 = get_memory_meta_full(&db, m1).await?;
-        assert_eq!((i1.scope.as_str(), i1.kind.as_str()), ("project", "session"));
+        assert_eq!(
+            (i1.scope.as_str(), i1.kind.as_str()),
+            ("project", "session")
+        );
         // Round-trip of explicit scope/kind.
         let i2 = get_memory_meta_full(&db, m2).await?;
-        assert_eq!((i2.scope.as_str(), i2.kind.as_str()), ("user", "preference"));
+        assert_eq!(
+            (i2.scope.as_str(), i2.kind.as_str()),
+            ("user", "preference")
+        );
         // set_memory_scope_kind upserted a row even though none existed before,
         // with the default importance preserved.
         assert!((i2.importance - 0.5).abs() < 1e-9);
         // Missing row → defaults.
         let none = get_memory_meta_full(&db, 9999).await?;
-        assert_eq!((none.scope.as_str(), none.kind.as_str()), ("project", "session"));
+        assert_eq!(
+            (none.scope.as_str(), none.kind.as_str()),
+            ("project", "session")
+        );
 
         // User-scope query is global (ignores project) → m2 + m3.
         let users = get_recent_memories_scoped(&db, "user", None, 50).await?;
         let user_ids: Vec<i64> = users.iter().map(|m| m.id).collect();
-        assert!(user_ids.contains(&m2) && user_ids.contains(&m3), "{user_ids:?}");
-        assert!(!user_ids.contains(&m1) && !user_ids.contains(&m4), "{user_ids:?}");
+        assert!(
+            user_ids.contains(&m2) && user_ids.contains(&m3),
+            "{user_ids:?}"
+        );
+        assert!(
+            !user_ids.contains(&m1) && !user_ids.contains(&m4),
+            "{user_ids:?}"
+        );
 
         // Project-scope for beta → m4 (legacy, no meta) but NOT m3 (user-scope).
         let beta_proj = get_recent_memories_scoped(&db, "project", Some(beta), 50).await?;
         let beta_ids: Vec<i64> = beta_proj.iter().map(|m| m.id).collect();
-        assert!(beta_ids.contains(&m4), "legacy memory must count as project: {beta_ids:?}");
-        assert!(!beta_ids.contains(&m3), "user-scope excluded from project: {beta_ids:?}");
+        assert!(
+            beta_ids.contains(&m4),
+            "legacy memory must count as project: {beta_ids:?}"
+        );
+        assert!(
+            !beta_ids.contains(&m3),
+            "user-scope excluded from project: {beta_ids:?}"
+        );
 
         // Project-scope for alpha → m1 only (m2 is user-scope).
         let alpha_proj = get_recent_memories_scoped(&db, "project", Some(alpha), 50).await?;
         let alpha_ids: Vec<i64> = alpha_proj.iter().map(|m| m.id).collect();
-        assert!(alpha_ids.contains(&m1) && !alpha_ids.contains(&m2), "{alpha_ids:?}");
+        assert!(
+            alpha_ids.contains(&m1) && !alpha_ids.contains(&m2),
+            "{alpha_ids:?}"
+        );
 
         // set_memory_scope_kind clamps unknown values.
         set_memory_scope_kind(&db, m1, "bogus-scope", "bogus-kind").await?;
         let i1b = get_memory_meta_full(&db, m1).await?;
-        assert_eq!((i1b.scope.as_str(), i1b.kind.as_str()), ("project", "session"));
+        assert_eq!(
+            (i1b.scope.as_str(), i1b.kind.as_str()),
+            ("project", "session")
+        );
 
         let _ = std::fs::remove_file(path);
         Ok(())
@@ -2395,7 +2971,11 @@ mod tests {
                 .flatten();
         let blob_hash = blob_hash.expect("large output must record an output_blob");
         let restored = crate::ccr::load_blob(&db, &blob_hash).await?;
-        assert_eq!(restored, big.as_bytes(), "CCR must return the exact original");
+        assert_eq!(
+            restored,
+            big.as_bytes(),
+            "CCR must return the exact original"
+        );
 
         // A small output below the cap stores no blob (no overhead).
         let small_id =
@@ -2408,7 +2988,10 @@ mod tests {
                 .try_get("output_blob")
                 .ok()
                 .flatten();
-        assert!(small_blob.is_none(), "small output should not allocate a blob");
+        assert!(
+            small_blob.is_none(),
+            "small output should not allocate a blob"
+        );
 
         let _ = std::fs::remove_file(path);
         Ok(())

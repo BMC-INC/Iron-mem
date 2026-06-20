@@ -147,6 +147,24 @@ enum Commands {
         limit: i64,
     },
 
+    /// Query the temporal memory graph for an entity
+    Graph {
+        /// Entity to query (person, project, organization, concept)
+        entity: String,
+        /// Project root path (defaults to current directory; use --all for every project)
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Query graph edges across every project
+        #[arg(short, long)]
+        all: bool,
+        /// Include superseded/duplicate historical edges
+        #[arg(long)]
+        history: bool,
+        /// Max graph edges
+        #[arg(short, long, default_value = "20")]
+        limit: i64,
+    },
+
     /// Manually compress a session
     Compress {
         /// Session ID to compress
@@ -248,6 +266,13 @@ async fn main() -> Result<()> {
             all,
             limit,
         } => run_corrections(&cfg, project.as_deref(), all, limit).await?,
+        Commands::Graph {
+            entity,
+            project,
+            all,
+            history,
+            limit,
+        } => run_graph(&cfg, &entity, project.as_deref(), all, history, limit).await?,
         Commands::Compress { session_id } => run_compress_cmd(&cfg, &session_id).await?,
         Commands::Gc => run_gc(&cfg).await?,
         Commands::Embed {
@@ -734,7 +759,8 @@ async fn run_profile(cfg: &config::Config, refresh: bool) -> Result<()> {
     let (embedder, store) = vectorstore::build_semantic(&database, cfg).await;
 
     if refresh {
-        match profile::regenerate(&database, embedder.as_deref(), store.as_ref(), Some(cfg)).await? {
+        match profile::regenerate(&database, embedder.as_deref(), store.as_ref(), Some(cfg)).await?
+        {
             Some(_) => println!("✅ Profile regenerated."),
             None => {
                 println!("No user-scope memories yet — nothing to profile.");
@@ -784,6 +810,59 @@ async fn run_corrections(
     Ok(())
 }
 
+async fn run_graph(
+    cfg: &config::Config,
+    entity: &str,
+    project: Option<&str>,
+    all: bool,
+    history: bool,
+    limit: i64,
+) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+
+    let filter = if all {
+        None
+    } else {
+        Some(resolve_project(project)?)
+    };
+    let edges = db::memory_edges_for_entity(
+        &database,
+        filter.as_deref(),
+        entity,
+        history,
+        limit.max(1) as usize,
+    )
+    .await?;
+
+    if edges.is_empty() {
+        match &filter {
+            Some(p) => println!("No graph edges for {entity:?} in {p}."),
+            None => println!("No graph edges for {entity:?}."),
+        }
+        return Ok(());
+    }
+
+    println!("{} graph edge(s) for {entity:?}:", edges.len());
+    for e in &edges {
+        let mut suffix = String::new();
+        if let Some(from) = &e.valid_from {
+            suffix.push_str(&format!(" from {from}"));
+        }
+        if let Some(until) = &e.valid_until {
+            suffix.push_str(&format!(" until {until}"));
+        }
+        if let Some(reason) = &e.superseded_reason {
+            suffix.push_str(&format!(" [{reason} -> {:?}]", e.superseded_by));
+        }
+        println!(
+            "\n• {} --{}--> {}{} (memory {}, confidence {:.2})",
+            e.source, e.relation, e.target, suffix, e.memory_id, e.confidence
+        );
+    }
+    Ok(())
+}
+
 async fn run_compress_cmd(cfg: &config::Config, session_id: &str) -> Result<()> {
     let database = db::Database::new(&cfg.effective_database_url()).await?;
     database.migrate().await?;
@@ -805,8 +884,14 @@ async fn run_compress_cmd(cfg: &config::Config, session_id: &str) -> Result<()> 
     );
 
     let (embedder, store) = vectorstore::build_semantic(&database, cfg).await;
-    let memory_id =
-        compress::run(&database, embedder.as_deref(), store.as_ref(), cfg, session_id).await?;
+    let memory_id = compress::run(
+        &database,
+        embedder.as_deref(),
+        store.as_ref(),
+        cfg,
+        session_id,
+    )
+    .await?;
 
     println!("✅ Memory created (id={})", memory_id);
     if let Some(memory) = db::get_memory_by_id(&database, memory_id).await? {
@@ -843,8 +928,8 @@ async fn run_embed(
         if force { ", rebuilding index" } else { "" }
     );
 
-    let count = vectorstore::backfill(&database, embedder.as_ref(), store.as_ref(), filter, force)
-        .await?;
+    let count =
+        vectorstore::backfill(&database, embedder.as_ref(), store.as_ref(), filter, force).await?;
 
     println!("✅ Embedded {} memory(ies)", count);
     Ok(())

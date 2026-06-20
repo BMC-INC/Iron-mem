@@ -267,6 +267,7 @@ ironmem inject              # Manually rebuild IRONMEM.md (relevance-ranked)
 ironmem remember "..."      # Store an explicit memory (--scope user, --kind preference, --tags)
 ironmem profile             # Show the user profile (--refresh to regenerate it)
 ironmem corrections         # List mined error→fix memories (--all for every project)
+ironmem graph "Operator OS" # Query temporal graph edges (--history includes superseded edges)
 ironmem compress <id>       # Manually compress a session
 ironmem embed               # Backfill semantic embeddings for existing memories
 ironmem gc                  # Reclaim unreferenced CCR blobs (after wipes)
@@ -752,6 +753,7 @@ This starts IronMem with Streamable HTTP on `http://localhost:37779/mcp` and Pos
 - [x] **Memory scoping & types** (Supermemory patterns): project vs. user (cross-project) scope, typed memories (`error_solution` / `preference` / `architecture` / `learned_pattern` / …), scope-aware injection with per-kind boosts, and a `remember` tool
 - [x] **Always-injected user profile** — cross-project facts distilled into one profile memory (LLM summary or deterministic local rollup); `get_profile` / `refresh_profile`
 - [x] **Correction miner** — error→fix loops become `error_solution` memories, surfaced via `list_corrections`
+- [x] **Temporal graph lite** — compression now extracts structured `source | relation | target` edges with dates, confidence, memory provenance, and reconciliation. Exact duplicates and superseded current-state edges are marked in history rather than deleted. Query with `ironmem graph`, REST `/graph`, or MCP `memory_graph`.
 
 ### Next
 

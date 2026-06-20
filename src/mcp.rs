@@ -136,7 +136,7 @@ impl IronMemServer {
             ),
             Tool::new(
                 "get_status",
-                "Get database stats: total sessions, memories, and observations.",
+                "Get database stats: total sessions, memories, observations, graph edges, and CCR storage.",
                 schema(serde_json::json!({
                     "type": "object",
                     "properties": {}
@@ -267,6 +267,20 @@ impl IronMemServer {
                         "project": { "type": "string", "description": "Project root path (omit for all projects)" },
                         "limit": { "type": "integer", "description": "Max results (default 10)" }
                     }
+                })),
+            ),
+            Tool::new(
+                "memory_graph",
+                "Query temporal graph edges for an entity. Returns active edges by default; include_superseded=true returns provenance history.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "entity": { "type": "string", "description": "Entity to query (person, project, organization, concept)" },
+                        "project": { "type": "string", "description": "Optional project root path; omit for all projects" },
+                        "include_superseded": { "type": "boolean", "description": "Include duplicate/superseded historical edges (default false)" },
+                        "limit": { "type": "integer", "description": "Max graph edges (default 20)" }
+                    },
+                    "required": ["entity"]
                 })),
             ),
             Tool::new(
@@ -496,6 +510,7 @@ impl IronMemServer {
             "sessions": stats.total_sessions,
             "memories": stats.total_memories,
             "observations": stats.total_observations,
+            "memory_edges": stats.total_memory_edges,
             "db_path": self.config.db_path,
             "ccr": stats.ccr_json(),
         });
@@ -641,8 +656,14 @@ impl IronMemServer {
         if text.trim().is_empty() {
             return Ok(error_result("'text' must not be empty"));
         }
-        let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("project");
-        let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("preference");
+        let scope = args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("project");
+        let kind = args
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("preference");
         let tags = args.get("tags").and_then(|v| v.as_str());
 
         let memory_id = compress::remember(
@@ -714,6 +735,40 @@ impl IronMemServer {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let json = serde_json::json!({ "corrections": corrections });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json).unwrap(),
+        )]))
+    }
+
+    async fn handle_memory_graph(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
+        let entity = args
+            .get("entity")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ErrorData::invalid_params("missing 'entity'", None))?;
+        let project = args.get("project").and_then(|v| v.as_str());
+        let include_superseded = args
+            .get("include_superseded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
+
+        let edges = db::memory_edges_for_entity(
+            &self.db,
+            project,
+            entity,
+            include_superseded,
+            limit.max(1) as usize,
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json = serde_json::json!({
+            "ok": true,
+            "entity": entity,
+            "project": project,
+            "include_superseded": include_superseded,
+            "edges": edges,
+        });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -794,7 +849,9 @@ impl IronMemServer {
 
 /// Read the optional `semantic` tool arg (default true).
 fn semantic_arg(args: &JsonObject) -> bool {
-    args.get("semantic").and_then(|v| v.as_bool()).unwrap_or(true)
+    args.get("semantic")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
 }
 
 impl ServerHandler for IronMemServer {
@@ -835,6 +892,7 @@ impl ServerHandler for IronMemServer {
             "get_profile" => self.handle_get_profile().await,
             "refresh_profile" => self.handle_refresh_profile().await,
             "list_corrections" => self.handle_list_corrections(&args).await,
+            "memory_graph" => self.handle_memory_graph(&args).await,
             "wipe_project" => self.handle_wipe_project(&args).await,
             _ => Err(ErrorData::invalid_params(
                 format!("unknown tool: {}", request.name),
@@ -980,8 +1038,7 @@ mod tests {
     // ── retrieve_original (CCR) ──────────────────────────────────────────────
 
     async fn test_server() -> (IronMemServer, String) {
-        let db_path =
-            std::env::temp_dir().join(format!("ironmem-mcp-{}.db", uuid::Uuid::new_v4()));
+        let db_path = std::env::temp_dir().join(format!("ironmem-mcp-{}.db", uuid::Uuid::new_v4()));
         let db_path_string = db_path.to_string_lossy().to_string();
         let db = Database::new(&db_path_string).await.unwrap();
         db.migrate().await.unwrap();
@@ -1018,7 +1075,10 @@ mod tests {
             .expect("retrieve_original tool registered");
         let v = serde_json::to_value(t).unwrap();
         let props = &v["inputSchema"]["properties"];
-        assert!(props.get("observation_id").is_some(), "schema has observation_id");
+        assert!(
+            props.get("observation_id").is_some(),
+            "schema has observation_id"
+        );
         assert!(props.get("hash").is_some(), "schema has hash");
     }
 
@@ -1027,7 +1087,10 @@ mod tests {
         let (server, path) = test_server().await;
         let mut args = JsonObject::new();
         args.insert("project".into(), serde_json::json!("/tmp/projX"));
-        args.insert("text".into(), serde_json::json!("user prefers vim keybindings"));
+        args.insert(
+            "text".into(),
+            serde_json::json!("user prefers vim keybindings"),
+        );
         args.insert("scope".into(), serde_json::json!("user"));
         args.insert("kind".into(), serde_json::json!("preference"));
         args.insert("tags".into(), serde_json::json!("editor pref"));
@@ -1085,19 +1148,29 @@ mod tests {
 
         // No profile yet.
         let v: serde_json::Value =
-            serde_json::from_str(&result_text(&server.handle_get_profile().await.unwrap())).unwrap();
+            serde_json::from_str(&result_text(&server.handle_get_profile().await.unwrap()))
+                .unwrap();
         assert!(v["profile"].is_null());
 
         // Seed a user memory, then refresh.
         let s = db::create_session(&server.db, "/tmp/p").await.unwrap();
-        let uid = db::insert_memory(&server.db, "/tmp/p", &s, "user prefers dark mode", Some("pref"))
+        let uid = db::insert_memory(
+            &server.db,
+            "/tmp/p",
+            &s,
+            "user prefers dark mode",
+            Some("pref"),
+        )
+        .await
+        .unwrap();
+        db::set_memory_scope_kind(&server.db, uid, "user", "preference")
             .await
             .unwrap();
-        db::set_memory_scope_kind(&server.db, uid, "user", "preference").await.unwrap();
 
-        let rv: serde_json::Value =
-            serde_json::from_str(&result_text(&server.handle_refresh_profile().await.unwrap()))
-                .unwrap();
+        let rv: serde_json::Value = serde_json::from_str(&result_text(
+            &server.handle_refresh_profile().await.unwrap(),
+        ))
+        .unwrap();
         assert_eq!(rv["ok"], true);
         assert_eq!(rv["regenerated"], true);
         assert!(rv["profile"]["summary"]
@@ -1107,7 +1180,8 @@ mod tests {
 
         // get_profile now returns it.
         let v2: serde_json::Value =
-            serde_json::from_str(&result_text(&server.handle_get_profile().await.unwrap())).unwrap();
+            serde_json::from_str(&result_text(&server.handle_get_profile().await.unwrap()))
+                .unwrap();
         assert!(!v2["profile"].is_null());
 
         let _ = std::fs::remove_file(db_path);
@@ -1160,9 +1234,10 @@ mod tests {
 
         let mut args = JsonObject::new();
         args.insert("project".into(), serde_json::json!("/tmp/p"));
-        let v: serde_json::Value =
-            serde_json::from_str(&result_text(&server.handle_list_corrections(&args).await.unwrap()))
-                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result_text(
+            &server.handle_list_corrections(&args).await.unwrap(),
+        ))
+        .unwrap();
         let arr = v["corrections"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert!(arr[0]["summary"].as_str().unwrap().contains("E0425"));
@@ -1215,7 +1290,10 @@ mod tests {
 
         let v: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
         assert_eq!(v["ok"], true);
-        assert_eq!(v["original"].as_str().unwrap(), "verbatim bytes addressed by hash");
+        assert_eq!(
+            v["original"].as_str().unwrap(),
+            "verbatim bytes addressed by hash"
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -1241,7 +1319,9 @@ mod tests {
         let mem_id = db::insert_memory(&server.db, "/tmp/p", &s, "summary", Some("t"))
             .await
             .unwrap();
-        db::upsert_memory_meta(&server.db, mem_id, 0.5).await.unwrap();
+        db::upsert_memory_meta(&server.db, mem_id, 0.5)
+            .await
+            .unwrap();
 
         let transcript = "## Read\ninput: x\noutput: y\n\n";
         let r = crate::ccr::store_blob(&server.db, transcript.as_bytes(), None)
@@ -1261,9 +1341,10 @@ mod tests {
         // Unknown memory id → graceful ok:false.
         let mut args = JsonObject::new();
         args.insert("memory_id".into(), serde_json::json!(987_654));
-        let v: serde_json::Value =
-            serde_json::from_str(&result_text(&server.handle_retrieve_original(&args).await.unwrap()))
-                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result_text(
+            &server.handle_retrieve_original(&args).await.unwrap(),
+        ))
+        .unwrap();
         assert_eq!(v["ok"], false);
 
         let _ = std::fs::remove_file(path);

@@ -38,9 +38,15 @@ pub async fn run(
 
     // Feedback loop: mine error→fix corrections into error_solution memories.
     // Best-effort — never fail compression because mining hiccuped.
-    if let Err(e) =
-        crate::corrections::mine_and_store(db, embedder, store, &session.project, session_id, &observations)
-            .await
+    if let Err(e) = crate::corrections::mine_and_store(
+        db,
+        embedder,
+        store,
+        &session.project,
+        session_id,
+        &observations,
+    )
+    .await
     {
         tracing::warn!("correction mining failed (session {session_id}): {e}");
     }
@@ -81,7 +87,9 @@ pub async fn store_session_transcript(
     if transcript.is_empty() {
         return Ok(None);
     }
-    let hash = crate::ccr::store_blob(db, transcript.as_bytes(), None).await?.hash;
+    let hash = crate::ccr::store_blob(db, transcript.as_bytes(), None)
+        .await?
+        .hash;
     db::set_memory_session_blob(db, memory_id, &hash).await?;
     Ok(Some(hash))
 }
@@ -132,6 +140,32 @@ pub async fn persist(
     for entity in &result.entities {
         if let Err(e) = db::insert_memory_entity(db, memory_id, entity).await {
             tracing::warn!("entity index failed (memory {memory_id}): {e}");
+        }
+    }
+
+    // Temporal graph lite: persist structured subject→relation→object edges
+    // with the narrative memory as provenance. This is additive to FTS/vector
+    // recall and gives Operator OS a queryable relationship layer.
+    for relation in &result.relations {
+        let edge = db::NewMemoryEdge {
+            project: project.to_string(),
+            memory_id,
+            source: relation.source.clone(),
+            relation: relation.relation.clone(),
+            target: relation.target.clone(),
+            valid_from: relation
+                .valid_from
+                .clone()
+                .or_else(|| result.event_time.clone()),
+            valid_until: relation.valid_until.clone(),
+            confidence: relation.confidence,
+        };
+        match db::insert_memory_edge(db, &edge).await {
+            Ok(_) => {
+                let _ = db::insert_memory_entity(db, memory_id, &relation.source).await;
+                let _ = db::insert_memory_entity(db, memory_id, &relation.target).await;
+            }
+            Err(e) => tracing::warn!("memory edge store failed (memory {memory_id}): {e}"),
         }
     }
 
@@ -332,7 +366,10 @@ mod tests {
         // the meta row at the default project scope.
         let info = db::get_memory_meta_full(&db, id).await.unwrap();
         assert!((info.importance - 0.8).abs() < 1e-9);
-        assert_eq!((info.scope.as_str(), info.kind.as_str()), ("project", "architecture"));
+        assert_eq!(
+            (info.scope.as_str(), info.kind.as_str()),
+            ("project", "architecture")
+        );
         // Embedding persisted under the embedder's model id.
         assert!(db::get_embedding(&db, "memory", id, emb.id())
             .await
@@ -380,7 +417,10 @@ mod tests {
             .iter()
             .find(|m| m.summary.contains("7 May 2023"))
             .expect("date fact must be retrievable by its date");
-        assert_ne!(fact_hit.id, id, "fact is a memory distinct from the narrative");
+        assert_ne!(
+            fact_hit.id, id,
+            "fact is a memory distinct from the narrative"
+        );
         let meta = db::get_memory_meta_full(&db, fact_hit.id).await.unwrap();
         assert_eq!(meta.kind, "fact", "fact memory must be tagged kind=fact");
 
@@ -429,9 +469,62 @@ mod tests {
             .iter()
             .find(|m| m.summary.contains("researched adoption agencies"))
             .expect("dated fact retrievable");
-        assert!(fact.summary.contains("2023-05-08"), "fact text must carry the date");
+        assert!(
+            fact.summary.contains("2023-05-08"),
+            "fact text must carry the date"
+        );
         let meta = db::get_memory_meta_full(&db, fact.id).await.unwrap();
         assert_eq!(meta.event_time.as_deref(), Some("2023-05-08"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn persist_stores_structured_relations_as_graph_edges() {
+        let path = std::env::temp_dir().join(format!("ironmem-rel-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::new(&path.to_string_lossy()).await.unwrap();
+        db.migrate().await.unwrap();
+        let session = create_session(&db, "/tmp/p").await.unwrap();
+        let store = crate::vectorstore::BruteForceStore;
+        let result = CompressionResult {
+            summary: "Caroline moved work forward".into(),
+            tags: "caroline acme".into(),
+            importance: 7,
+            kind: "session".into(),
+            event_time: Some("2026-06-05".into()),
+            relations: vec![provider::MemoryRelation {
+                source: "Caroline".into(),
+                relation: "status".into(),
+                target: "approved".into(),
+                valid_from: None,
+                valid_until: None,
+                confidence: 0.88,
+            }],
+            ..Default::default()
+        };
+
+        let memory_id = persist(&db, None, &store, "/tmp/p", &session, result)
+            .await
+            .unwrap();
+
+        let edges = db::memory_edges_for_entity(&db, Some("/tmp/p"), "Caroline", false, 10)
+            .await
+            .unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].memory_id, memory_id);
+        assert_eq!(edges[0].source, "Caroline");
+        assert_eq!(edges[0].relation, "status");
+        assert_eq!(edges[0].target, "approved");
+        assert_eq!(edges[0].valid_from.as_deref(), Some("2026-06-05"));
+        assert!((edges[0].confidence - 0.88).abs() < 1e-9);
+
+        // Relation endpoints are also indexed as entities on the narrative row.
+        assert_eq!(
+            db::memories_for_entity(&db, Some("/tmp/p"), "approved", 10)
+                .await
+                .unwrap(),
+            vec![memory_id]
+        );
+
         let _ = std::fs::remove_file(path);
     }
 
@@ -488,7 +581,10 @@ mod tests {
 
         // scope/kind landed; importance bumped above the neutral default.
         let info = db::get_memory_meta_full(&db, id).await.unwrap();
-        assert_eq!((info.scope.as_str(), info.kind.as_str()), ("user", "preference"));
+        assert_eq!(
+            (info.scope.as_str(), info.kind.as_str()),
+            ("user", "preference")
+        );
         assert!((info.importance - 0.7).abs() < 1e-9);
         // Embedding written under the embedder's model id.
         assert!(db::get_embedding(&db, "memory", id, emb.id())
@@ -497,8 +593,13 @@ mod tests {
             .is_some());
         // Retrievable via the global user scope, irrespective of which project
         // it was created in (the cross-project guarantee).
-        let users = db::get_recent_memories_scoped(&db, "user", None, 10).await.unwrap();
-        assert!(users.iter().any(|m| m.id == id), "user memory must be globally visible");
+        let users = db::get_recent_memories_scoped(&db, "user", None, 10)
+            .await
+            .unwrap();
+        assert!(
+            users.iter().any(|m| m.id == id),
+            "user memory must be globally visible"
+        );
         // It must NOT appear under another project's project-scope view.
         let proj_b = db::get_recent_memories_scoped(&db, "project", Some("/tmp/projB"), 10)
             .await
@@ -510,7 +611,10 @@ mod tests {
             .await
             .unwrap();
         let info2 = db::get_memory_meta_full(&db, id2).await.unwrap();
-        assert_eq!((info2.scope.as_str(), info2.kind.as_str()), ("project", "session"));
+        assert_eq!(
+            (info2.scope.as_str(), info2.kind.as_str()),
+            ("project", "session")
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -523,13 +627,31 @@ mod tests {
         let session = create_session(&db, "/tmp/p").await.unwrap();
         let store = crate::vectorstore::BruteForceStore;
 
-        db::insert_observation(&db, &session, "/tmp/p", "Read", Some("src/main.rs"), Some("fn main(){}"), 2048)
+        db::insert_observation(
+            &db,
+            &session,
+            "/tmp/p",
+            "Read",
+            Some("src/main.rs"),
+            Some("fn main(){}"),
+            2048,
+        )
+        .await
+        .unwrap();
+        db::insert_observation(
+            &db,
+            &session,
+            "/tmp/p",
+            "Bash",
+            Some("cargo test"),
+            Some("ok"),
+            2048,
+        )
+        .await
+        .unwrap();
+        let observations = db::get_observations_for_session(&db, &session)
             .await
             .unwrap();
-        db::insert_observation(&db, &session, "/tmp/p", "Bash", Some("cargo test"), Some("ok"), 2048)
-            .await
-            .unwrap();
-        let observations = db::get_observations_for_session(&db, &session).await.unwrap();
 
         let result = CompressionResult {
             summary: "s".into(),

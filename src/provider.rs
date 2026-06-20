@@ -54,6 +54,19 @@ pub struct CompressionResult {
     /// organizations, products. Indexed in `memory_entities` so name-anchored
     /// questions resolve by direct lookup regardless of keyword/vector rank.
     pub entities: Vec<String>,
+    /// Structured relation edges extracted from the session (`RELATIONS:`).
+    /// Persisted as temporal graph edges with source-memory provenance.
+    pub relations: Vec<MemoryRelation>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryRelation {
+    pub source: String,
+    pub relation: String,
+    pub target: String,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub confidence: f64,
 }
 
 /// Default importance when the model omits or mangles the IMPORTANCE line.
@@ -69,6 +82,7 @@ impl Default for CompressionResult {
             facts: Vec::new(),
             event_time: None,
             entities: Vec::new(),
+            relations: Vec::new(),
         }
     }
 }
@@ -122,6 +136,10 @@ fn build_prompt(observations: &[Observation]) -> String {
         "ENTITIES: [comma-separated proper nouns named in the session — people, places, organizations, products. Omit common words; write 'none' if there are no proper nouns.]"
             .to_string(),
     );
+    lines.push(
+        "RELATIONS: [one structured relation per line, each starting with \"- \". Format exactly: source | relation | target | valid_from | valid_until | confidence. Use concise relation names like works_at, lives_at, status, depends_on, decided, owns, uses, part_of. Put 'none' for unknown dates. Confidence is 0.0-1.0. Example: \"- Caroline | status | approved | 2026-06-05 | none | 0.9\". If there are no durable relationships, write \"- none\".]"
+            .to_string(),
+    );
 
     lines.join("\n")
 }
@@ -134,36 +152,46 @@ fn parse_response(text: &str) -> CompressionResult {
     let mut facts: Vec<String> = Vec::new();
     let mut event_time: Option<String> = None;
     let mut entities: Vec<String> = Vec::new();
+    let mut relations: Vec<MemoryRelation> = Vec::new();
     // FACTS is a multi-line block: once the marker is seen, subsequent "- "
     // bullet lines are facts until the next known marker ends the block.
     let mut in_facts = false;
+    let mut in_relations = false;
 
     for line in text.lines() {
         if let Some(s) = line.strip_prefix("SUMMARY:") {
             summary = s.trim().to_string();
             in_facts = false;
+            in_relations = false;
         } else if let Some(rest) = line.strip_prefix("FACTS:") {
             in_facts = true;
+            in_relations = false;
             // Tolerate a first fact placed on the marker line itself.
             push_fact(&mut facts, rest);
         } else if let Some(t) = line.strip_prefix("TAGS:") {
             tags = t.trim().to_string();
             in_facts = false;
+            in_relations = false;
         } else if let Some(i) = line.strip_prefix("IMPORTANCE:") {
             importance = parse_importance(i);
             in_facts = false;
+            in_relations = false;
         } else if let Some(k) = line.strip_prefix("KIND:") {
             // Clamp to the known set; unrecognized values collapse to `session`.
             kind = Some(crate::db::clamp_kind(k).to_string());
             in_facts = false;
+            in_relations = false;
         } else if let Some(w) = line.strip_prefix("WHEN:") {
             let w = w.trim();
             // Treat blank / "none" / "unknown" as undated.
-            if !w.is_empty() && !w.eq_ignore_ascii_case("none") && !w.eq_ignore_ascii_case("unknown")
+            if !w.is_empty()
+                && !w.eq_ignore_ascii_case("none")
+                && !w.eq_ignore_ascii_case("unknown")
             {
                 event_time = Some(w.to_string());
             }
             in_facts = false;
+            in_relations = false;
         } else if let Some(e) = line.strip_prefix("ENTITIES:") {
             for ent in e.split(',') {
                 let ent = ent.trim();
@@ -172,8 +200,15 @@ fn parse_response(text: &str) -> CompressionResult {
                 }
             }
             in_facts = false;
+            in_relations = false;
+        } else if let Some(rest) = line.strip_prefix("RELATIONS:") {
+            in_facts = false;
+            in_relations = true;
+            push_relation(&mut relations, rest);
         } else if in_facts {
             push_fact(&mut facts, line);
+        } else if in_relations {
+            push_relation(&mut relations, line);
         }
     }
 
@@ -190,6 +225,7 @@ fn parse_response(text: &str) -> CompressionResult {
         facts,
         event_time,
         entities,
+        relations,
     }
 }
 
@@ -209,6 +245,48 @@ fn push_fact(facts: &mut Vec<String>, line: &str) {
     }
 }
 
+fn optional_relation_date(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("unknown") {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+fn push_relation(relations: &mut Vec<MemoryRelation>, line: &str) {
+    let trimmed = line.trim();
+    let bullet = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix('-'));
+    let Some(raw) = bullet.map(str::trim) else {
+        return;
+    };
+    if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
+        return;
+    }
+
+    let parts = raw.split('|').map(str::trim).collect::<Vec<_>>();
+    if parts.len() != 6 {
+        return;
+    }
+    let source = parts[0];
+    let relation = parts[1];
+    let target = parts[2];
+    if source.is_empty() || relation.is_empty() || target.is_empty() {
+        return;
+    }
+    let confidence = parts[5].parse::<f64>().unwrap_or(0.5).clamp(0.0, 1.0);
+    relations.push(MemoryRelation {
+        source: source.to_string(),
+        relation: relation.to_string(),
+        target: target.to_string(),
+        valid_from: optional_relation_date(parts[3]),
+        valid_until: optional_relation_date(parts[4]),
+        confidence,
+    });
+}
+
 /// Parse the IMPORTANCE value, taking the first integer found and clamping to
 /// 1..=10. Returns `None` if no integer is present (caller applies the default).
 fn parse_importance(s: &str) -> Option<u8> {
@@ -218,10 +296,7 @@ fn parse_importance(s: &str) -> Option<u8> {
         .skip_while(|c| !c.is_ascii_digit())
         .take_while(|c| c.is_ascii_digit())
         .collect();
-    digits
-        .parse::<i64>()
-        .ok()
-        .map(|n| n.clamp(1, 10) as u8)
+    digits.parse::<i64>().ok().map(|n| n.clamp(1, 10) as u8)
 }
 
 // ── API key resolution ──────────────────────────────────────────────
@@ -245,10 +320,7 @@ pub fn resolve_api_key(provider: Provider) -> Result<String> {
 
 // ── Compress dispatcher ─────────────────────────────────────────────
 
-pub async fn compress(
-    observations: &[Observation],
-    config: &Config,
-) -> Result<CompressionResult> {
+pub async fn compress(observations: &[Observation], config: &Config) -> Result<CompressionResult> {
     if observations.is_empty() {
         return Err(anyhow!("No observations to compress"));
     }
@@ -311,7 +383,9 @@ struct AnthropicResponse {
 }
 
 async fn compress_anthropic(prompt: &str, model: &str, api_key: &str) -> Result<CompressionResult> {
-    Ok(parse_response(&anthropic_text(prompt, model, api_key).await?))
+    Ok(parse_response(
+        &anthropic_text(prompt, model, api_key).await?,
+    ))
 }
 
 async fn anthropic_text(prompt: &str, model: &str, api_key: &str) -> Result<String> {
@@ -521,13 +595,18 @@ mod tests {
 
     #[test]
     fn parse_response_treats_when_none_as_undated() {
-        assert!(parse_response("SUMMARY: s\nWHEN: none").event_time.is_none());
+        assert!(parse_response("SUMMARY: s\nWHEN: none")
+            .event_time
+            .is_none());
         assert!(parse_response("SUMMARY: s").event_time.is_none());
     }
 
     #[test]
     fn prompt_emits_when_section() {
-        assert!(build_prompt(&[]).contains("WHEN:"), "prompt must request WHEN");
+        assert!(
+            build_prompt(&[]).contains("WHEN:"),
+            "prompt must request WHEN"
+        );
     }
 
     #[test]
@@ -538,7 +617,9 @@ mod tests {
 
     #[test]
     fn parse_response_entities_none_is_empty() {
-        assert!(parse_response("SUMMARY: s\nENTITIES: none").entities.is_empty());
+        assert!(parse_response("SUMMARY: s\nENTITIES: none")
+            .entities
+            .is_empty());
         assert!(parse_response("SUMMARY: s").entities.is_empty());
     }
 
@@ -547,6 +628,46 @@ mod tests {
         assert!(
             build_prompt(&[]).contains("ENTITIES:"),
             "prompt must request ENTITIES"
+        );
+    }
+
+    #[test]
+    fn parse_response_extracts_relations_block() {
+        let r = parse_response(
+            "SUMMARY: s\nRELATIONS:\n- Caroline | status | approved | 2026-06-05 | none | 0.9\n- Operator OS | depends_on | Iron Mem | none | none | 0.75\nTAGS: a b",
+        );
+        assert_eq!(r.relations.len(), 2);
+        assert_eq!(
+            r.relations[0],
+            MemoryRelation {
+                source: "Caroline".into(),
+                relation: "status".into(),
+                target: "approved".into(),
+                valid_from: Some("2026-06-05".into()),
+                valid_until: None,
+                confidence: 0.9,
+            }
+        );
+        assert_eq!(r.relations[1].source, "Operator OS");
+        assert_eq!(r.relations[1].target, "Iron Mem");
+        assert_eq!(r.relations[1].confidence, 0.75);
+    }
+
+    #[test]
+    fn parse_response_ignores_malformed_or_none_relations() {
+        let r = parse_response(
+            "SUMMARY: s\nRELATIONS:\n- none\n- missing | fields\n-  | status | draft | none | none | 0.8\n- James | role | operator | none | none | 1.4",
+        );
+        assert_eq!(r.relations.len(), 1);
+        assert_eq!(r.relations[0].source, "James");
+        assert_eq!(r.relations[0].confidence, 1.0);
+    }
+
+    #[test]
+    fn prompt_emits_relations_section() {
+        assert!(
+            build_prompt(&[]).contains("RELATIONS:"),
+            "prompt must request RELATIONS"
         );
     }
 
