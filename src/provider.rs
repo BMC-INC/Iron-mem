@@ -25,7 +25,7 @@ impl Provider {
 
     pub fn default_model(&self) -> &'static str {
         match self {
-            Provider::Anthropic => "claude-sonnet-4-6-20250627",
+            Provider::Anthropic => "claude-sonnet-4-6",
             Provider::Openai => "gpt-4o",
             Provider::Google => "gemini-2.0-flash",
         }

@@ -509,7 +509,7 @@ The UI shows sessions, memories, and database stats. You can browse, search, and
 {
   "port": 37778,
   "provider": "anthropic",
-  "model": "claude-sonnet-4-6-20250627",
+  "model": "claude-sonnet-4-6",
   "inject_limit": 5,
   "max_observation_bytes": 2048,
   "db_path": "/Users/you/.ironmem/mem.db",
@@ -574,7 +574,7 @@ IronMem supports three LLM providers for session compression:
 
 | Provider | `provider` value | Default model | API key env var |
 |----------|-----------------|---------------|-----------------|
-| **Anthropic** | `"anthropic"` | `claude-sonnet-4-6-20250627` | `ANTHROPIC_API_KEY` |
+| **Anthropic** | `"anthropic"` | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` |
 | **OpenAI** | `"openai"` | `gpt-4o` | `OPENAI_API_KEY` |
 | **Google Gemini** | `"google"` | `gemini-2.0-flash` | `GOOGLE_API_KEY` |
 
