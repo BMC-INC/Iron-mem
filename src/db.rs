@@ -146,6 +146,89 @@ pub struct SessionHistoryEntry {
     pub tags: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[allow(dead_code)]
+pub struct MemoryFeedback {
+    pub id: i64,
+    pub memory_id: i64,
+    pub project: String,
+    pub signal: String,
+    pub weight: f64,
+    pub detail: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[allow(dead_code)]
+pub struct InjectionEvent {
+    pub id: i64,
+    pub project: String,
+    pub session_id: Option<String>,
+    pub memory_id: i64,
+    pub rank: i64,
+    pub query: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct MemoryScoreAdjustment {
+    pub memory_id: i64,
+    pub feedback_score: f64,
+    pub injection_count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct CodeAnchor {
+    pub id: i64,
+    pub project: String,
+    pub memory_id: i64,
+    pub path: String,
+    pub language: String,
+    pub symbol_kind: String,
+    pub symbol_name: String,
+    pub ast_hash: String,
+    pub context_hash: String,
+    pub start_byte: i64,
+    pub end_byte: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct ReflectionProposal {
+    pub id: i64,
+    pub project: String,
+    pub kind: String,
+    pub source_memory_ids: Vec<i64>,
+    pub proposed_summary: String,
+    pub status: String,
+    pub created_at: i64,
+    pub applied_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct BrainSnapshot {
+    pub id: String,
+    pub label: Option<String>,
+    pub project: Option<String>,
+    pub memory_count: i64,
+    pub edge_count: i64,
+    pub blob_hash: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct SyncEvent {
+    pub event_id: String,
+    pub node_id: String,
+    pub project: Option<String>,
+    pub lamport: i64,
+    pub op_type: String,
+    pub payload: String,
+    pub created_at: i64,
+    pub applied_at: Option<i64>,
+}
+
 impl Database {
     pub async fn new(url: &str) -> Result<Self> {
         register_sqlite_vec();
@@ -571,6 +654,221 @@ impl Database {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_memory_chunks_memory
              ON memory_chunks(memory_id, ordinal)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Closed-loop retrieval quality: record what was injected and whether
+        // later behavior indicated that memory helped or hurt.
+        match self.backend {
+            Backend::Sqlite => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS injection_events (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        project     TEXT NOT NULL,
+                        session_id  TEXT,
+                        memory_id   BIGINT NOT NULL,
+                        rank        BIGINT NOT NULL,
+                        query       TEXT,
+                        created_at  BIGINT NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+            Backend::Postgres => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS injection_events (
+                        id          BIGSERIAL PRIMARY KEY,
+                        project     TEXT NOT NULL,
+                        session_id  TEXT,
+                        memory_id   BIGINT NOT NULL,
+                        rank        BIGINT NOT NULL,
+                        query       TEXT,
+                        created_at  BIGINT NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_injection_events_memory
+             ON injection_events(memory_id, created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        match self.backend {
+            Backend::Sqlite => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS memory_feedback (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        memory_id   BIGINT NOT NULL,
+                        project     TEXT NOT NULL,
+                        signal      TEXT NOT NULL,
+                        weight      DOUBLE PRECISION NOT NULL,
+                        detail      TEXT,
+                        created_at  BIGINT NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+            Backend::Postgres => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS memory_feedback (
+                        id          BIGSERIAL PRIMARY KEY,
+                        memory_id   BIGINT NOT NULL,
+                        project     TEXT NOT NULL,
+                        signal      TEXT NOT NULL,
+                        weight      DOUBLE PRECISION NOT NULL,
+                        detail      TEXT,
+                        created_at  BIGINT NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memory_feedback_memory
+             ON memory_feedback(memory_id, created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // AST-bound memory anchors. v1 ships a real tree-sitter Rust parser and
+        // stores language-tagged symbol hashes so more grammars can be added
+        // without changing the database contract.
+        match self.backend {
+            Backend::Sqlite => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS code_anchors (
+                        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                        project      TEXT NOT NULL,
+                        memory_id    BIGINT NOT NULL,
+                        path         TEXT NOT NULL,
+                        language     TEXT NOT NULL,
+                        symbol_kind  TEXT NOT NULL,
+                        symbol_name  TEXT NOT NULL,
+                        ast_hash     TEXT NOT NULL,
+                        context_hash TEXT NOT NULL,
+                        start_byte   BIGINT NOT NULL,
+                        end_byte     BIGINT NOT NULL,
+                        created_at   BIGINT NOT NULL,
+                        updated_at   BIGINT NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+            Backend::Postgres => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS code_anchors (
+                        id           BIGSERIAL PRIMARY KEY,
+                        project      TEXT NOT NULL,
+                        memory_id    BIGINT NOT NULL,
+                        path         TEXT NOT NULL,
+                        language     TEXT NOT NULL,
+                        symbol_kind  TEXT NOT NULL,
+                        symbol_name  TEXT NOT NULL,
+                        ast_hash     TEXT NOT NULL,
+                        context_hash TEXT NOT NULL,
+                        start_byte   BIGINT NOT NULL,
+                        end_byte     BIGINT NOT NULL,
+                        created_at   BIGINT NOT NULL,
+                        updated_at   BIGINT NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_code_anchors_lookup
+             ON code_anchors(project, language, symbol_name, ast_hash)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_code_anchors_memory
+             ON code_anchors(memory_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        match self.backend {
+            Backend::Sqlite => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS reflection_proposals (
+                        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                        project           TEXT NOT NULL,
+                        kind              TEXT NOT NULL,
+                        source_memory_ids TEXT NOT NULL,
+                        proposed_summary  TEXT NOT NULL,
+                        status            TEXT NOT NULL,
+                        created_at        BIGINT NOT NULL,
+                        applied_at        BIGINT
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+            Backend::Postgres => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS reflection_proposals (
+                        id                BIGSERIAL PRIMARY KEY,
+                        project           TEXT NOT NULL,
+                        kind              TEXT NOT NULL,
+                        source_memory_ids TEXT NOT NULL,
+                        proposed_summary  TEXT NOT NULL,
+                        status            TEXT NOT NULL,
+                        created_at        BIGINT NOT NULL,
+                        applied_at        BIGINT
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_reflection_proposals_project
+             ON reflection_proposals(project, status, created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS brain_snapshots (
+                id           TEXT PRIMARY KEY,
+                label        TEXT,
+                project      TEXT,
+                memory_count BIGINT NOT NULL,
+                edge_count   BIGINT NOT NULL,
+                blob_hash    TEXT NOT NULL,
+                created_at   BIGINT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS sync_events (
+                event_id   TEXT PRIMARY KEY,
+                node_id    TEXT NOT NULL,
+                project    TEXT,
+                lamport    BIGINT NOT NULL,
+                op_type    TEXT NOT NULL,
+                payload    TEXT NOT NULL,
+                created_at BIGINT NOT NULL,
+                applied_at BIGINT
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_sync_events_order
+             ON sync_events(project, lamport, created_at)",
         )
         .execute(&self.pool)
         .await?;
@@ -1867,7 +2165,7 @@ pub async fn memory_edges_for_entity_at(
     Ok(rows.into_iter().map(memory_edge_from_row).collect())
 }
 
-async fn all_memory_edges(db: &Database, project: Option<&str>) -> Result<Vec<MemoryEdge>> {
+pub async fn all_memory_edges(db: &Database, project: Option<&str>) -> Result<Vec<MemoryEdge>> {
     let mut sql =
         "SELECT id, project, memory_id, source, relation, target, valid_from, valid_until,
                 observed_at, confidence, superseded_by, superseded_reason, created_at
@@ -2259,6 +2557,627 @@ pub async fn recent_memory_chunks(
         .await?,
     };
     Ok(rows.into_iter().map(memory_chunk_from_row).collect())
+}
+
+// ── Feedback, decay, and usage reinforcement ────────────────────────────────
+
+pub async fn record_injection_events(
+    db: &Database,
+    project: &str,
+    session_id: Option<&str>,
+    query: Option<&str>,
+    memories: &[Memory],
+) -> Result<()> {
+    let now = Utc::now().timestamp();
+    for (idx, memory) in memories.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO injection_events(project, session_id, memory_id, rank, query, created_at)
+             VALUES($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(project)
+        .bind(session_id)
+        .bind(memory.id)
+        .bind(idx as i64 + 1)
+        .bind(query)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+    }
+    Ok(())
+}
+
+pub async fn record_memory_feedback(
+    db: &Database,
+    memory_id: i64,
+    project: &str,
+    signal: &str,
+    weight: f64,
+    detail: Option<&str>,
+) -> Result<i64> {
+    let now = Utc::now().timestamp();
+    let weight = weight.clamp(-2.0, 2.0);
+    match db.backend {
+        Backend::Sqlite => {
+            let mut conn = db.pool.acquire().await?;
+            sqlx::query(
+                "INSERT INTO memory_feedback(memory_id, project, signal, weight, detail, created_at)
+                 VALUES($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(memory_id)
+            .bind(project)
+            .bind(signal.trim())
+            .bind(weight)
+            .bind(detail)
+            .bind(now)
+            .execute(&mut *conn)
+            .await?;
+            let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() AS id")
+                .fetch_one(&mut *conn)
+                .await?;
+            Ok(row.get("id"))
+        }
+        Backend::Postgres => {
+            let row: sqlx::any::AnyRow = sqlx::query(
+                "INSERT INTO memory_feedback(memory_id, project, signal, weight, detail, created_at)
+                 VALUES($1, $2, $3, $4, $5, $6) RETURNING id",
+            )
+            .bind(memory_id)
+            .bind(project)
+            .bind(signal.trim())
+            .bind(weight)
+            .bind(detail)
+            .bind(now)
+            .fetch_one(&db.pool)
+            .await?;
+            Ok(row.get("id"))
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub async fn feedback_for_memory(db: &Database, memory_id: i64) -> Result<Vec<MemoryFeedback>> {
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(
+        "SELECT id, memory_id, project, signal, weight, detail, created_at
+         FROM memory_feedback WHERE memory_id = $1 ORDER BY created_at DESC, id DESC",
+    )
+    .bind(memory_id)
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| MemoryFeedback {
+            id: r.get("id"),
+            memory_id: r.get("memory_id"),
+            project: r.get("project"),
+            signal: r.get("signal"),
+            weight: r.try_get::<f64, _>("weight").unwrap_or(0.0),
+            detail: r.try_get("detail").ok().flatten(),
+            created_at: r.get("created_at"),
+        })
+        .collect())
+}
+
+pub async fn score_adjustments_for_memories(
+    db: &Database,
+    ids: &[i64],
+) -> Result<HashMap<i64, MemoryScoreAdjustment>> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let in_list = ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let feedback_sql = format!(
+        "SELECT memory_id, COALESCE(SUM(weight), 0.0) AS score
+         FROM memory_feedback WHERE memory_id IN ({in_list}) GROUP BY memory_id"
+    );
+    for r in sqlx::query(&feedback_sql).fetch_all(&db.pool).await? {
+        let id: i64 = r.get("memory_id");
+        out.entry(id)
+            .or_insert_with(|| MemoryScoreAdjustment {
+                memory_id: id,
+                ..Default::default()
+            })
+            .feedback_score = r.try_get::<f64, _>("score").unwrap_or(0.0);
+    }
+    let injection_sql = format!(
+        "SELECT memory_id, COUNT(*) AS cnt
+         FROM injection_events WHERE memory_id IN ({in_list}) GROUP BY memory_id"
+    );
+    for r in sqlx::query(&injection_sql).fetch_all(&db.pool).await? {
+        let id: i64 = r.get("memory_id");
+        out.entry(id)
+            .or_insert_with(|| MemoryScoreAdjustment {
+                memory_id: id,
+                ..Default::default()
+            })
+            .injection_count = r.get("cnt");
+    }
+    Ok(out)
+}
+
+pub fn reinforcement_multiplier(feedback_score: f64, injection_count: i64) -> f64 {
+    let positive = (feedback_score.max(0.0) * 0.08).min(0.45);
+    let negative = (feedback_score.min(0.0).abs() * 0.12).min(0.65);
+    let ignored = if injection_count >= 5 && feedback_score <= 0.0 {
+        ((injection_count - 4) as f64 * 0.015).min(0.25)
+    } else {
+        0.0
+    };
+    (1.0 + positive - negative - ignored).clamp(0.2, 1.6)
+}
+
+// ── Graph curation ───────────────────────────────────────────────────────────
+
+#[allow(dead_code)]
+pub async fn memory_edge_by_id(db: &Database, edge_id: i64) -> Result<Option<MemoryEdge>> {
+    let row = sqlx::query(
+        "SELECT id, project, memory_id, source, relation, target, valid_from, valid_until,
+                observed_at, confidence, superseded_by, superseded_reason, created_at
+         FROM memory_edges WHERE id = $1",
+    )
+    .bind(edge_id)
+    .fetch_optional(&db.pool)
+    .await?;
+    Ok(row.map(memory_edge_from_row))
+}
+
+pub async fn curate_memory_edge_delete(db: &Database, edge_id: i64) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE memory_edges
+         SET superseded_by = id, superseded_reason = 'user_deleted'
+         WHERE id = $1 AND superseded_by IS NULL",
+    )
+    .bind(edge_id)
+    .execute(&db.pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn curate_memory_edge_update(
+    db: &Database,
+    edge_id: i64,
+    source: &str,
+    relation: &str,
+    target: &str,
+    valid_from: Option<&str>,
+    valid_until: Option<&str>,
+    confidence: f64,
+) -> Result<bool> {
+    let source_norm = normalize_graph_text(source);
+    let relation_norm = normalize_relation(relation);
+    let target_norm = normalize_graph_text(target);
+    if source_norm.is_empty() || relation_norm.is_empty() || target_norm.is_empty() {
+        anyhow::bail!("source, relation, and target must not be empty");
+    }
+    let result = sqlx::query(
+        "UPDATE memory_edges
+         SET source = $1, source_norm = $2, relation = $3, relation_norm = $4,
+             target = $5, target_norm = $6, valid_from = $7, valid_until = $8,
+             confidence = $9, superseded_by = NULL, superseded_reason = NULL
+         WHERE id = $10",
+    )
+    .bind(source.trim())
+    .bind(source_norm)
+    .bind(relation.trim())
+    .bind(relation_norm)
+    .bind(target.trim())
+    .bind(target_norm)
+    .bind(valid_from)
+    .bind(valid_until)
+    .bind(confidence.clamp(0.0, 1.0))
+    .bind(edge_id)
+    .execute(&db.pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+// ── AST-bound code anchors ───────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_code_anchor(
+    db: &Database,
+    project: &str,
+    memory_id: i64,
+    path: &str,
+    language: &str,
+    symbol_kind: &str,
+    symbol_name: &str,
+    ast_hash: &str,
+    context_hash: &str,
+    start_byte: i64,
+    end_byte: i64,
+) -> Result<i64> {
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "DELETE FROM code_anchors
+         WHERE project = $1 AND memory_id = $2 AND language = $3 AND symbol_name = $4",
+    )
+    .bind(project)
+    .bind(memory_id)
+    .bind(language)
+    .bind(symbol_name)
+    .execute(&db.pool)
+    .await?;
+
+    match db.backend {
+        Backend::Sqlite => {
+            let mut conn = db.pool.acquire().await?;
+            sqlx::query(
+                "INSERT INTO code_anchors
+                 (project, memory_id, path, language, symbol_kind, symbol_name, ast_hash,
+                  context_hash, start_byte, end_byte, created_at, updated_at)
+                 VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            )
+            .bind(project)
+            .bind(memory_id)
+            .bind(path)
+            .bind(language)
+            .bind(symbol_kind)
+            .bind(symbol_name)
+            .bind(ast_hash)
+            .bind(context_hash)
+            .bind(start_byte)
+            .bind(end_byte)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *conn)
+            .await?;
+            let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() AS id")
+                .fetch_one(&mut *conn)
+                .await?;
+            Ok(row.get("id"))
+        }
+        Backend::Postgres => {
+            let row: sqlx::any::AnyRow = sqlx::query(
+                "INSERT INTO code_anchors
+                 (project, memory_id, path, language, symbol_kind, symbol_name, ast_hash,
+                  context_hash, start_byte, end_byte, created_at, updated_at)
+                 VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 RETURNING id",
+            )
+            .bind(project)
+            .bind(memory_id)
+            .bind(path)
+            .bind(language)
+            .bind(symbol_kind)
+            .bind(symbol_name)
+            .bind(ast_hash)
+            .bind(context_hash)
+            .bind(start_byte)
+            .bind(end_byte)
+            .bind(now)
+            .bind(now)
+            .fetch_one(&db.pool)
+            .await?;
+            Ok(row.get("id"))
+        }
+    }
+}
+
+fn code_anchor_from_row(r: sqlx::any::AnyRow) -> CodeAnchor {
+    CodeAnchor {
+        id: r.get("id"),
+        project: r.get("project"),
+        memory_id: r.get("memory_id"),
+        path: r.get("path"),
+        language: r.get("language"),
+        symbol_kind: r.get("symbol_kind"),
+        symbol_name: r.get("symbol_name"),
+        ast_hash: r.get("ast_hash"),
+        context_hash: r.get("context_hash"),
+        start_byte: r.get("start_byte"),
+        end_byte: r.get("end_byte"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+    }
+}
+
+pub async fn code_anchors_for_project(db: &Database, project: &str) -> Result<Vec<CodeAnchor>> {
+    let rows = sqlx::query(
+        "SELECT id, project, memory_id, path, language, symbol_kind, symbol_name, ast_hash,
+                context_hash, start_byte, end_byte, created_at, updated_at
+         FROM code_anchors WHERE project = $1 ORDER BY updated_at DESC, id DESC",
+    )
+    .bind(project)
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows.into_iter().map(code_anchor_from_row).collect())
+}
+
+pub async fn update_code_anchor_location(
+    db: &Database,
+    anchor_id: i64,
+    path: &str,
+    start_byte: i64,
+    end_byte: i64,
+    context_hash: &str,
+) -> Result<bool> {
+    let now = Utc::now().timestamp();
+    let result = sqlx::query(
+        "UPDATE code_anchors
+         SET path = $1, start_byte = $2, end_byte = $3, context_hash = $4, updated_at = $5
+         WHERE id = $6",
+    )
+    .bind(path)
+    .bind(start_byte)
+    .bind(end_byte)
+    .bind(context_hash)
+    .bind(now)
+    .bind(anchor_id)
+    .execute(&db.pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+// ── Reflection/consolidation proposals ──────────────────────────────────────
+
+fn proposal_ids_to_json(ids: &[i64]) -> String {
+    serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn proposal_ids_from_json(raw: &str) -> Vec<i64> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+pub async fn insert_reflection_proposal(
+    db: &Database,
+    project: &str,
+    kind: &str,
+    source_memory_ids: &[i64],
+    proposed_summary: &str,
+) -> Result<i64> {
+    let now = Utc::now().timestamp();
+    let ids = proposal_ids_to_json(source_memory_ids);
+    match db.backend {
+        Backend::Sqlite => {
+            let mut conn = db.pool.acquire().await?;
+            sqlx::query(
+                "INSERT INTO reflection_proposals
+                 (project, kind, source_memory_ids, proposed_summary, status, created_at)
+                 VALUES($1, $2, $3, $4, 'proposed', $5)",
+            )
+            .bind(project)
+            .bind(clamp_kind(kind))
+            .bind(ids)
+            .bind(proposed_summary)
+            .bind(now)
+            .execute(&mut *conn)
+            .await?;
+            let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() AS id")
+                .fetch_one(&mut *conn)
+                .await?;
+            Ok(row.get("id"))
+        }
+        Backend::Postgres => {
+            let row: sqlx::any::AnyRow = sqlx::query(
+                "INSERT INTO reflection_proposals
+                 (project, kind, source_memory_ids, proposed_summary, status, created_at)
+                 VALUES($1, $2, $3, $4, 'proposed', $5) RETURNING id",
+            )
+            .bind(project)
+            .bind(clamp_kind(kind))
+            .bind(ids)
+            .bind(proposed_summary)
+            .bind(now)
+            .fetch_one(&db.pool)
+            .await?;
+            Ok(row.get("id"))
+        }
+    }
+}
+
+fn reflection_proposal_from_row(r: sqlx::any::AnyRow) -> ReflectionProposal {
+    ReflectionProposal {
+        id: r.get("id"),
+        project: r.get("project"),
+        kind: r.get("kind"),
+        source_memory_ids: proposal_ids_from_json(&r.get::<String, _>("source_memory_ids")),
+        proposed_summary: r.get("proposed_summary"),
+        status: r.get("status"),
+        created_at: r.get("created_at"),
+        applied_at: r.try_get("applied_at").ok().flatten(),
+    }
+}
+
+pub async fn reflection_proposals(
+    db: &Database,
+    project: Option<&str>,
+    status: Option<&str>,
+    limit: i64,
+) -> Result<Vec<ReflectionProposal>> {
+    let mut sql =
+        "SELECT id, project, kind, source_memory_ids, proposed_summary, status, created_at, applied_at
+         FROM reflection_proposals"
+            .to_string();
+    let mut clauses = Vec::new();
+    if project.is_some() {
+        clauses.push("project = $1");
+    }
+    if status.is_some() {
+        clauses.push(if project.is_some() {
+            "status = $2"
+        } else {
+            "status = $1"
+        });
+    }
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+    let limit_ph = match (project.is_some(), status.is_some()) {
+        (true, true) => "$3",
+        (true, false) | (false, true) => "$2",
+        (false, false) => "$1",
+    };
+    sql.push_str(&format!(
+        " ORDER BY created_at DESC, id DESC LIMIT {limit_ph}"
+    ));
+    let mut q = sqlx::query(&sql);
+    if let Some(p) = project {
+        q = q.bind(p);
+    }
+    if let Some(s) = status {
+        q = q.bind(s);
+    }
+    let rows = q.bind(limit).fetch_all(&db.pool).await?;
+    Ok(rows.into_iter().map(reflection_proposal_from_row).collect())
+}
+
+pub async fn mark_reflection_proposal_applied(db: &Database, proposal_id: i64) -> Result<()> {
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "UPDATE reflection_proposals SET status = 'applied', applied_at = $1 WHERE id = $2",
+    )
+    .bind(now)
+    .bind(proposal_id)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+// ── Brain snapshots and sync event log ───────────────────────────────────────
+
+pub async fn insert_brain_snapshot(
+    db: &Database,
+    id: &str,
+    label: Option<&str>,
+    project: Option<&str>,
+    memory_count: i64,
+    edge_count: i64,
+    blob_hash: &str,
+) -> Result<()> {
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO brain_snapshots(id, label, project, memory_count, edge_count, blob_hash, created_at)
+         VALUES($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(id)
+    .bind(label)
+    .bind(project)
+    .bind(memory_count)
+    .bind(edge_count)
+    .bind(blob_hash)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_brain_snapshots(db: &Database, limit: i64) -> Result<Vec<BrainSnapshot>> {
+    let rows = sqlx::query(
+        "SELECT id, label, project, memory_count, edge_count, blob_hash, created_at
+         FROM brain_snapshots ORDER BY created_at DESC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| BrainSnapshot {
+            id: r.get("id"),
+            label: r.try_get("label").ok().flatten(),
+            project: r.try_get("project").ok().flatten(),
+            memory_count: r.get("memory_count"),
+            edge_count: r.get("edge_count"),
+            blob_hash: r.get("blob_hash"),
+            created_at: r.get("created_at"),
+        })
+        .collect())
+}
+
+pub async fn brain_snapshot(db: &Database, id: &str) -> Result<Option<BrainSnapshot>> {
+    let row = sqlx::query(
+        "SELECT id, label, project, memory_count, edge_count, blob_hash, created_at
+         FROM brain_snapshots WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&db.pool)
+    .await?;
+    Ok(row.map(|r| BrainSnapshot {
+        id: r.get("id"),
+        label: r.try_get("label").ok().flatten(),
+        project: r.try_get("project").ok().flatten(),
+        memory_count: r.get("memory_count"),
+        edge_count: r.get("edge_count"),
+        blob_hash: r.get("blob_hash"),
+        created_at: r.get("created_at"),
+    }))
+}
+
+pub async fn insert_sync_event(
+    db: &Database,
+    event_id: &str,
+    node_id: &str,
+    project: Option<&str>,
+    lamport: i64,
+    op_type: &str,
+    payload: &str,
+) -> Result<bool> {
+    let now = Utc::now().timestamp();
+    let result = sqlx::query(
+        "INSERT INTO sync_events(event_id, node_id, project, lamport, op_type, payload, created_at)
+         VALUES($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT(event_id) DO NOTHING",
+    )
+    .bind(event_id)
+    .bind(node_id)
+    .bind(project)
+    .bind(lamport)
+    .bind(op_type)
+    .bind(payload)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn list_sync_events(
+    db: &Database,
+    project: Option<&str>,
+    after_lamport: i64,
+    limit: i64,
+) -> Result<Vec<SyncEvent>> {
+    let rows = match project {
+        Some(p) => sqlx::query(
+            "SELECT event_id, node_id, project, lamport, op_type, payload, created_at, applied_at
+                 FROM sync_events
+                 WHERE project = $1 AND lamport > $2
+                 ORDER BY lamport ASC, created_at ASC LIMIT $3",
+        )
+        .bind(p)
+        .bind(after_lamport)
+        .bind(limit)
+        .fetch_all(&db.pool)
+        .await?,
+        None => sqlx::query(
+            "SELECT event_id, node_id, project, lamport, op_type, payload, created_at, applied_at
+                 FROM sync_events
+                 WHERE lamport > $1
+                 ORDER BY lamport ASC, created_at ASC LIMIT $2",
+        )
+        .bind(after_lamport)
+        .bind(limit)
+        .fetch_all(&db.pool)
+        .await?,
+    };
+    Ok(rows
+        .into_iter()
+        .map(|r| SyncEvent {
+            event_id: r.get("event_id"),
+            node_id: r.get("node_id"),
+            project: r.try_get("project").ok().flatten(),
+            lamport: r.get("lamport"),
+            op_type: r.get("op_type"),
+            payload: r.get("payload"),
+            created_at: r.get("created_at"),
+            applied_at: r.try_get("applied_at").ok().flatten(),
+        })
+        .collect())
 }
 
 /// Kind for each of `ids`, in one query. Ids absent from `memory_meta` (legacy

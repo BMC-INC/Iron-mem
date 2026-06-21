@@ -51,6 +51,19 @@ pub fn router(state: AppState) -> Router {
         .route("/refresh_profile", post(refresh_profile))
         .route("/corrections", get(list_corrections))
         .route("/graph", get(memory_graph))
+        .route(
+            "/graph/{id}",
+            post(update_graph_edge).delete(delete_graph_edge),
+        )
+        .route("/feedback", post(record_feedback))
+        .route("/reflect", post(run_reflection))
+        .route("/code/relink", post(code_relink))
+        .route("/snapshots", get(list_snapshots).post(create_snapshot))
+        .route("/snapshots/{id}/restore", post(restore_snapshot))
+        .route(
+            "/sync/events",
+            get(export_sync_events).post(publish_sync_event),
+        )
         // Web UI routes
         .route("/ui", get(web_ui))
         .route("/api/projects", get(api_list_projects))
@@ -399,6 +412,242 @@ async fn memory_graph(
         at: params.at,
         edges,
     }))
+}
+
+#[derive(Deserialize)]
+pub struct GraphEdgeUpdateRequest {
+    pub source: String,
+    pub relation: String,
+    pub target: String,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub confidence: Option<f64>,
+}
+
+async fn update_graph_edge(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<GraphEdgeUpdateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    for value in [body.valid_from.as_deref(), body.valid_until.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if !crate::provider::is_valid_memory_date(value) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "valid_from/valid_until must be YYYY-MM-DD".to_string(),
+            ));
+        }
+    }
+    let updated = db::curate_memory_edge_update(
+        &state.db,
+        id,
+        &body.source,
+        &body.relation,
+        &body.target,
+        body.valid_from.as_deref(),
+        body.valid_until.as_deref(),
+        body.confidence.unwrap_or(1.0),
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "updated": updated })))
+}
+
+async fn delete_graph_edge(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let deleted = db::curate_memory_edge_delete(&state.db, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "deleted": deleted })))
+}
+
+#[derive(Deserialize)]
+pub struct FeedbackRequest {
+    pub memory_id: i64,
+    pub project: String,
+    pub signal: String,
+    pub weight: Option<f64>,
+    pub detail: Option<String>,
+}
+
+async fn record_feedback(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<FeedbackRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let id = db::record_memory_feedback(
+        &state.db,
+        body.memory_id,
+        &body.project,
+        &body.signal,
+        body.weight.unwrap_or(1.0),
+        body.detail.as_deref(),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "id": id })))
+}
+
+#[derive(Deserialize)]
+pub struct ReflectionRequest {
+    pub project: Option<String>,
+    pub dry_run: Option<bool>,
+    pub apply: Option<bool>,
+    pub limit: Option<i64>,
+}
+
+async fn run_reflection(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ReflectionRequest>,
+) -> Result<Json<crate::reflection::ReflectionReport>, (StatusCode, String)> {
+    let report = crate::reflection::run(
+        &state.db,
+        state.embedder.as_deref(),
+        state.store.as_ref(),
+        body.project.as_deref(),
+        body.dry_run.unwrap_or(true),
+        body.apply.unwrap_or(false),
+        body.limit.unwrap_or(200),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(report))
+}
+
+#[derive(Deserialize)]
+pub struct CodeRelinkRequest {
+    pub project: String,
+    pub dry_run: Option<bool>,
+    pub anchor_only: Option<bool>,
+    pub relink_only: Option<bool>,
+}
+
+async fn code_relink(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CodeRelinkRequest>,
+) -> Result<Json<crate::code_anchor::CodeRelinkReport>, (StatusCode, String)> {
+    let dry_run = body.dry_run.unwrap_or(true);
+    let mut combined = crate::code_anchor::CodeRelinkReport {
+        dry_run,
+        ..Default::default()
+    };
+    if !body.relink_only.unwrap_or(false) {
+        let r = crate::code_anchor::anchor_project(&state.db, &body.project, dry_run)
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        combined.scanned_symbols = combined.scanned_symbols.max(r.scanned_symbols);
+        combined.anchors_created += r.anchors_created;
+    }
+    if !body.anchor_only.unwrap_or(false) {
+        let r = crate::code_anchor::relink_project(&state.db, &body.project, dry_run)
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        combined.scanned_symbols = combined.scanned_symbols.max(r.scanned_symbols);
+        combined.anchors_relinked += r.anchors_relinked;
+    }
+    Ok(Json(combined))
+}
+
+#[derive(Deserialize)]
+pub struct SnapshotCreateRequest {
+    pub label: Option<String>,
+    pub project: Option<String>,
+}
+
+async fn create_snapshot(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SnapshotCreateRequest>,
+) -> Result<Json<db::BrainSnapshot>, (StatusCode, String)> {
+    let snap = crate::snapshot::create(&state.db, body.label.as_deref(), body.project.as_deref())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(snap))
+}
+
+#[derive(Deserialize)]
+pub struct SnapshotListQuery {
+    pub limit: Option<i64>,
+}
+
+async fn list_snapshots(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SnapshotListQuery>,
+) -> Result<Json<Vec<db::BrainSnapshot>>, (StatusCode, String)> {
+    let snaps = db::list_brain_snapshots(&state.db, params.limit.unwrap_or(20))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(snaps))
+}
+
+#[derive(Deserialize)]
+pub struct RestoreSnapshotRequest {
+    pub dry_run: Option<bool>,
+}
+
+async fn restore_snapshot(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<RestoreSnapshotRequest>,
+) -> Result<Json<crate::snapshot::RestoreReport>, (StatusCode, String)> {
+    let report = crate::snapshot::restore(&state.db, &id, body.dry_run.unwrap_or(true))
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(report))
+}
+
+#[derive(Deserialize)]
+pub struct SyncQuery {
+    pub project: Option<String>,
+    pub after_lamport: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+async fn export_sync_events(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SyncQuery>,
+) -> Result<Json<Vec<db::SyncEvent>>, (StatusCode, String)> {
+    let events = crate::sync::export_events(
+        &state.db,
+        params.project.as_deref(),
+        params.after_lamport.unwrap_or(0),
+        params.limit.unwrap_or(100),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(events))
+}
+
+#[derive(Deserialize)]
+pub struct SyncPublishRequest {
+    pub node_id: String,
+    pub project: Option<String>,
+    pub op_type: String,
+    pub payload: serde_json::Value,
+}
+
+async fn publish_sync_event(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SyncPublishRequest>,
+) -> Result<Json<crate::sync::PublishResult>, (StatusCode, String)> {
+    let payload = crate::sync::SyncPayload {
+        kind: body.op_type.clone(),
+        memory_id: body.payload.get("memory_id").and_then(|v| v.as_i64()),
+        edge_id: body.payload.get("edge_id").and_then(|v| v.as_i64()),
+        body: body.payload,
+    };
+    let result = crate::sync::publish(
+        &state.db,
+        &body.node_id,
+        body.project.as_deref(),
+        &body.op_type,
+        &payload,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(result))
 }
 
 // POST /compress  (manual trigger)

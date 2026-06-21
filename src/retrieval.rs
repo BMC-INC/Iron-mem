@@ -819,6 +819,10 @@ pub async fn injection_rank(
     };
 
     let now = Utc::now().timestamp();
+    let candidate_ids: Vec<i64> = candidates.iter().map(|m| m.id).collect();
+    let adjustments = db::score_adjustments_for_memories(db, &candidate_ids)
+        .await
+        .unwrap_or_default();
     let mut scored: Vec<(f64, Memory)> = Vec::with_capacity(candidates.len());
     for m in candidates {
         let rel = relevance.get(&m.id).copied().unwrap_or(0.0);
@@ -827,7 +831,14 @@ pub async fn injection_rank(
         // the relevance/recency/importance blend.
         let info = db::get_memory_meta_full(db, m.id).await?;
         let base = blended_score(rel, rec, info.importance, weights);
-        scored.push((base * weights.kind_multiplier(&info.kind), m));
+        let reinforcement = adjustments
+            .get(&m.id)
+            .map(|a| db::reinforcement_multiplier(a.feedback_score, a.injection_count))
+            .unwrap_or(1.0);
+        scored.push((
+            base * weights.kind_multiplier(&info.kind) * reinforcement,
+            m,
+        ));
     }
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     Ok(scored.into_iter().take(limit).map(|(_, m)| m).collect())

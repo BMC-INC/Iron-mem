@@ -49,6 +49,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # CCR: content-addressed reversible blob store
 zstd = "0.13"
 sha2 = "0.10"
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
 
 # Embeddings & vector search
 async-trait = "0.1"

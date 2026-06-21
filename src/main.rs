@@ -1,4 +1,5 @@
 mod ccr;
+mod code_anchor;
 mod compress;
 mod config;
 mod context;
@@ -14,9 +15,12 @@ mod hooks;
 mod mcp;
 mod profile;
 mod provider;
+mod reflection;
 mod retrieval;
 mod server;
+mod snapshot;
 mod strutil;
+mod sync;
 mod vectorstore;
 
 use anyhow::Result;
@@ -32,6 +36,54 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Subcommand)]
+enum SnapshotCommands {
+    /// Create a CCR-backed brain snapshot
+    Create {
+        /// Optional human label
+        #[arg(short, long)]
+        label: Option<String>,
+        /// Project root path (defaults to current directory)
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+    /// List brain snapshots
+    List {
+        #[arg(short, long, default_value = "20")]
+        limit: i64,
+    },
+    /// Restore a project brain snapshot
+    Restore {
+        snapshot_id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SyncCommands {
+    /// Publish an immutable sync event
+    Publish {
+        #[arg(long)]
+        node: String,
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(long)]
+        op: String,
+        #[arg(long)]
+        payload: String,
+    },
+    /// Export sync events as JSON
+    Export {
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(long, default_value = "0")]
+        after_lamport: i64,
+        #[arg(short, long, default_value = "100")]
+        limit: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -170,6 +222,26 @@ enum Commands {
         limit: i64,
     },
 
+    /// Delete a graph edge by marking it user-deleted
+    GraphDelete { edge_id: i64 },
+
+    /// Update a graph edge after human curation
+    GraphUpdate {
+        edge_id: i64,
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        relation: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        valid_from: Option<String>,
+        #[arg(long)]
+        valid_until: Option<String>,
+        #[arg(long, default_value = "1.0")]
+        confidence: f64,
+    },
+
     /// Reconcile duplicate/superseded temporal graph edges
     Reconcile {
         /// Project root path (defaults to current directory; use --all for every project)
@@ -226,6 +298,59 @@ enum Commands {
         /// Directory for markdown eval reports
         #[arg(long, default_value = "docs/evals")]
         out: String,
+    },
+
+    /// Record usage feedback for a memory
+    Feedback {
+        memory_id: i64,
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(long)]
+        signal: String,
+        #[arg(long, default_value = "1.0")]
+        weight: f64,
+        #[arg(long)]
+        detail: Option<String>,
+    },
+
+    /// Run a reflection/consolidation pass
+    Reflect {
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(short, long)]
+        all: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        apply: bool,
+        #[arg(short, long, default_value = "200")]
+        limit: i64,
+        #[arg(long)]
+        list: bool,
+    },
+
+    /// Anchor/relink memories to Rust AST symbols
+    CodeRelink {
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        anchor_only: bool,
+        #[arg(long)]
+        relink_only: bool,
+    },
+
+    /// Brain-state snapshots
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotCommands,
+    },
+
+    /// Multi-agent sync event log
+    Sync {
+        #[command(subcommand)]
+        action: SyncCommands,
     },
 
     /// Start the MCP server (stdio transport, for Claude Desktop/Code)
@@ -326,6 +451,28 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Commands::GraphDelete { edge_id } => run_graph_delete(&cfg, edge_id).await?,
+        Commands::GraphUpdate {
+            edge_id,
+            source,
+            relation,
+            target,
+            valid_from,
+            valid_until,
+            confidence,
+        } => {
+            run_graph_update(
+                &cfg,
+                edge_id,
+                &source,
+                &relation,
+                &target,
+                valid_from.as_deref(),
+                valid_until.as_deref(),
+                confidence,
+            )
+            .await?
+        }
         Commands::Reconcile {
             project,
             all,
@@ -345,6 +492,39 @@ async fn main() -> Result<()> {
             force,
         } => run_embed(&cfg, project.as_deref(), all, force).await?,
         Commands::Eval { out } => run_eval(&cfg, &out).await?,
+        Commands::Feedback {
+            memory_id,
+            project,
+            signal,
+            weight,
+            detail,
+        } => {
+            run_feedback(
+                &cfg,
+                memory_id,
+                project.as_deref(),
+                &signal,
+                weight,
+                detail.as_deref(),
+            )
+            .await?
+        }
+        Commands::Reflect {
+            project,
+            all,
+            dry_run,
+            apply,
+            limit,
+            list,
+        } => run_reflect(&cfg, project.as_deref(), all, dry_run, apply, limit, list).await?,
+        Commands::CodeRelink {
+            project,
+            dry_run,
+            anchor_only,
+            relink_only,
+        } => run_code_relink(&cfg, project.as_deref(), dry_run, anchor_only, relink_only).await?,
+        Commands::Snapshot { action } => run_snapshot(&cfg, action).await?,
+        Commands::Sync { action } => run_sync(&cfg, action).await?,
         Commands::Config => {
             println!("{}", serde_json::to_string_pretty(&cfg)?);
         }
@@ -586,6 +766,197 @@ async fn run_gc(cfg: &config::Config) -> Result<()> {
     Ok(())
 }
 
+async fn run_feedback(
+    cfg: &config::Config,
+    memory_id: i64,
+    project: Option<&str>,
+    signal: &str,
+    weight: f64,
+    detail: Option<&str>,
+) -> Result<()> {
+    let project = resolve_project(project)?;
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let id =
+        db::record_memory_feedback(&database, memory_id, &project, signal, weight, detail).await?;
+    println!(
+        "Recorded feedback #{id} for memory {memory_id}: signal={signal}, weight={:.2}",
+        weight.clamp(-2.0, 2.0)
+    );
+    Ok(())
+}
+
+async fn run_reflect(
+    cfg: &config::Config,
+    project: Option<&str>,
+    all: bool,
+    dry_run: bool,
+    apply: bool,
+    limit: i64,
+    list: bool,
+) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let filter = if all {
+        None
+    } else {
+        Some(resolve_project(project)?)
+    };
+    if list {
+        let proposals = reflection::list(&database, filter.as_deref(), None, limit.max(1)).await?;
+        println!("{} reflection proposal(s):", proposals.len());
+        for p in proposals {
+            println!(
+                "\n#{} [{}:{}] {} source(s)\n{}",
+                p.id,
+                p.status,
+                p.kind,
+                p.source_memory_ids.len(),
+                p.proposed_summary
+            );
+        }
+        return Ok(());
+    }
+
+    let (embedder, store) = vectorstore::build_semantic(&database, cfg).await;
+    let report = reflection::run(
+        &database,
+        embedder.as_deref(),
+        store.as_ref(),
+        filter.as_deref(),
+        dry_run,
+        apply,
+        limit.max(1),
+    )
+    .await?;
+    println!(
+        "Reflection{}: scanned={}, proposals={}, written={}, applied={}",
+        if report.dry_run { " dry-run" } else { "" },
+        report.scanned,
+        report.proposals,
+        report.proposals_written.len(),
+        report.applied
+    );
+    Ok(())
+}
+
+async fn run_code_relink(
+    cfg: &config::Config,
+    project: Option<&str>,
+    dry_run: bool,
+    anchor_only: bool,
+    relink_only: bool,
+) -> Result<()> {
+    let project = resolve_project(project)?;
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+
+    let mut created = 0;
+    let mut relinked = 0;
+    let mut scanned = 0;
+    if !relink_only {
+        let r = code_anchor::anchor_project(&database, &project, dry_run).await?;
+        created += r.anchors_created;
+        scanned = scanned.max(r.scanned_symbols);
+    }
+    if !anchor_only {
+        let r = code_anchor::relink_project(&database, &project, dry_run).await?;
+        relinked += r.anchors_relinked;
+        scanned = scanned.max(r.scanned_symbols);
+    }
+    println!(
+        "Code relink{}: scanned_symbols={}, anchors_created={}, anchors_relinked={}",
+        if dry_run { " dry-run" } else { "" },
+        scanned,
+        created,
+        relinked
+    );
+    Ok(())
+}
+
+async fn run_snapshot(cfg: &config::Config, action: SnapshotCommands) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    match action {
+        SnapshotCommands::Create { label, project } => {
+            let project = match project {
+                Some(p) => Some(resolve_project(Some(&p))?),
+                None => Some(resolve_project(None)?),
+            };
+            let snap = snapshot::create(&database, label.as_deref(), project.as_deref()).await?;
+            println!(
+                "Created snapshot {} (memories={}, edges={}, blob={})",
+                snap.id, snap.memory_count, snap.edge_count, snap.blob_hash
+            );
+        }
+        SnapshotCommands::List { limit } => {
+            let snaps = db::list_brain_snapshots(&database, limit.max(1)).await?;
+            println!("{} snapshot(s):", snaps.len());
+            for s in snaps {
+                println!(
+                    "\n{} | {:?} | project={:?} | memories={} edges={} | {}",
+                    s.id, s.label, s.project, s.memory_count, s.edge_count, s.blob_hash
+                );
+            }
+        }
+        SnapshotCommands::Restore {
+            snapshot_id,
+            dry_run,
+        } => {
+            let report = snapshot::restore(&database, &snapshot_id, dry_run).await?;
+            println!(
+                "Snapshot restore{} {}: memories_in_snapshot={}, edges_in_snapshot={}, restored_memories={}, restored_edges={}",
+                if report.dry_run { " dry-run" } else { "" },
+                report.snapshot_id,
+                report.memories_in_snapshot,
+                report.edges_in_snapshot,
+                report.restored_memories,
+                report.restored_edges
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_sync(cfg: &config::Config, action: SyncCommands) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    match action {
+        SyncCommands::Publish {
+            node,
+            project,
+            op,
+            payload,
+        } => {
+            let parsed: serde_json::Value = serde_json::from_str(&payload)
+                .unwrap_or_else(|_| serde_json::json!({ "text": payload }));
+            let sync_payload = sync::SyncPayload {
+                kind: op.clone(),
+                memory_id: parsed.get("memory_id").and_then(|v| v.as_i64()),
+                edge_id: parsed.get("edge_id").and_then(|v| v.as_i64()),
+                body: parsed,
+            };
+            let result =
+                sync::publish(&database, &node, project.as_deref(), &op, &sync_payload).await?;
+            println!(
+                "Published sync event {} lamport={} inserted={}",
+                result.event_id, result.lamport, result.inserted
+            );
+        }
+        SyncCommands::Export {
+            project,
+            after_lamport,
+            limit,
+        } => {
+            let events =
+                sync::export_events(&database, project.as_deref(), after_lamport, limit.max(1))
+                    .await?;
+            println!("{}", serde_json::to_string_pretty(&events)?);
+        }
+    }
+    Ok(())
+}
+
 async fn run_status(cfg: &config::Config) -> Result<()> {
     let url = format!("http://127.0.0.1:{}/status", cfg.port);
     match reqwest::get(&url).await {
@@ -789,6 +1160,9 @@ async fn run_inject(cfg: &config::Config, project: Option<&str>, limit: i64) -> 
     )
     .await?;
 
+    db::record_injection_events(&database, &project, None, Some("session-start"), &memories)
+        .await
+        .ok();
     hooks::write_ironmem_file(&project, &memories)?;
     hooks::ensure_claude_md_import(&project)?;
 
@@ -955,6 +1329,62 @@ async fn run_graph(
             "\n• {} --{}--> {}{} (memory {}, confidence {:.2})",
             e.source, e.relation, e.target, suffix, e.memory_id, e.confidence
         );
+    }
+    Ok(())
+}
+
+async fn run_graph_delete(cfg: &config::Config, edge_id: i64) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let deleted = db::curate_memory_edge_delete(&database, edge_id).await?;
+    if deleted {
+        println!("Graph edge {edge_id} marked user_deleted.");
+    } else {
+        println!("Graph edge {edge_id} was not active or does not exist.");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_graph_update(
+    cfg: &config::Config,
+    edge_id: i64,
+    source: &str,
+    relation: &str,
+    target: &str,
+    valid_from: Option<&str>,
+    valid_until: Option<&str>,
+    confidence: f64,
+) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    if let Some(v) = valid_from {
+        anyhow::ensure!(
+            provider::is_valid_memory_date(v),
+            "--valid-from must be YYYY-MM-DD"
+        );
+    }
+    if let Some(v) = valid_until {
+        anyhow::ensure!(
+            provider::is_valid_memory_date(v),
+            "--valid-until must be YYYY-MM-DD"
+        );
+    }
+    let updated = db::curate_memory_edge_update(
+        &database,
+        edge_id,
+        source,
+        relation,
+        target,
+        valid_from,
+        valid_until,
+        confidence,
+    )
+    .await?;
+    if updated {
+        println!("Graph edge {edge_id} updated.");
+    } else {
+        println!("Graph edge {edge_id} does not exist.");
     }
     Ok(())
 }

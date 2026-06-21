@@ -54,11 +54,14 @@
 - **Dual-output compression** — session compression writes both a narrative memory and separate searchable `kind=fact` memories, so dates, names, quantities, and direct answers survive summarization.
 - **Temporal recall + graph recall** — dated facts and `event_time` metadata power timestamp lookup, while `memory_edges` stores structured `source | relation | target` edges with valid-time filters and provenance. Temporal questions route toward date-bearing facts; relationship questions route toward graph edges.
 - **Adaptive working-memory skim** — every compressed or explicit memory gets durable `memory_chunks` with density (`high`, `medium`, `low`), kind, title, token estimate, and optional exact transcript offsets. Agents can skim broadly with **`memory_skim`**, then expand exact evidence with **`retrieve_original(chunk_id=...)`**.
+- **Closed-loop memory quality** — injection events and explicit feedback now reinforce useful memories and decay repeatedly ignored or corrected memories, reducing stale context without deleting provenance.
+- **AST-bound Rust anchors** — `ironmem code-relink` uses Tree-sitter to hash Rust symbols and relink memories when code moves across files.
+- **Reflection, snapshots, and sync** — dry-run-first consolidation proposals, CCR-backed project brain snapshots, and an idempotent Lamport-clock sync event log support long-lived and multi-agent memory workflows.
 - **`remember` tool** — store an explicit, typed memory in one call (`scope`, `kind`, `text`, `tags`). User-scope facts follow you into every project and also enter the skim layer.
 - **User profile** — cross-project memories are distilled into a single always-injected profile (LLM summary, or deterministic local rollup when offline). Read/regenerate with **`get_profile`** / **`refresh_profile`**.
 - **Correction miner** — error→fix loops in a session (a failing command, edits, then the same command passing) are mined into `error_solution` memories and surfaced via **`list_corrections`**, so past fixes resurface when the work recurs.
 - **21 MCP tools** now — including `memory_skim`, `retrieve_original`, `remember`, `get_profile`, `refresh_profile`, `list_corrections`, `memory_graph`, and `reconcile_memory_graph`.
-- **Current verification:** `cargo test --bin ironmem -- --nocapture` passes **157 tests** with **1 ignored benchmark**, and `cargo clippy --bin ironmem -- -D warnings` is clean.
+- **Current verification:** `cargo test --bin ironmem` passes **160 tests** with **1 ignored benchmark**, `cargo test --test mcp_stdio_clean` passes, and `cargo clippy --bin ironmem -- -D warnings` is clean.
 - **Still zero telemetry. Still local-first. Your data stays yours.**
 
 <details>
@@ -301,8 +304,15 @@ ironmem remember "..."      # Store an explicit memory (--scope user, --kind pre
 ironmem profile             # Show the user profile (--refresh to regenerate it)
 ironmem corrections         # List mined error→fix memories (--all for every project)
 ironmem graph "Operator OS" # Query temporal graph edges (--history includes superseded edges, --at filters valid time)
+ironmem graph-delete <edge-id> # Mark a bad graph edge user_deleted
+ironmem graph-update <edge-id> --source A --relation owns --target B # Human-curate a graph edge
 ironmem reconcile --dry-run # Preview duplicate/current-state graph reconciliation
 ironmem graph-backfill --limit 50 # Extract graph relations from older memories
+ironmem feedback <memory-id> --signal used --weight 1 # Reinforce or decay a memory
+ironmem reflect --dry-run # Propose durable-memory consolidation
+ironmem code-relink --dry-run # Tree-sitter Rust AST anchoring/relinking
+ironmem snapshot create --label before-refactor # CCR-backed project brain snapshot
+ironmem sync publish --node ci --op error_solution --payload '{"memory_id":1}' # Multi-agent event log
 ironmem eval                # Run deterministic memory-quality evals into docs/evals
 ironmem compress <id>       # Manually compress a session
 ironmem embed               # Backfill semantic embeddings for existing memories
@@ -877,7 +887,9 @@ This starts IronMem with Streamable HTTP on `http://localhost:37779/mcp` and Pos
 - [x] **Temporal and procedural recall** — graph queries support valid-time filters (`--at`, `at_time`, REST `at`), compression validates dates, reusable workflow rules are extracted/stored as `kind=procedural`, and temporal lookup queries route toward date-bearing facts instead of graph-only relationship hits.
 - [x] **Adaptive working-memory skim** — `memory_chunks` store model-agnostic compressed chunk maps with density, kind, title, token estimate, source offsets, and `chunk_id` expansion handles. Use MCP `memory_skim`, REST `/skim`, or `get_context` expansions, then expand exact evidence with `retrieve_original`.
 - [x] **Operator OS adapter + eval harness** — `docs/operator-os-memory-adapter.md` defines tenant/worker/work-item memory mapping, and `ironmem eval` writes repeatable graph/temporal/procedural eval reports with command, model, and commit metadata.
-- [x] **Current verification** — 157 Rust tests pass, 1 benchmark is intentionally ignored, and clippy is clean with `-D warnings`.
+- [x] **Closed-loop quality + curation** — usage feedback and injection events adjust ranking; the Web UI can inspect graph edges and mark hallucinated links as user-deleted.
+- [x] **AST-bound memory + reflection + time travel + sync** — Tree-sitter Rust code anchors, dry-run/apply reflection proposals, CCR-backed snapshots, and an idempotent sync event log are implemented.
+- [x] **Current verification** — 160 Rust tests pass, 1 benchmark is intentionally ignored, standalone MCP stdio cleanliness passes, and clippy is clean with `-D warnings`.
 
 ### Next
 

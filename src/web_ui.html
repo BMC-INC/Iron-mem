@@ -21,7 +21,9 @@
   .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
   .tab { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 8px 16px; cursor: pointer; color: var(--muted); font-size: 0.85rem; }
   .tab.active { color: var(--accent); border-color: var(--accent); }
+  .toolbar { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
   .search { width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px; color: var(--text); font-size: 0.9rem; margin-bottom: 16px; outline: none; }
+  .toolbar .search { width: auto; flex: 1; min-width: 220px; margin-bottom: 0; }
   .search:focus { border-color: var(--accent); }
   .search::placeholder { color: var(--muted); }
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 12px; }
@@ -35,6 +37,10 @@
   .card-actions { margin-top: 8px; }
   .btn-delete { background: none; border: 1px solid var(--border); color: var(--red); padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 0.75rem; }
   .btn-delete:hover { border-color: var(--red); }
+  .btn { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 9px 12px; border-radius: 6px; cursor: pointer; font-size: 0.8rem; }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .edge-line { color: var(--text); font-size: 0.92rem; }
+  .edge-meta { color: var(--muted); font-size: 0.75rem; margin-top: 6px; }
   .session-status { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
   .session-status.active { background: var(--green); }
   .session-status.ended { background: var(--muted); }
@@ -57,6 +63,8 @@
 <div class="tabs">
   <div class="tab active" data-tab="memories" onclick="switchTab('memories')">Memories</div>
   <div class="tab" data-tab="sessions" onclick="switchTab('sessions')">Sessions</div>
+  <div class="tab" data-tab="graph" onclick="switchTab('graph')">Graph</div>
+  <div class="tab" data-tab="ops" onclick="switchTab('ops')">Ops</div>
 </div>
 
 <input class="search" id="search" type="text" placeholder="Search memories..." oninput="debounceSearch()">
@@ -147,6 +155,96 @@ async function loadSessions() {
   }).join('');
 }
 
+async function loadGraph() {
+  const el = document.getElementById('content');
+  el.innerHTML = `
+    <div class="toolbar">
+      <input class="search" id="graph-entity" type="text" placeholder="Entity, project, person, concept">
+      <button class="btn" onclick="queryGraph()">Query</button>
+    </div>
+    <div class="empty">Query an entity to inspect graph edges.</div>
+  `;
+}
+
+async function queryGraph() {
+  const entity = document.getElementById('graph-entity').value.trim();
+  const el = document.getElementById('content');
+  if (!entity) return;
+  const data = await fetchJSON('/graph?' + new URLSearchParams({ entity, history: 'true', limit: '80' }));
+  const toolbar = el.querySelector('.toolbar').outerHTML;
+  if (!data.edges.length) {
+    el.innerHTML = toolbar + '<div class="empty">No graph edges found.</div>';
+    return;
+  }
+  el.innerHTML = toolbar + data.edges.map(edge => `
+    <div class="card" id="edge-${edge.id}">
+      <div class="card-header">
+        <span class="card-id">Edge #${edge.id}</span>
+        <span class="card-project" title="${edge.project}">${formatProject(edge.project)}</span>
+        <span class="card-date">${formatDate(edge.created_at)}</span>
+      </div>
+      <div class="edge-line">${escapeHtml(edge.source)} <span style="color: var(--accent)">--${escapeHtml(edge.relation)}--></span> ${escapeHtml(edge.target)}</div>
+      <div class="edge-meta">memory ${edge.memory_id} · confidence ${Number(edge.confidence).toFixed(2)} ${edge.superseded_reason ? '· ' + escapeHtml(edge.superseded_reason) : ''}</div>
+      <div class="card-actions">
+        <button class="btn-delete" onclick="deleteEdge(${edge.id})">Delete edge</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function deleteEdge(id) {
+  if (!confirm('Delete graph edge #' + id + '?')) return;
+  await fetch(API + '/graph/' + id, { method: 'DELETE' });
+  const el = document.getElementById('edge-' + id);
+  if (el) el.remove();
+}
+
+async function loadOps() {
+  const el = document.getElementById('content');
+  el.innerHTML = `
+    <div class="card">
+      <div class="card-header"><span class="card-id">Reflection</span></div>
+      <div class="card-summary">Find fragmented durable memories and write consolidation proposals.</div>
+      <button class="btn" onclick="runReflection()">Dry run</button>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-id">Code Anchors</span></div>
+      <div class="card-summary">Scan Rust AST symbols, anchor matching memories, and relink moved code.</div>
+      <button class="btn" onclick="runCodeRelink()">Dry run current project</button>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-id">Snapshot</span></div>
+      <div class="card-summary">Create a CCR-backed snapshot for the current browser project field.</div>
+      <button class="btn" onclick="createSnapshot()">Create snapshot</button>
+    </div>
+    <div id="ops-result" class="empty">Maintenance results appear here.</div>
+  `;
+}
+
+function currentProjectGuess() {
+  const cards = document.querySelectorAll('.card-project');
+  return cards.length ? cards[0].getAttribute('title') : '';
+}
+
+async function runReflection() {
+  const res = await fetch(API + '/reflect', { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ dry_run: true, limit: 200 }) });
+  document.getElementById('ops-result').textContent = JSON.stringify(await res.json(), null, 2);
+}
+
+async function runCodeRelink() {
+  const project = prompt('Project path to scan:', currentProjectGuess());
+  if (!project) return;
+  const res = await fetch(API + '/code/relink', { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ project, dry_run: true }) });
+  document.getElementById('ops-result').textContent = JSON.stringify(await res.json(), null, 2);
+}
+
+async function createSnapshot() {
+  const project = prompt('Project path to snapshot:', currentProjectGuess());
+  if (!project) return;
+  const res = await fetch(API + '/snapshots', { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ project, label: 'manual-ui' }) });
+  document.getElementById('ops-result').textContent = JSON.stringify(await res.json(), null, 2);
+}
+
 async function deleteMemory(id) {
   if (!confirm('Delete memory #' + id + '?')) return;
   await fetch(API + '/api/memories/' + id, { method: 'DELETE' });
@@ -160,7 +258,9 @@ function switchTab(tab) {
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
   document.getElementById('search').style.display = tab === 'memories' ? '' : 'none';
   if (tab === 'memories') loadMemories();
-  else loadSessions();
+  if (tab === 'sessions') loadSessions();
+  if (tab === 'graph') loadGraph();
+  if (tab === 'ops') loadOps();
 }
 
 function debounceSearch() {
