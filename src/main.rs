@@ -428,8 +428,33 @@ enum Commands {
     Config,
 }
 
+#[cfg(windows)]
+fn main() -> Result<()> {
+    // Windows' default main-thread stack is small enough for the debug MCP
+    // startup path to overflow before stdio can answer `initialize`.
+    std::thread::Builder::new()
+        .name("ironmem-main".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(async_main)?
+        .join()
+        .map_err(|panic| {
+            if let Some(message) = panic.downcast_ref::<&str>() {
+                anyhow::anyhow!("ironmem main thread panicked: {message}")
+            } else if let Some(message) = panic.downcast_ref::<String>() {
+                anyhow::anyhow!("ironmem main thread panicked: {message}")
+            } else {
+                anyhow::anyhow!("ironmem main thread panicked")
+            }
+        })?
+}
+
+#[cfg(not(windows))]
+fn main() -> Result<()> {
+    async_main()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn async_main() -> Result<()> {
     // Logs MUST go to stderr, never stdout: in `ironmem mcp` (stdio transport)
     // stdout carries the JSON-RPC stream, so a single log line there corrupts it
     // — the MCP client sees the `2026-…` timestamp and rejects the message
