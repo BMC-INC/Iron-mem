@@ -4,7 +4,7 @@
 //! `Unexpected token ', "2026-0"... is not valid JSON` the moment it connects.
 //! This test spawns the real binary and asserts stdout is pure JSON.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -15,21 +15,13 @@ fn mcp_stdio_stdout_is_pure_json() {
     let db = std::env::temp_dir().join(format!("ironmem-stdio-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&db);
 
-    // Build a sqlx-valid sqlite URL on BOTH platforms (mirrors db::sqlite_file_url):
-    // a Unix abs path already starts with '/', but a Windows `C:\…` path needs an
-    // extra leading '/' and forward slashes → `sqlite:///C:/…`. Passing the raw
-    // `C:\…` (two slashes) makes sqlx treat the drive as the URL authority and the
-    // server fails to open the DB, producing empty stdout.
-    let p = db.to_string_lossy().replace('\\', "/");
-    let url = if p.as_bytes().get(1) == Some(&b':') {
-        format!("sqlite:///{p}?mode=rwc")
-    } else {
-        format!("sqlite://{p}?mode=rwc")
-    };
-
     let mut child = Command::new(bin)
         .arg("mcp")
-        .env("DATABASE_URL", &url)
+        // Pass the same kind of raw filesystem path users can configure and let
+        // IronMem normalize it. Hand-rolled sqlite:// URLs are easy to get wrong
+        // on Windows drive-letter paths and can make the child exit before MCP
+        // stdio starts.
+        .env("DATABASE_URL", &db)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -76,8 +68,7 @@ fn mcp_stdio_stdout_is_pure_json() {
                 let is_init = serde_json::from_str::<serde_json::Value>(l.trim())
                     .ok()
                     .map(|v| {
-                        v.get("id").and_then(|x| x.as_i64()) == Some(0)
-                            && v.get("result").is_some()
+                        v.get("id").and_then(|x| x.as_i64()) == Some(0) && v.get("result").is_some()
                     })
                     .unwrap_or(false);
                 lines.push(l);
@@ -92,7 +83,11 @@ fn mcp_stdio_stdout_is_pure_json() {
     }
 
     let _ = child.kill();
-    let _ = child.wait();
+    let status = child.wait().ok();
+    let mut stderr = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
     while let Ok(l) = rx.try_recv() {
         lines.push(l);
     }
@@ -107,6 +102,6 @@ fn mcp_stdio_stdout_is_pure_json() {
     }
     assert!(
         saw_init_response,
-        "expected an initialize response on stdout; got: {lines:?}"
+        "expected an initialize response on stdout; got: {lines:?}; status: {status:?}; stderr: {stderr}"
     );
 }
