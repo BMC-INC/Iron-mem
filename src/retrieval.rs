@@ -411,14 +411,35 @@ pub async fn hybrid_search(
     query: &str,
     limit: usize,
 ) -> Result<Vec<Memory>> {
+    hybrid_search_in_namespace(
+        db,
+        embedder,
+        store,
+        crate::governance::DEFAULT_NAMESPACE,
+        project,
+        query,
+        limit,
+    )
+    .await
+}
+
+pub async fn hybrid_search_in_namespace(
+    db: &Database,
+    embedder: Option<&dyn Embedder>,
+    store: &dyn VectorStore,
+    namespace: &str,
+    project: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<Memory>> {
     // Candidate pool: pull more than `limit` per signal so the narrative-reserve
     // quota below has narratives to choose from even when facts dominate ranking.
     let pool = (limit * 3).max(30);
 
     // Keyword side (always run).
     let fts = match project {
-        Some(p) => db::search_memories(db, p, query, pool as i64).await?,
-        None => db::search_all_memories(db, query, pool as i64).await?,
+        Some(p) => db::search_memories_in_namespace(db, namespace, p, query, pool as i64).await?,
+        None => db::search_all_memories_in_namespace(db, namespace, query, pool as i64).await?,
     };
 
     // Semantic side (best-effort; only when an embedder is configured).
@@ -544,7 +565,7 @@ pub async fn hybrid_search(
     for id in chosen {
         if let Some(m) = by_id.get(&id) {
             out.push(m.clone());
-        } else if let Some(m) = db::get_memory_by_id(db, id).await? {
+        } else if let Some(m) = db::get_memory_by_id_in_namespace(db, id, namespace).await? {
             out.push(m);
         }
     }
@@ -738,7 +759,7 @@ fn reanchor(narrow: Vec<Memory>, wide: Vec<Memory>) -> Vec<Memory> {
 /// they keep their strong narrow-order floor, so reranking can only PROMOTE a
 /// buried wide-pool answer (precision/recall for reasoning questions), never
 /// demote a dated fact the base retrieval already had in the top `limit`.
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub async fn rerank_search(
     db: &Database,
     embedder: Option<&dyn Embedder>,
@@ -748,9 +769,35 @@ pub async fn rerank_search(
     query: &str,
     limit: usize,
 ) -> Result<Vec<Memory>> {
+    rerank_search_in_namespace(
+        db,
+        embedder,
+        store,
+        config,
+        crate::governance::DEFAULT_NAMESPACE,
+        project,
+        query,
+        limit,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn rerank_search_in_namespace(
+    db: &Database,
+    embedder: Option<&dyn Embedder>,
+    store: &dyn VectorStore,
+    config: &Config,
+    namespace: &str,
+    project: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<Memory>> {
     let pool = limit.saturating_mul(2).max(config.rerank.pool);
-    let narrow = hybrid_search(db, embedder, store, project, query, limit).await?;
-    let wide = hybrid_search(db, embedder, store, project, query, pool).await?;
+    let narrow =
+        hybrid_search_in_namespace(db, embedder, store, namespace, project, query, limit).await?;
+    let wide =
+        hybrid_search_in_namespace(db, embedder, store, namespace, project, query, pool).await?;
     let candidates = reanchor(narrow, wide);
     Ok(llm_rerank(config, query, candidates, limit).await)
 }

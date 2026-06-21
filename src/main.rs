@@ -11,6 +11,7 @@ mod embedder;
 mod embedding_codec;
 mod eval;
 mod expansion;
+mod governance;
 mod hooks;
 mod mcp;
 mod profile;
@@ -87,6 +88,7 @@ enum SyncCommands {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Start the ironmem worker server
     Server,
@@ -104,6 +106,9 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value = "10")]
         limit: i64,
+        /// Governance namespace/realm boundary
+        #[arg(long, default_value = "local")]
+        namespace: String,
     },
 
     /// Search memories across all projects
@@ -113,6 +118,9 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value = "10")]
         limit: i64,
+        /// Governance namespace/realm boundary
+        #[arg(long, default_value = "local")]
+        namespace: String,
     },
 
     /// List recent memories for a project
@@ -123,6 +131,9 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value = "5")]
         limit: i64,
+        /// Governance namespace/realm boundary
+        #[arg(long, default_value = "local")]
+        namespace: String,
     },
 
     /// List projects with stored memories
@@ -179,6 +190,51 @@ enum Commands {
         /// Optional space-separated tags
         #[arg(short, long)]
         tags: Option<String>,
+        /// Governance namespace/realm boundary (default: local)
+        #[arg(long, default_value = "local")]
+        namespace: String,
+        /// Provenance source: user_input|tool_output|agent_generated|derived|external|sync_peer
+        #[arg(long, default_value = "user_input")]
+        source_type: String,
+        /// Trust tier: high|medium|low|untrusted
+        #[arg(long, default_value = "high")]
+        trust_tier: String,
+        /// Writer identity recorded in the tamper-evident ledger
+        #[arg(long)]
+        writer: Option<String>,
+        /// Classification: public|internal|confidential|restricted|phi|pii
+        #[arg(long, default_value = "internal")]
+        classification: String,
+        /// Consent state: required|granted|denied|withdrawn. PHI/PII require granted.
+        #[arg(long)]
+        consent_state: Option<String>,
+        /// Residency tag such as us-east-1 or eu-west-1
+        #[arg(long)]
+        residency: Option<String>,
+        /// Retention policy identifier
+        #[arg(long)]
+        retention_policy_id: Option<String>,
+        /// Expiration timestamp as Unix seconds
+        #[arg(long)]
+        expires_at: Option<i64>,
+        /// Prevent governed forget until legal hold is cleared
+        #[arg(long, default_value_t = false)]
+        legal_hold: bool,
+        /// External source reference, receipt id, URL, or tool event id
+        #[arg(long)]
+        source_ref: Option<String>,
+    },
+
+    /// Governed delete for one memory: ledger entry + CCR release + vector/meta purge
+    Forget {
+        /// Memory id to forget
+        memory_id: i64,
+        /// Actor written into the memory ledger
+        #[arg(long, default_value = "ironmem:cli")]
+        actor: String,
+        /// Human-readable reason written into the memory ledger
+        #[arg(long)]
+        reason: Option<String>,
     },
 
     /// Show the user profile (durable cross-project facts + recent activity)
@@ -400,9 +456,18 @@ async fn main() -> Result<()> {
             query,
             project,
             limit,
-        } => run_search(&cfg, &query, project.as_deref(), limit).await?,
-        Commands::SearchGlobal { query, limit } => run_search_global(&cfg, &query, limit).await?,
-        Commands::List { project, limit } => run_list(&cfg, project.as_deref(), limit).await?,
+            namespace,
+        } => run_search(&cfg, &query, project.as_deref(), limit, &namespace).await?,
+        Commands::SearchGlobal {
+            query,
+            limit,
+            namespace,
+        } => run_search_global(&cfg, &query, limit, &namespace).await?,
+        Commands::List {
+            project,
+            limit,
+            namespace,
+        } => run_list(&cfg, project.as_deref(), limit, &namespace).await?,
         Commands::Projects { limit } => run_projects(&cfg, limit).await?,
         Commands::Sessions { project, limit } => {
             run_sessions(&cfg, project.as_deref(), limit).await?
@@ -415,7 +480,31 @@ async fn main() -> Result<()> {
             scope,
             kind,
             tags,
+            namespace,
+            source_type,
+            trust_tier,
+            writer,
+            classification,
+            consent_state,
+            residency,
+            retention_policy_id,
+            expires_at,
+            legal_hold,
+            source_ref,
         } => {
+            let governance = build_cli_governance(
+                &namespace,
+                &source_type,
+                &trust_tier,
+                writer,
+                &classification,
+                consent_state.as_deref(),
+                residency,
+                retention_policy_id,
+                expires_at,
+                legal_hold,
+                source_ref,
+            );
             run_remember(
                 &cfg,
                 &text,
@@ -423,9 +512,15 @@ async fn main() -> Result<()> {
                 &scope,
                 &kind,
                 tags.as_deref(),
+                governance,
             )
             .await?
         }
+        Commands::Forget {
+            memory_id,
+            actor,
+            reason,
+        } => run_forget(&cfg, memory_id, &actor, reason.as_deref()).await?,
         Commands::Profile { refresh } => run_profile(&cfg, refresh).await?,
         Commands::Corrections {
             project,
@@ -982,11 +1077,13 @@ async fn run_search(
     query: &str,
     project: Option<&str>,
     limit: i64,
+    namespace: &str,
 ) -> Result<()> {
     let project = resolve_project(project)?;
     let database = db::Database::new(&cfg.effective_database_url()).await?;
     database.migrate().await?;
-    let memories = db::search_memories(&database, &project, query, limit).await?;
+    let memories =
+        db::search_memories_in_namespace(&database, namespace, &project, query, limit).await?;
 
     if memories.is_empty() {
         println!("No memories found for query: {}", query);
@@ -1006,10 +1103,15 @@ async fn run_search(
     Ok(())
 }
 
-async fn run_search_global(cfg: &config::Config, query: &str, limit: i64) -> Result<()> {
+async fn run_search_global(
+    cfg: &config::Config,
+    query: &str,
+    limit: i64,
+    namespace: &str,
+) -> Result<()> {
     let database = db::Database::new(&cfg.effective_database_url()).await?;
     database.migrate().await?;
-    let memories = db::search_all_memories(&database, query, limit).await?;
+    let memories = db::search_all_memories_in_namespace(&database, namespace, query, limit).await?;
 
     if memories.is_empty() {
         println!("No memories found across any project for query: {}", query);
@@ -1030,11 +1132,17 @@ async fn run_search_global(cfg: &config::Config, query: &str, limit: i64) -> Res
     Ok(())
 }
 
-async fn run_list(cfg: &config::Config, project: Option<&str>, limit: i64) -> Result<()> {
+async fn run_list(
+    cfg: &config::Config,
+    project: Option<&str>,
+    limit: i64,
+    namespace: &str,
+) -> Result<()> {
     let project = resolve_project(project)?;
     let database = db::Database::new(&cfg.effective_database_url()).await?;
     database.migrate().await?;
-    let memories = db::get_recent_memories(&database, &project, limit).await?;
+    let memories =
+        db::get_recent_memories_in_namespace(&database, namespace, &project, limit).await?;
 
     if memories.is_empty() {
         println!("No memories for project: {}", project);
@@ -1128,10 +1236,19 @@ async fn run_wipe(cfg: &config::Config, project: Option<&str>, force: bool) -> R
 
     let (_embedder, store) = vectorstore::build_semantic(&database, cfg).await;
     let ids = db::memory_ids_for_project(&database, &project).await?;
-    let count = db::delete_memories_for_project(&database, &project).await?;
+    let mut count = 0_u64;
     for id in ids {
-        if let Err(e) = vectorstore::purge_memory(&database, store.as_ref(), id).await {
-            tracing::warn!("vector/meta cleanup failed for memory {id}: {e}");
+        match db::governed_delete_memory(&database, id, Some("ironmem:wipe"), Some("project wipe"))
+            .await
+        {
+            Ok(true) => {
+                count += 1;
+                if let Err(e) = vectorstore::purge_memory(&database, store.as_ref(), id).await {
+                    tracing::warn!("vector/meta cleanup failed for memory {id}: {e}");
+                }
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!("governed wipe failed for memory {id}: {e}"),
         }
     }
 
@@ -1174,6 +1291,55 @@ async fn run_inject(cfg: &config::Config, project: Option<&str>, limit: i64) -> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_cli_governance(
+    namespace: &str,
+    source_type: &str,
+    trust_tier: &str,
+    writer: Option<String>,
+    classification: &str,
+    consent_state: Option<&str>,
+    residency: Option<String>,
+    retention_policy_id: Option<String>,
+    expires_at: Option<i64>,
+    legal_hold: bool,
+    source_ref: Option<String>,
+) -> governance::MemoryGovernance {
+    governance::MemoryGovernance {
+        namespace: governance::normalize_namespace(namespace),
+        source_type: governance::parse_source_type(source_type),
+        trust_tier: governance::parse_trust_tier(trust_tier),
+        writer_identity: writer.or_else(|| Some("ironmem:cli".to_string())),
+        source_ref,
+        parent_memory_id: None,
+        classification: governance::parse_classification(classification),
+        consent_state: consent_state.and_then(governance::parse_consent_state),
+        residency,
+        retention_policy_id,
+        expires_at,
+        legal_hold,
+    }
+}
+
+async fn run_forget(
+    cfg: &config::Config,
+    memory_id: i64,
+    actor: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let (_embedder, store) = vectorstore::build_semantic(&database, cfg).await;
+    let deleted = db::governed_delete_memory(&database, memory_id, Some(actor), reason).await?;
+    if deleted {
+        vectorstore::purge_memory(&database, store.as_ref(), memory_id).await?;
+        println!("Forgot memory id={} (ledger recorded)", memory_id);
+    } else {
+        println!("No memory found for id={}", memory_id);
+    }
+    Ok(())
+}
+
 async fn run_remember(
     cfg: &config::Config,
     text: &str,
@@ -1181,6 +1347,7 @@ async fn run_remember(
     scope: &str,
     kind: &str,
     tags: Option<&str>,
+    governance: governance::MemoryGovernance,
 ) -> Result<()> {
     if text.trim().is_empty() {
         anyhow::bail!("memory text must not be empty");
@@ -1190,7 +1357,8 @@ async fn run_remember(
     database.migrate().await?;
 
     let (embedder, store) = vectorstore::build_semantic(&database, cfg).await;
-    let id = compress::remember(
+    let namespace = governance::normalize_namespace(&governance.namespace);
+    let id = compress::remember_with_governance(
         &database,
         embedder.as_deref(),
         store.as_ref(),
@@ -1199,12 +1367,14 @@ async fn run_remember(
         kind,
         text,
         tags,
+        governance,
     )
     .await?;
 
     println!(
-        "✅ Remembered memory id={} (scope={}, kind={}) for {}",
+        "✅ Remembered memory id={} (namespace={}, scope={}, kind={}) for {}",
         id,
+        namespace,
         db::clamp_scope(scope),
         db::clamp_kind(kind),
         project

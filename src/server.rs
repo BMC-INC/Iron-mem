@@ -22,11 +22,24 @@ pub struct AppState {
 
 impl AppState {
     /// Hybrid (keyword + semantic) search using this server's embedder + store.
+    #[allow(dead_code)]
     async fn hybrid(&self, project: Option<&str>, query: &str, limit: i64) -> Vec<db::Memory> {
-        retrieval::hybrid_search(
+        self.hybrid_in_namespace(crate::governance::DEFAULT_NAMESPACE, project, query, limit)
+            .await
+    }
+
+    async fn hybrid_in_namespace(
+        &self,
+        namespace: &str,
+        project: Option<&str>,
+        query: &str,
+        limit: i64,
+    ) -> Vec<db::Memory> {
+        retrieval::hybrid_search_in_namespace(
             &self.db,
             self.embedder.as_deref(),
             self.store.as_ref(),
+            namespace,
             project,
             query,
             limit as usize,
@@ -245,11 +258,23 @@ pub struct RememberRequest {
     pub scope: Option<String>,
     pub kind: Option<String>,
     pub tags: Option<String>,
+    pub namespace: Option<String>,
+    pub source_type: Option<String>,
+    pub trust_tier: Option<String>,
+    pub writer_identity: Option<String>,
+    pub classification: Option<String>,
+    pub consent_state: Option<String>,
+    pub residency: Option<String>,
+    pub retention_policy_id: Option<String>,
+    pub expires_at: Option<i64>,
+    pub legal_hold: Option<bool>,
+    pub source_ref: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct RememberResponse {
     pub memory_id: i64,
+    pub namespace: String,
     pub scope: String,
     pub kind: String,
 }
@@ -266,8 +291,40 @@ async fn remember(
     }
     let scope = body.scope.as_deref().unwrap_or("project");
     let kind = body.kind.as_deref().unwrap_or("preference");
+    let governance = crate::governance::MemoryGovernance {
+        namespace: crate::governance::normalize_namespace(
+            body.namespace
+                .as_deref()
+                .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+        ),
+        source_type: crate::governance::parse_source_type(
+            body.source_type.as_deref().unwrap_or("user_input"),
+        ),
+        trust_tier: crate::governance::parse_trust_tier(
+            body.trust_tier.as_deref().unwrap_or("high"),
+        ),
+        writer_identity: body
+            .writer_identity
+            .as_deref()
+            .map(str::to_string)
+            .or_else(|| Some("ironmem:rest".to_string())),
+        source_ref: body.source_ref.clone(),
+        parent_memory_id: None,
+        classification: crate::governance::parse_classification(
+            body.classification.as_deref().unwrap_or("internal"),
+        ),
+        consent_state: body
+            .consent_state
+            .as_deref()
+            .and_then(crate::governance::parse_consent_state),
+        residency: body.residency.clone(),
+        retention_policy_id: body.retention_policy_id.clone(),
+        expires_at: body.expires_at,
+        legal_hold: body.legal_hold.unwrap_or(false),
+    };
+    let namespace = crate::governance::normalize_namespace(&governance.namespace);
 
-    let memory_id = compress::remember(
+    let memory_id = compress::remember_with_governance(
         &state.db,
         state.embedder.as_deref(),
         state.store.as_ref(),
@@ -276,12 +333,14 @@ async fn remember(
         kind,
         &body.text,
         body.tags.as_deref(),
+        governance,
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(RememberResponse {
         memory_id,
+        namespace,
         scope: db::clamp_scope(scope).to_string(),
         kind: db::clamp_kind(kind).to_string(),
     }))
@@ -678,6 +737,7 @@ pub struct ContextQuery {
     pub project: String,
     pub limit: Option<i64>,
     pub query: Option<String>,
+    pub namespace: Option<String>,
     /// Per-request override for LLM reranking ("1"/"true"/"yes"/"on"). Absent ⇒
     /// fall back to the server's `rerank.enabled` config default.
     pub rerank: Option<String>,
@@ -712,6 +772,12 @@ async fn get_context(
 ) -> Result<Json<ContextResponse>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(state.config.inject_limit as i64);
     let rerank_on = truthy(&params.rerank).unwrap_or(state.config.rerank.enabled);
+    let namespace = crate::governance::normalize_namespace(
+        params
+            .namespace
+            .as_deref()
+            .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+    );
 
     let memories = match &params.query {
         Some(q) if !q.is_empty() => {
@@ -719,11 +785,12 @@ async fn get_context(
                 // Re-anchored reranked retrieval: protect the base@limit ordering
                 // (FTS-strong temporal answers) while letting the LLM promote
                 // buried wide-pool answers. Failure falls back to base order.
-                retrieval::rerank_search(
+                retrieval::rerank_search_in_namespace(
                     &state.db,
                     state.embedder.as_deref(),
                     state.store.as_ref(),
                     &state.config,
+                    &namespace,
                     Some(&params.project),
                     q,
                     limit as usize,
@@ -731,10 +798,12 @@ async fn get_context(
                 .await
                 .unwrap_or_default()
             } else {
-                state.hybrid(Some(&params.project), q, limit).await
+                state
+                    .hybrid_in_namespace(&namespace, Some(&params.project), q, limit)
+                    .await
             }
         }
-        _ => db::get_recent_memories(&state.db, &params.project, limit)
+        _ => db::get_recent_memories_in_namespace(&state.db, &namespace, &params.project, limit)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
@@ -763,6 +832,7 @@ pub struct SkimQuery {
     pub project: Option<String>,
     pub limit: Option<i64>,
     pub global: Option<String>,
+    pub namespace: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -780,7 +850,13 @@ async fn get_skim(
     } else {
         params.project.as_deref()
     };
-    let chunks = db::recent_memory_chunks(&state.db, project, limit)
+    let namespace = crate::governance::normalize_namespace(
+        params
+            .namespace
+            .as_deref()
+            .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+    );
+    let chunks = db::recent_memory_chunks_in_namespace(&state.db, &namespace, project, limit)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(SkimResponse { chunks }))
@@ -841,6 +917,7 @@ pub struct MemoriesQuery {
     pub project: Option<String>,
     pub query: Option<String>,
     pub limit: Option<i64>,
+    pub namespace: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -864,14 +941,26 @@ async fn api_list_memories(
     Query(params): Query<MemoriesQuery>,
 ) -> Result<Json<Vec<db::Memory>>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(50);
+    let namespace = crate::governance::normalize_namespace(
+        params
+            .namespace
+            .as_deref()
+            .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+    );
 
     let memories = match (&params.project, &params.query) {
-        (Some(project), Some(q)) => state.hybrid(Some(project), q, limit).await,
-        (Some(project), None) => db::get_recent_memories(&state.db, project, limit)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-        (None, Some(q)) => state.hybrid(None, q, limit).await,
-        (None, None) => db::get_all_memories(&state.db, limit)
+        (Some(project), Some(q)) => {
+            state
+                .hybrid_in_namespace(&namespace, Some(project), q, limit)
+                .await
+        }
+        (Some(project), None) => {
+            db::get_recent_memories_in_namespace(&state.db, &namespace, project, limit)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        }
+        (None, Some(q)) => state.hybrid_in_namespace(&namespace, None, q, limit).await,
+        (None, None) => db::get_all_memories_in_namespace(&state.db, &namespace, limit)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
@@ -883,15 +972,12 @@ async fn api_delete_memory(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let deleted = db::delete_memory(&state.db, id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let deleted =
+        db::governed_delete_memory(&state.db, id, Some("ironmem:web-ui"), Some("api delete"))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if deleted {
-        // Best-effort: never fail the delete because cleanup hiccuped.
-        if let Err(e) = db::decref_memory_session_blob(&state.db, id).await {
-            tracing::warn!("CCR decref failed for memory {id}: {e}");
-        }
         if let Err(e) = vectorstore::purge_memory(&state.db, state.store.as_ref(), id).await {
             tracing::warn!("vector/meta cleanup failed for memory {id}: {e}");
         }

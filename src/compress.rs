@@ -8,6 +8,7 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::db::{self, Database};
 use crate::embedder::Embedder;
+use crate::governance::MemoryGovernance;
 use crate::provider::{self, CompressionResult};
 use crate::vectorstore::VectorStore;
 
@@ -335,6 +336,19 @@ pub async fn persist(
     // Compressed sessions are project-scoped; record the LLM-classified kind
     // (importance is preserved — set_memory_scope_kind only touches scope+kind).
     db::set_memory_scope_kind(db, memory_id, "project", &result.kind).await?;
+    if let Err(e) = db::apply_memory_governance(
+        db,
+        memory_id,
+        "project",
+        &result.kind,
+        &MemoryGovernance::compressed_session(),
+        Some("ironmem:compress"),
+        "remember",
+    )
+    .await
+    {
+        tracing::warn!("memory governance store failed (memory {memory_id}): {e}");
+    }
     // Temporal tag: stamp the session's stated event date on the narrative so
     // the time-aware retrieval boost can surface it for date-anchored questions.
     if let Some(when) = &result.event_time {
@@ -471,6 +485,19 @@ async fn persist_procedure(
     if let Err(e) = db::set_memory_scope_kind(db, pid, "project", "procedural").await {
         tracing::warn!("procedural kind tag failed (memory {pid}): {e}");
     }
+    if let Err(e) = db::apply_memory_governance(
+        db,
+        pid,
+        "project",
+        "procedural",
+        &MemoryGovernance::derived_from(parent_id),
+        Some("ironmem:derive"),
+        "derive",
+    )
+    .await
+    {
+        tracing::warn!("procedural governance failed (memory {pid}): {e}");
+    }
     let proc_lower = procedure.to_lowercase();
     for entity in entities {
         if proc_lower.contains(&entity.to_lowercase()) {
@@ -532,6 +559,19 @@ async fn persist_fact(
     if let Err(e) = db::set_memory_scope_kind(db, fid, "project", "fact").await {
         tracing::warn!("fact kind tag failed (fact memory {fid}): {e}");
     }
+    if let Err(e) = db::apply_memory_governance(
+        db,
+        fid,
+        "project",
+        "fact",
+        &MemoryGovernance::derived_from(parent_id),
+        Some("ironmem:derive"),
+        "derive",
+    )
+    .await
+    {
+        tracing::warn!("fact governance failed (memory {fid}): {e}");
+    }
     // Also tag the fact with the session's event_time so the time-aware boost can
     // surface it directly (not just via the dated text).
     if let Some(when) = event_time {
@@ -580,12 +620,49 @@ pub async fn remember(
     text: &str,
     tags: Option<&str>,
 ) -> Result<i64> {
+    remember_with_governance(
+        db,
+        embedder,
+        store,
+        project,
+        scope,
+        kind,
+        text,
+        tags,
+        MemoryGovernance::explicit(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn remember_with_governance(
+    db: &Database,
+    embedder: Option<&dyn Embedder>,
+    store: &dyn VectorStore,
+    project: &str,
+    scope: &str,
+    kind: &str,
+    text: &str,
+    tags: Option<&str>,
+    governance: MemoryGovernance,
+) -> Result<i64> {
+    governance.validate()?;
     // Explicit memories aren't tied to a compressed session; mark the origin so
     // they're distinguishable in session-history joins (no FK to sessions).
     let memory_id = db::insert_memory(db, project, "remember", text, tags).await?;
     // Deliberately curated → slightly above the neutral default importance.
     db::upsert_memory_meta(db, memory_id, 0.7).await?;
     db::set_memory_scope_kind(db, memory_id, scope, kind).await?;
+    db::apply_memory_governance(
+        db,
+        memory_id,
+        scope,
+        kind,
+        &governance,
+        governance.writer_identity.as_deref(),
+        "remember",
+    )
+    .await?;
     let explicit = CompressionResult {
         summary: text.to_string(),
         tags: tags.unwrap_or_default().to_string(),

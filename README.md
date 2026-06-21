@@ -54,6 +54,7 @@
 - **Dual-output compression** — session compression writes both a narrative memory and separate searchable `kind=fact` memories, so dates, names, quantities, and direct answers survive summarization.
 - **Temporal recall + graph recall** — dated facts and `event_time` metadata power timestamp lookup, while `memory_edges` stores structured `source | relation | target` edges with valid-time filters and provenance. Temporal questions route toward date-bearing facts; relationship questions route toward graph edges.
 - **Adaptive working-memory skim** — every compressed or explicit memory gets durable `memory_chunks` with density (`high`, `medium`, `low`), kind, title, token estimate, and optional exact transcript offsets. Agents can skim broadly with **`memory_skim`**, then expand exact evidence with **`retrieve_original(chunk_id=...)`**.
+- **Governed recall** — memories now carry a durable governance envelope: namespace, source type, trust tier, writer/source provenance, classification, consent state, residency, retention metadata, legal hold, tombstone state, record hash, and append-only ledger hash chain. Reads are namespace-scoped and active-only by default; PHI/PII writes fail closed unless consent is granted.
 - **Closed-loop memory quality** — injection events and explicit feedback now reinforce useful memories and decay repeatedly ignored or corrected memories, reducing stale context without deleting provenance.
 - **AST-bound Rust anchors** — `ironmem code-relink` uses Tree-sitter to hash Rust symbols and relink memories when code moves across files.
 - **Reflection, snapshots, and sync** — dry-run-first consolidation proposals, CCR-backed project brain snapshots, and an idempotent Lamport-clock sync event log support long-lived and multi-agent memory workflows.
@@ -153,6 +154,7 @@ With IronMem:
 - [MCP Setup](#mcp-setup)
 - [MCP Tools](#mcp-tools)
 - [Web UI](#web-ui)
+- [Governed Memory](#governed-memory)
 - [Configuration](#configuration)
 - [Testing Status](#testing-status)
 - [Troubleshooting](#troubleshooting)
@@ -301,6 +303,8 @@ ironmem search-global "auth middleware"  # Search across all projects
 ironmem sessions            # Session history for current project
 ironmem inject              # Manually rebuild IRONMEM.md (relevance-ranked)
 ironmem remember "..."      # Store an explicit memory (--scope user, --kind preference, --tags)
+ironmem remember "..." --classification pii --consent-state granted --namespace tenant-a
+ironmem forget <memory-id> --reason "user requested erasure"
 ironmem profile             # Show the user profile (--refresh to regenerate it)
 ironmem corrections         # List mined error→fix memories (--all for every project)
 ironmem graph "Operator OS" # Query temporal graph edges (--history includes superseded edges, --at filters valid time)
@@ -582,15 +586,52 @@ The REST server runs on `http://localhost:37778` by default. Current high-signal
 | `POST /event` | Record an observation |
 | `POST /session/end` | End and compress a session |
 | `POST /compress` | Manually compress a session |
-| `GET /context?project=&query=&limit=&rerank=` | Retrieve project memories plus expansion chunks |
-| `GET /skim?project=&limit=` | Return adaptive project skim chunks |
-| `GET /skim?global=true&limit=` | Return adaptive global skim chunks |
+| `GET /context?project=&query=&namespace=&limit=&rerank=` | Retrieve project memories plus expansion chunks in one governance namespace |
+| `GET /skim?project=&namespace=&limit=` | Return adaptive project skim chunks in one governance namespace |
+| `GET /skim?global=true&namespace=&limit=` | Return adaptive global skim chunks in one governance namespace |
 | `POST /retrieve_original` | Expand by `chunk_id`, `observation_id`, `memory_id`, or `hash` |
 | `POST /remember` | Store an explicit typed/scoped memory |
 | `GET /profile` / `POST /refresh_profile` | Read or regenerate the user profile |
 | `GET /corrections` | List mined error-solution memories |
 | `GET /graph?entity=&project=&history=&at=&limit=` | Query temporal graph edges |
 | `GET /status` | Health, DB stats, CCR stats, graph edge count, and memory chunk count |
+
+---
+
+## Governed Memory
+
+IronMem is still independent of SovereignClaw, but it now has its own governance envelope for durable recall. The default namespace is `local`, so existing single-user installs continue to work without new flags. Multi-tenant or control-plane callers can set `namespace` to isolate reads, search, skim, list, context injection, and explicit memory writes.
+
+Governance fields accepted by CLI, REST `/remember`, and MCP `remember` include:
+
+| Field | Purpose |
+| ----- | ------- |
+| `namespace` | Tenant/realm boundary. Defaults to `local`. |
+| `source_type` | `user_input`, `tool_output`, `agent_generated`, `derived`, `external`, or `sync_peer`. |
+| `trust_tier` | `high`, `medium`, `low`, or `untrusted`. |
+| `writer_identity` / `source_ref` | Provenance for who/what wrote the memory. |
+| `parent_memory_id` | Lineage for derived facts and compression children. |
+| `classification` | `public`, `internal`, `confidential`, `restricted`, `pii`, or `phi`. |
+| `consent_state` | `required`, `granted`, `denied`, or `withdrawn`; `pii` and `phi` require `granted`. |
+| `residency`, `retention_policy_id`, `expires_at` | Policy metadata; `expires_at` is enforced by active recall filters. |
+| `legal_hold` | Prevents governed deletion while true. |
+
+Every governed write stores a canonical record hash and appends to `memory_ledger`, linking each entry to the previous namespace hash. Deletion uses `ironmem forget` or the existing project wipe paths, which now call governed deletion per memory: legal holds block deletion, active recall is tombstoned first, the ledger records the forget event, vectors are purged, and CCR blobs are garbage-collected when no references remain.
+
+Example:
+
+```bash
+ironmem remember "Customer asked to retain audit exports for 7 years" \
+  --namespace tenant-a \
+  --classification confidential \
+  --consent-state granted \
+  --writer ops-agent \
+  --residency us \
+  --retention-policy-id audit-7y
+
+ironmem search "audit exports" --namespace tenant-a
+ironmem forget 42 --actor privacy-admin --reason "retention window expired"
+```
 
 ---
 

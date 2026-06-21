@@ -129,7 +129,8 @@ impl IronMemServer {
                     "properties": {
                         "project": { "type": "string", "description": "Project root path" },
                         "limit": { "type": "integer", "description": "Max results (default 5)" },
-                        "query": { "type": "string", "description": "Search query (optional)" }
+                        "query": { "type": "string", "description": "Search query (optional)" },
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" }
                     },
                     "required": ["project"]
                 })),
@@ -142,7 +143,8 @@ impl IronMemServer {
                     "properties": {
                         "project": { "type": "string", "description": "Project root path. Omit when global=true." },
                         "limit": { "type": "integer", "description": "Max chunks (default 15)" },
-                        "global": { "type": "boolean", "description": "When true, skim across all projects." }
+                        "global": { "type": "boolean", "description": "When true, skim across all projects." },
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" }
                     }
                 })),
             ),
@@ -174,7 +176,8 @@ impl IronMemServer {
                     "type": "object",
                     "properties": {
                         "project": { "type": "string", "description": "Project root path" },
-                        "limit": { "type": "integer", "description": "Max results (default 5)" }
+                        "limit": { "type": "integer", "description": "Max results (default 5)" },
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" }
                     },
                     "required": ["project"]
                 })),
@@ -188,7 +191,8 @@ impl IronMemServer {
                         "query": { "type": "string", "description": "Search query" },
                         "project": { "type": "string", "description": "Project root path" },
                         "limit": { "type": "integer", "description": "Max results (default 10)" },
-                        "semantic": { "type": "boolean", "description": "Blend semantic vector search with keyword search (default true). Set false for keyword-only." }
+                        "semantic": { "type": "boolean", "description": "Blend semantic vector search with keyword search (default true). Set false for keyword-only." },
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" }
                     },
                     "required": ["query", "project"]
                 })),
@@ -201,7 +205,8 @@ impl IronMemServer {
                     "properties": {
                         "query": { "type": "string", "description": "Search query" },
                         "limit": { "type": "integer", "description": "Max results (default 10)" },
-                        "semantic": { "type": "boolean", "description": "Blend semantic vector search with keyword search (default true). Set false for keyword-only." }
+                        "semantic": { "type": "boolean", "description": "Blend semantic vector search with keyword search (default true). Set false for keyword-only." },
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" }
                     },
                     "required": ["query"]
                 })),
@@ -242,7 +247,7 @@ impl IronMemServer {
             ),
             Tool::new(
                 "remember",
-                "Store an explicit, durable memory. Use scope='user' for facts/preferences about the user that apply across every project; scope='project' (default) for this project only. kind classifies it: session | error_solution | preference | architecture | learned_pattern | project_config | profile.",
+                "Store an explicit, durable governed memory. Use scope='user' for facts/preferences that apply across projects inside the namespace; scope='project' (default) for this project only. PHI/PII requires consent_state='granted'.",
                 schema(serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -250,7 +255,18 @@ impl IronMemServer {
                         "text": { "type": "string", "description": "The memory content to store verbatim" },
                         "scope": { "type": "string", "description": "'project' (default) or 'user' (cross-project)" },
                         "kind": { "type": "string", "description": "session | error_solution | preference | architecture | learned_pattern | project_config | profile (default preference)" },
-                        "tags": { "type": "string", "description": "Optional space-separated keywords" }
+                        "tags": { "type": "string", "description": "Optional space-separated keywords" },
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
+                        "source_type": { "type": "string", "description": "user_input | tool_output | agent_generated | derived | external | sync_peer" },
+                        "trust_tier": { "type": "string", "description": "high | medium | low | untrusted" },
+                        "writer_identity": { "type": "string", "description": "Writer identity for the tamper-evident ledger" },
+                        "classification": { "type": "string", "description": "public | internal | confidential | restricted | phi | pii" },
+                        "consent_state": { "type": "string", "description": "required | granted | denied | withdrawn; PHI/PII requires granted" },
+                        "residency": { "type": "string", "description": "Optional residency tag" },
+                        "retention_policy_id": { "type": "string", "description": "Optional retention policy id" },
+                        "expires_at": { "type": "integer", "description": "Optional Unix timestamp expiry" },
+                        "legal_hold": { "type": "boolean", "description": "If true, governed forget refuses deletion" },
+                        "source_ref": { "type": "string", "description": "Optional source event, receipt, URL, or tool id" }
                     },
                     "required": ["project", "text"]
                 })),
@@ -480,13 +496,14 @@ impl IronMemServer {
             .unwrap_or(self.config.inject_limit as i64);
         let query = args.get("query").and_then(|v| v.as_str());
         let semantic = semantic_arg(args);
+        let namespace = namespace_arg(args);
 
         let memories = match query {
             Some(q) if !q.is_empty() => self
-                .hybrid(Some(project), q, limit, semantic)
+                .hybrid_in_namespace(&namespace, Some(project), q, limit, semantic)
                 .await
                 .unwrap_or_default(),
-            _ => db::get_recent_memories(&self.db, project, limit)
+            _ => db::get_recent_memories_in_namespace(&self.db, &namespace, project, limit)
                 .await
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
         };
@@ -522,7 +539,8 @@ impl IronMemServer {
         } else {
             args.get("project").and_then(|v| v.as_str())
         };
-        let chunks = db::recent_memory_chunks(&self.db, project, limit)
+        let namespace = namespace_arg(args);
+        let chunks = db::recent_memory_chunks_in_namespace(&self.db, &namespace, project, limit)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let json = serde_json::json!({ "chunks": chunks });
@@ -557,8 +575,9 @@ impl IronMemServer {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ErrorData::invalid_params("missing 'project'", None))?;
         let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(5);
+        let namespace = namespace_arg(args);
 
-        let memories = db::get_recent_memories(&self.db, project, limit)
+        let memories = db::get_recent_memories_in_namespace(&self.db, &namespace, project, limit)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -579,9 +598,10 @@ impl IronMemServer {
             .ok_or_else(|| ErrorData::invalid_params("missing 'project'", None))?;
         let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10);
         let semantic = semantic_arg(args);
+        let namespace = namespace_arg(args);
 
         let memories = self
-            .hybrid(Some(project), query, limit, semantic)
+            .hybrid_in_namespace(&namespace, Some(project), query, limit, semantic)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -598,9 +618,10 @@ impl IronMemServer {
             .ok_or_else(|| ErrorData::invalid_params("missing 'query'", None))?;
         let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10);
         let semantic = semantic_arg(args);
+        let namespace = namespace_arg(args);
 
         let memories = self
-            .hybrid(None, query, limit, semantic)
+            .hybrid_in_namespace(&namespace, None, query, limit, semantic)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -697,8 +718,58 @@ impl IronMemServer {
             .and_then(|v| v.as_str())
             .unwrap_or("preference");
         let tags = args.get("tags").and_then(|v| v.as_str());
+        let governance = crate::governance::MemoryGovernance {
+            namespace: crate::governance::normalize_namespace(
+                args.get("namespace")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+            ),
+            source_type: crate::governance::parse_source_type(
+                args.get("source_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("user_input"),
+            ),
+            trust_tier: crate::governance::parse_trust_tier(
+                args.get("trust_tier")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("high"),
+            ),
+            writer_identity: args
+                .get("writer_identity")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| Some("ironmem:mcp".to_string())),
+            source_ref: args
+                .get("source_ref")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            parent_memory_id: None,
+            classification: crate::governance::parse_classification(
+                args.get("classification")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("internal"),
+            ),
+            consent_state: args
+                .get("consent_state")
+                .and_then(|v| v.as_str())
+                .and_then(crate::governance::parse_consent_state),
+            residency: args
+                .get("residency")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            retention_policy_id: args
+                .get("retention_policy_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            expires_at: args.get("expires_at").and_then(|v| v.as_i64()),
+            legal_hold: args
+                .get("legal_hold")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        };
+        let namespace = crate::governance::normalize_namespace(&governance.namespace);
 
-        let memory_id = compress::remember(
+        let memory_id = compress::remember_with_governance(
             &self.db,
             self.embedder.as_deref(),
             self.store.as_ref(),
@@ -707,6 +778,7 @@ impl IronMemServer {
             kind,
             text,
             tags,
+            governance,
         )
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -714,6 +786,7 @@ impl IronMemServer {
         let json = serde_json::json!({
             "ok": true,
             "memory_id": memory_id,
+            "namespace": namespace,
             "scope": db::clamp_scope(scope),
             "kind": db::clamp_kind(kind),
         });
@@ -845,17 +918,26 @@ impl IronMemServer {
         let ids = db::memory_ids_for_project(&self.db, project)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        let count = db::delete_memories_for_project(&self.db, project)
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let mut count = 0_u64;
         for id in ids {
-            // Release the CCR session-transcript reference before purge_memory
-            // deletes the memory_meta row that records it.
-            if let Err(e) = db::decref_memory_session_blob(&self.db, id).await {
-                tracing::warn!("CCR decref failed for memory {id}: {e}");
-            }
-            if let Err(e) = vectorstore::purge_memory(&self.db, self.store.as_ref(), id).await {
-                tracing::warn!("vector/meta cleanup failed for memory {id}: {e}");
+            match db::governed_delete_memory(
+                &self.db,
+                id,
+                Some("ironmem:mcp"),
+                Some("project wipe"),
+            )
+            .await
+            {
+                Ok(true) => {
+                    count += 1;
+                    if let Err(e) =
+                        vectorstore::purge_memory(&self.db, self.store.as_ref(), id).await
+                    {
+                        tracing::warn!("vector/meta cleanup failed for memory {id}: {e}");
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!("governed wipe failed for memory {id}: {e}"),
             }
         }
 
@@ -884,8 +966,27 @@ impl IronMemServer {
 
     /// Hybrid (keyword + semantic) search. `semantic=false` forces FTS-only.
     /// With no embedder configured the result is identical to legacy FTS.
+    #[allow(dead_code)]
     async fn hybrid(
         &self,
+        project: Option<&str>,
+        query: &str,
+        limit: i64,
+        semantic: bool,
+    ) -> anyhow::Result<Vec<Memory>> {
+        self.hybrid_in_namespace(
+            crate::governance::DEFAULT_NAMESPACE,
+            project,
+            query,
+            limit,
+            semantic,
+        )
+        .await
+    }
+
+    async fn hybrid_in_namespace(
+        &self,
+        namespace: &str,
         project: Option<&str>,
         query: &str,
         limit: i64,
@@ -896,10 +997,11 @@ impl IronMemServer {
         } else {
             None
         };
-        retrieval::hybrid_search(
+        retrieval::hybrid_search_in_namespace(
             &self.db,
             embedder,
             self.store.as_ref(),
+            namespace,
             project,
             query,
             limit as usize,
@@ -913,6 +1015,14 @@ fn semantic_arg(args: &JsonObject) -> bool {
     args.get("semantic")
         .and_then(|v| v.as_bool())
         .unwrap_or(true)
+}
+
+fn namespace_arg(args: &JsonObject) -> String {
+    crate::governance::normalize_namespace(
+        args.get("namespace")
+            .and_then(|v| v.as_str())
+            .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+    )
 }
 
 impl ServerHandler for IronMemServer {

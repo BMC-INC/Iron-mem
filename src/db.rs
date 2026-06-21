@@ -5,6 +5,11 @@ use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
 use std::collections::HashMap;
 
+use crate::governance::{
+    classification_str, consent_state_str, ledger_entry_hash, memory_record_hash,
+    normalize_namespace, source_type_str, trust_tier_str, MemoryGovernance, DEFAULT_NAMESPACE,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Backend {
     Sqlite,
@@ -44,6 +49,20 @@ pub struct Memory {
     pub session_id: String,
     pub summary: String,
     pub tags: Option<String>,
+    pub created_at: i64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct MemoryLedgerEntry {
+    pub id: i64,
+    pub namespace: String,
+    pub memory_id: Option<i64>,
+    pub op_type: String,
+    pub actor: Option<String>,
+    pub prev_hash: Option<String>,
+    pub entry_hash: String,
+    pub payload: String,
     pub created_at: i64,
 }
 
@@ -225,8 +244,30 @@ pub struct SyncEvent {
     pub lamport: i64,
     pub op_type: String,
     pub payload: String,
+    pub payload_hash: Option<String>,
+    pub prev_hash: Option<String>,
+    pub event_hash: Option<String>,
+    pub signer: Option<String>,
     pub created_at: i64,
     pub applied_at: Option<i64>,
+}
+
+async fn add_memory_meta_column(db: &Database, column_sql: &str) -> Result<()> {
+    match db.backend {
+        Backend::Sqlite => {
+            let _ = sqlx::query(&format!("ALTER TABLE memory_meta ADD COLUMN {column_sql}"))
+                .execute(&db.pool)
+                .await;
+        }
+        Backend::Postgres => {
+            sqlx::query(&format!(
+                "ALTER TABLE memory_meta ADD COLUMN IF NOT EXISTS {column_sql}"
+            ))
+            .execute(&db.pool)
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 impl Database {
@@ -506,6 +547,86 @@ impl Database {
                     .await?;
             }
         }
+
+        // Governance-ready memory: IronMem remains independent of any external
+        // control plane by storing provenance, namespace, classification/consent,
+        // residency/retention, tombstone, and record-integrity metadata itself.
+        add_memory_meta_column(self, "namespace TEXT NOT NULL DEFAULT 'local'").await?;
+        add_memory_meta_column(self, "source_type TEXT NOT NULL DEFAULT 'derived'").await?;
+        add_memory_meta_column(self, "trust_tier TEXT NOT NULL DEFAULT 'medium'").await?;
+        add_memory_meta_column(self, "writer_identity TEXT").await?;
+        add_memory_meta_column(self, "source_ref TEXT").await?;
+        add_memory_meta_column(self, "parent_memory_id BIGINT").await?;
+        add_memory_meta_column(self, "classification TEXT NOT NULL DEFAULT 'internal'").await?;
+        add_memory_meta_column(self, "consent_state TEXT").await?;
+        add_memory_meta_column(self, "residency TEXT").await?;
+        add_memory_meta_column(self, "retention_policy_id TEXT").await?;
+        add_memory_meta_column(self, "expires_at BIGINT").await?;
+        add_memory_meta_column(self, "legal_hold BIGINT NOT NULL DEFAULT 0").await?;
+        add_memory_meta_column(self, "record_hash TEXT").await?;
+        add_memory_meta_column(self, "tombstoned_at BIGINT").await?;
+        add_memory_meta_column(self, "tombstone_reason TEXT").await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memory_meta_namespace
+             ON memory_meta(namespace, memory_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memory_meta_retention
+             ON memory_meta(retention_policy_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        match self.backend {
+            Backend::Sqlite => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS memory_ledger (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        namespace   TEXT NOT NULL,
+                        memory_id   BIGINT,
+                        op_type     TEXT NOT NULL,
+                        actor       TEXT,
+                        prev_hash   TEXT,
+                        entry_hash  TEXT NOT NULL UNIQUE,
+                        payload     TEXT NOT NULL,
+                        created_at  BIGINT NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+            Backend::Postgres => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS memory_ledger (
+                        id          BIGSERIAL PRIMARY KEY,
+                        namespace   TEXT NOT NULL,
+                        memory_id   BIGINT,
+                        op_type     TEXT NOT NULL,
+                        actor       TEXT,
+                        prev_hash   TEXT,
+                        entry_hash  TEXT NOT NULL UNIQUE,
+                        payload     TEXT NOT NULL,
+                        created_at  BIGINT NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memory_ledger_namespace
+             ON memory_ledger(namespace, id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memory_ledger_memory
+             ON memory_ledger(memory_id, id)",
+        )
+        .execute(&self.pool)
+        .await?;
 
         // Entity inverted index: one row per (memory, normalized proper-noun
         // token), so name-anchored questions resolve by direct lookup even when a
@@ -866,6 +987,36 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+        match self.backend {
+            Backend::Sqlite => {
+                let _ = sqlx::query("ALTER TABLE sync_events ADD COLUMN payload_hash TEXT")
+                    .execute(&self.pool)
+                    .await;
+                let _ = sqlx::query("ALTER TABLE sync_events ADD COLUMN prev_hash TEXT")
+                    .execute(&self.pool)
+                    .await;
+                let _ = sqlx::query("ALTER TABLE sync_events ADD COLUMN event_hash TEXT")
+                    .execute(&self.pool)
+                    .await;
+                let _ = sqlx::query("ALTER TABLE sync_events ADD COLUMN signer TEXT")
+                    .execute(&self.pool)
+                    .await;
+            }
+            Backend::Postgres => {
+                sqlx::query("ALTER TABLE sync_events ADD COLUMN IF NOT EXISTS payload_hash TEXT")
+                    .execute(&self.pool)
+                    .await?;
+                sqlx::query("ALTER TABLE sync_events ADD COLUMN IF NOT EXISTS prev_hash TEXT")
+                    .execute(&self.pool)
+                    .await?;
+                sqlx::query("ALTER TABLE sync_events ADD COLUMN IF NOT EXISTS event_hash TEXT")
+                    .execute(&self.pool)
+                    .await?;
+                sqlx::query("ALTER TABLE sync_events ADD COLUMN IF NOT EXISTS signer TEXT")
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_sync_events_order
              ON sync_events(project, lamport, created_at)",
@@ -1148,21 +1299,44 @@ pub async fn insert_memory(
 }
 
 pub async fn get_recent_memories(db: &Database, project: &str, limit: i64) -> Result<Vec<Memory>> {
+    get_recent_memories_in_namespace(db, DEFAULT_NAMESPACE, project, limit).await
+}
+
+pub async fn get_recent_memories_in_namespace(
+    db: &Database,
+    namespace: &str,
+    project: &str,
+    limit: i64,
+) -> Result<Vec<Memory>> {
+    let namespace = normalize_namespace(namespace);
+    let now = Utc::now().timestamp();
     let query_str = match db.backend {
         Backend::Sqlite => {
-            "SELECT rowid as id, project, session_id, summary, tags, created_at
-             FROM memories WHERE project = $1
-             ORDER BY created_at DESC LIMIT $2"
+            "SELECT memories.rowid as id, memories.project, memories.session_id, memories.summary, memories.tags, memories.created_at
+             FROM memories
+             LEFT JOIN memory_meta mm ON mm.memory_id = memories.rowid
+             WHERE memories.project = $1
+               AND COALESCE(mm.namespace, 'local') = $2
+               AND mm.tombstoned_at IS NULL
+               AND (mm.expires_at IS NULL OR mm.expires_at > $3)
+             ORDER BY memories.created_at DESC LIMIT $4"
         }
         Backend::Postgres => {
-            "SELECT id, project, session_id, summary, tags, created_at
-             FROM memories WHERE project = $1
-             ORDER BY created_at DESC LIMIT $2"
+            "SELECT m.id, m.project, m.session_id, m.summary, m.tags, m.created_at
+             FROM memories m
+             LEFT JOIN memory_meta mm ON mm.memory_id = m.id
+             WHERE m.project = $1
+               AND COALESCE(mm.namespace, 'local') = $2
+               AND mm.tombstoned_at IS NULL
+               AND (mm.expires_at IS NULL OR mm.expires_at > $3)
+             ORDER BY m.created_at DESC LIMIT $4"
         }
     };
 
     let rows: Vec<sqlx::any::AnyRow> = sqlx::query(query_str)
         .bind(project)
+        .bind(namespace)
+        .bind(now)
         .bind(limit)
         .fetch_all(&db.pool)
         .await?;
@@ -1196,8 +1370,19 @@ fn fts5_match_query(raw: &str) -> String {
         .join(" OR ")
 }
 
+#[allow(dead_code)]
 pub async fn search_memories(
     db: &Database,
+    project: &str,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<Memory>> {
+    search_memories_in_namespace(db, DEFAULT_NAMESPACE, project, query, limit).await
+}
+
+pub async fn search_memories_in_namespace(
+    db: &Database,
+    namespace: &str,
     project: &str,
     query: &str,
     limit: i64,
@@ -1210,22 +1395,38 @@ pub async fn search_memories(
     if matches!(db.backend, Backend::Sqlite) && match_query.is_empty() {
         return Ok(Vec::new());
     }
+    let namespace = normalize_namespace(namespace);
+    let now = Utc::now().timestamp();
     let query_str = match db.backend {
         Backend::Sqlite => {
-            "SELECT rowid as id, project, session_id, summary, tags, created_at
-             FROM memories WHERE memories MATCH $1 AND project = $2
-             ORDER BY created_at DESC LIMIT $3"
+            "SELECT memories.rowid as id, memories.project, memories.session_id, memories.summary, memories.tags, memories.created_at
+             FROM memories
+             LEFT JOIN memory_meta mm ON mm.memory_id = memories.rowid
+             WHERE memories MATCH $1
+               AND memories.project = $2
+               AND COALESCE(mm.namespace, 'local') = $3
+               AND mm.tombstoned_at IS NULL
+               AND (mm.expires_at IS NULL OR mm.expires_at > $4)
+             ORDER BY memories.created_at DESC LIMIT $5"
         }
         Backend::Postgres => {
-            "SELECT id, project, session_id, summary, tags, created_at
-             FROM memories WHERE search_vector @@ plainto_tsquery($1) AND project = $2
-             ORDER BY created_at DESC LIMIT $3"
+            "SELECT m.id, m.project, m.session_id, m.summary, m.tags, m.created_at
+             FROM memories m
+             LEFT JOIN memory_meta mm ON mm.memory_id = m.id
+             WHERE m.search_vector @@ plainto_tsquery($1)
+               AND m.project = $2
+               AND COALESCE(mm.namespace, 'local') = $3
+               AND mm.tombstoned_at IS NULL
+               AND (mm.expires_at IS NULL OR mm.expires_at > $4)
+             ORDER BY m.created_at DESC LIMIT $5"
         }
     };
 
     let rows: Vec<sqlx::any::AnyRow> = sqlx::query(query_str)
         .bind(match_query)
         .bind(project)
+        .bind(namespace)
+        .bind(now)
         .bind(limit)
         .fetch_all(&db.pool)
         .await?;
@@ -1243,7 +1444,17 @@ pub async fn search_memories(
         .collect())
 }
 
+#[allow(dead_code)]
 pub async fn search_all_memories(db: &Database, query: &str, limit: i64) -> Result<Vec<Memory>> {
+    search_all_memories_in_namespace(db, DEFAULT_NAMESPACE, query, limit).await
+}
+
+pub async fn search_all_memories_in_namespace(
+    db: &Database,
+    namespace: &str,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<Memory>> {
     let match_query = match db.backend {
         Backend::Sqlite => fts5_match_query(query),
         Backend::Postgres => query.to_string(),
@@ -1251,21 +1462,35 @@ pub async fn search_all_memories(db: &Database, query: &str, limit: i64) -> Resu
     if matches!(db.backend, Backend::Sqlite) && match_query.is_empty() {
         return Ok(Vec::new());
     }
+    let namespace = normalize_namespace(namespace);
+    let now = Utc::now().timestamp();
     let query_str = match db.backend {
         Backend::Sqlite => {
-            "SELECT rowid as id, project, session_id, summary, tags, created_at
-             FROM memories WHERE memories MATCH $1
-             ORDER BY created_at DESC LIMIT $2"
+            "SELECT memories.rowid as id, memories.project, memories.session_id, memories.summary, memories.tags, memories.created_at
+             FROM memories
+             LEFT JOIN memory_meta mm ON mm.memory_id = memories.rowid
+             WHERE memories MATCH $1
+               AND COALESCE(mm.namespace, 'local') = $2
+               AND mm.tombstoned_at IS NULL
+               AND (mm.expires_at IS NULL OR mm.expires_at > $3)
+             ORDER BY memories.created_at DESC LIMIT $4"
         }
         Backend::Postgres => {
-            "SELECT id, project, session_id, summary, tags, created_at
-             FROM memories WHERE search_vector @@ plainto_tsquery($1)
-             ORDER BY created_at DESC LIMIT $2"
+            "SELECT m.id, m.project, m.session_id, m.summary, m.tags, m.created_at
+             FROM memories m
+             LEFT JOIN memory_meta mm ON mm.memory_id = m.id
+             WHERE m.search_vector @@ plainto_tsquery($1)
+               AND COALESCE(mm.namespace, 'local') = $2
+               AND mm.tombstoned_at IS NULL
+               AND (mm.expires_at IS NULL OR mm.expires_at > $3)
+             ORDER BY m.created_at DESC LIMIT $4"
         }
     };
 
     let rows: Vec<sqlx::any::AnyRow> = sqlx::query(query_str)
         .bind(match_query)
+        .bind(namespace)
+        .bind(now)
         .bind(limit)
         .fetch_all(&db.pool)
         .await?;
@@ -1284,19 +1509,42 @@ pub async fn search_all_memories(db: &Database, query: &str, limit: i64) -> Resu
 }
 
 pub async fn list_projects(db: &Database, limit: i64) -> Result<Vec<ProjectSummary>> {
-    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(
-        "SELECT m.project,
-                COUNT(*) AS memory_count,
-                MAX(COALESCE(s.ended_at, s.started_at, m.created_at)) AS last_activity
-         FROM memories m
-         LEFT JOIN sessions s ON s.id = m.session_id
-         GROUP BY m.project
-         ORDER BY last_activity DESC
-         LIMIT $1",
-    )
-    .bind(limit)
-    .fetch_all(&db.pool)
-    .await?;
+    let now = Utc::now().timestamp();
+    let query_str = match db.backend {
+        Backend::Sqlite => {
+            "SELECT memories.project,
+                    COUNT(*) AS memory_count,
+                    MAX(COALESCE(s.ended_at, s.started_at, memories.created_at)) AS last_activity
+             FROM memories
+             LEFT JOIN sessions s ON s.id = memories.session_id
+             LEFT JOIN memory_meta mm ON mm.memory_id = memories.rowid
+             WHERE COALESCE(mm.namespace, 'local') = 'local'
+               AND mm.tombstoned_at IS NULL
+               AND (mm.expires_at IS NULL OR mm.expires_at > $1)
+             GROUP BY memories.project
+             ORDER BY last_activity DESC
+             LIMIT $2"
+        }
+        Backend::Postgres => {
+            "SELECT m.project,
+                    COUNT(*) AS memory_count,
+                    MAX(COALESCE(s.ended_at, s.started_at, m.created_at)) AS last_activity
+             FROM memories m
+             LEFT JOIN sessions s ON s.id = m.session_id
+             LEFT JOIN memory_meta mm ON mm.memory_id = m.id
+             WHERE COALESCE(mm.namespace, 'local') = 'local'
+               AND mm.tombstoned_at IS NULL
+               AND (mm.expires_at IS NULL OR mm.expires_at > $1)
+             GROUP BY m.project
+             ORDER BY last_activity DESC
+             LIMIT $2"
+        }
+    };
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(query_str)
+        .bind(now)
+        .bind(limit)
+        .fetch_all(&db.pool)
+        .await?;
 
     Ok(rows
         .into_iter()
@@ -1308,6 +1556,7 @@ pub async fn list_projects(db: &Database, limit: i64) -> Result<Vec<ProjectSumma
         .collect())
 }
 
+#[allow(dead_code)]
 pub async fn delete_memories_for_project(db: &Database, project: &str) -> Result<u64> {
     let result = sqlx::query("DELETE FROM memories WHERE project = $1")
         .bind(project)
@@ -1320,11 +1569,33 @@ pub async fn delete_memories_for_project(db: &Database, project: &str) -> Result
 /// purge each memory's vectors + metadata after a project wipe.
 pub async fn memory_ids_for_project(db: &Database, project: &str) -> Result<Vec<i64>> {
     let id_col = match db.backend {
-        Backend::Sqlite => "rowid",
-        Backend::Postgres => "id",
+        Backend::Sqlite => "memories.rowid",
+        Backend::Postgres => "m.id",
     };
-    let sql = format!("SELECT {id_col} AS id FROM memories WHERE project = $1");
-    let rows = sqlx::query(&sql).bind(project).fetch_all(&db.pool).await?;
+    let now = Utc::now().timestamp();
+    let sql = match db.backend {
+        Backend::Sqlite => format!(
+            "SELECT {id_col} AS id FROM memories
+             LEFT JOIN memory_meta mm ON mm.memory_id = memories.rowid
+             WHERE memories.project = $1
+               AND COALESCE(mm.namespace, 'local') = 'local'
+               AND mm.tombstoned_at IS NULL
+               AND (mm.expires_at IS NULL OR mm.expires_at > $2)"
+        ),
+        Backend::Postgres => format!(
+            "SELECT {id_col} AS id FROM memories m
+             LEFT JOIN memory_meta mm ON mm.memory_id = m.id
+             WHERE m.project = $1
+               AND COALESCE(mm.namespace, 'local') = 'local'
+               AND mm.tombstoned_at IS NULL
+               AND (mm.expires_at IS NULL OR mm.expires_at > $2)"
+        ),
+    };
+    let rows = sqlx::query(&sql)
+        .bind(project)
+        .bind(now)
+        .fetch_all(&db.pool)
+        .await?;
     Ok(rows.into_iter().map(|r| r.get::<i64, _>("id")).collect())
 }
 
@@ -1404,19 +1675,94 @@ pub async fn delete_memory(db: &Database, memory_id: i64) -> Result<bool> {
     Ok(result.rows_affected() > 0)
 }
 
+pub async fn governed_delete_memory(
+    db: &Database,
+    memory_id: i64,
+    actor: Option<&str>,
+    reason: Option<&str>,
+) -> Result<bool> {
+    let Some(memory) = get_memory_by_id_any_namespace(db, memory_id).await? else {
+        return Ok(false);
+    };
+    let meta = get_memory_meta_full(db, memory_id).await?;
+    if meta.legal_hold {
+        anyhow::bail!("memory {memory_id} is under legal hold and cannot be forgotten");
+    }
+    let namespace = normalize_namespace(&meta.namespace);
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "UPDATE memory_meta
+         SET tombstoned_at = $1, tombstone_reason = $2
+         WHERE memory_id = $3",
+    )
+    .bind(now)
+    .bind(reason)
+    .bind(memory_id)
+    .execute(&db.pool)
+    .await?;
+
+    let payload = serde_json::json!({
+        "classification": meta.classification,
+        "kind": meta.kind,
+        "namespace": namespace,
+        "project": memory.project,
+        "reason": reason,
+        "record_hash": meta.record_hash,
+        "scope": meta.scope,
+        "session_blob": get_memory_session_blob(db, memory_id).await?,
+        "source_type": meta.source_type,
+        "tombstoned_at": now,
+    });
+    append_memory_ledger(
+        db,
+        &namespace,
+        Some(memory_id),
+        "forget",
+        actor,
+        &payload.to_string(),
+    )
+    .await?;
+
+    decref_memory_session_blob(db, memory_id).await?;
+    let _ = gc_blobs(db).await?;
+    delete_memory(db, memory_id).await
+}
+
 pub async fn get_all_memories(db: &Database, limit: i64) -> Result<Vec<Memory>> {
+    get_all_memories_in_namespace(db, DEFAULT_NAMESPACE, limit).await
+}
+
+pub async fn get_all_memories_in_namespace(
+    db: &Database,
+    namespace: &str,
+    limit: i64,
+) -> Result<Vec<Memory>> {
+    let namespace = normalize_namespace(namespace);
+    let now = Utc::now().timestamp();
     let query_str = match db.backend {
         Backend::Sqlite => {
-            "SELECT rowid as id, project, session_id, summary, tags, created_at
-             FROM memories ORDER BY created_at DESC LIMIT $1"
+            "SELECT memories.rowid as id, memories.project, memories.session_id, memories.summary, memories.tags, memories.created_at
+             FROM memories
+             LEFT JOIN memory_meta mm ON mm.memory_id = memories.rowid
+             WHERE COALESCE(mm.namespace, 'local') = $1
+               AND mm.tombstoned_at IS NULL
+               AND (mm.expires_at IS NULL OR mm.expires_at > $2)
+             ORDER BY memories.created_at DESC LIMIT $3"
         }
         Backend::Postgres => {
-            "SELECT id, project, session_id, summary, tags, created_at
-             FROM memories ORDER BY created_at DESC LIMIT $1"
+            "SELECT m.id, m.project, m.session_id, m.summary, m.tags, m.created_at
+             FROM memories m
+             LEFT JOIN memory_meta mm ON mm.memory_id = m.id
+             WHERE COALESCE(mm.namespace, 'local') = $1
+               AND mm.tombstoned_at IS NULL
+               AND (mm.expires_at IS NULL OR mm.expires_at > $2)
+             ORDER BY m.created_at DESC LIMIT $3"
         }
     };
 
     let rows: Vec<sqlx::any::AnyRow> = sqlx::query(query_str)
+        .bind(namespace)
+        .bind(now)
         .bind(limit)
         .fetch_all(&db.pool)
         .await?;
@@ -1593,6 +1939,7 @@ pub fn clamp_scope(scope: &str) -> &'static str {
 /// (importance 0.5, scope `project`, kind `session`) apply when no row exists
 /// or a legacy row predates the column.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MemoryMetaInfo {
     pub importance: f64,
     // Populated + test-verified, but production scope selection happens at the
@@ -1606,6 +1953,21 @@ pub struct MemoryMetaInfo {
     /// so this field is read only in tests today.
     #[allow(dead_code)]
     pub event_time: Option<String>,
+    pub namespace: String,
+    pub source_type: String,
+    pub trust_tier: String,
+    pub writer_identity: Option<String>,
+    pub source_ref: Option<String>,
+    pub parent_memory_id: Option<i64>,
+    pub classification: String,
+    pub consent_state: Option<String>,
+    pub residency: Option<String>,
+    pub retention_policy_id: Option<String>,
+    pub expires_at: Option<i64>,
+    pub legal_hold: bool,
+    pub record_hash: Option<String>,
+    pub tombstoned_at: Option<i64>,
+    pub tombstone_reason: Option<String>,
 }
 
 impl Default for MemoryMetaInfo {
@@ -1615,6 +1977,21 @@ impl Default for MemoryMetaInfo {
             scope: "project".to_string(),
             kind: "session".to_string(),
             event_time: None,
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            source_type: "derived".to_string(),
+            trust_tier: "medium".to_string(),
+            writer_identity: None,
+            source_ref: None,
+            parent_memory_id: None,
+            classification: "internal".to_string(),
+            consent_state: None,
+            residency: None,
+            retention_policy_id: None,
+            expires_at: None,
+            legal_hold: false,
+            record_hash: None,
+            tombstoned_at: None,
+            tombstone_reason: None,
         }
     }
 }
@@ -1623,7 +2000,11 @@ impl Default for MemoryMetaInfo {
 /// columns fall back to the defaults in [`MemoryMetaInfo::default`].
 pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<MemoryMetaInfo> {
     let row: Option<sqlx::any::AnyRow> = sqlx::query(
-        "SELECT importance, scope, kind, event_time FROM memory_meta WHERE memory_id = $1",
+        "SELECT importance, scope, kind, event_time, namespace, source_type, trust_tier,
+                writer_identity, source_ref, parent_memory_id, classification, consent_state,
+                residency, retention_policy_id, expires_at, legal_hold, record_hash,
+                tombstoned_at, tombstone_reason
+         FROM memory_meta WHERE memory_id = $1",
     )
     .bind(memory_id)
     .fetch_optional(&db.pool)
@@ -1642,6 +2023,52 @@ pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<Memor
                 .flatten()
                 .unwrap_or_else(|| "session".to_string()),
             event_time: r.try_get::<Option<String>, _>("event_time").ok().flatten(),
+            namespace: r
+                .try_get::<Option<String>, _>("namespace")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| DEFAULT_NAMESPACE.to_string()),
+            source_type: r
+                .try_get::<Option<String>, _>("source_type")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "derived".to_string()),
+            trust_tier: r
+                .try_get::<Option<String>, _>("trust_tier")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "medium".to_string()),
+            writer_identity: r
+                .try_get::<Option<String>, _>("writer_identity")
+                .ok()
+                .flatten(),
+            source_ref: r.try_get::<Option<String>, _>("source_ref").ok().flatten(),
+            parent_memory_id: r
+                .try_get::<Option<i64>, _>("parent_memory_id")
+                .ok()
+                .flatten(),
+            classification: r
+                .try_get::<Option<String>, _>("classification")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "internal".to_string()),
+            consent_state: r
+                .try_get::<Option<String>, _>("consent_state")
+                .ok()
+                .flatten(),
+            residency: r.try_get::<Option<String>, _>("residency").ok().flatten(),
+            retention_policy_id: r
+                .try_get::<Option<String>, _>("retention_policy_id")
+                .ok()
+                .flatten(),
+            expires_at: r.try_get::<Option<i64>, _>("expires_at").ok().flatten(),
+            legal_hold: r.try_get::<i64, _>("legal_hold").unwrap_or(0) != 0,
+            record_hash: r.try_get::<Option<String>, _>("record_hash").ok().flatten(),
+            tombstoned_at: r.try_get::<Option<i64>, _>("tombstoned_at").ok().flatten(),
+            tombstone_reason: r
+                .try_get::<Option<String>, _>("tombstone_reason")
+                .ok()
+                .flatten(),
         },
         None => MemoryMetaInfo::default(),
     })
@@ -1688,6 +2115,208 @@ pub async fn set_memory_event_time(db: &Database, memory_id: i64, event_time: &s
     .execute(&db.pool)
     .await?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_memory_governance(
+    db: &Database,
+    memory_id: i64,
+    scope: &str,
+    kind: &str,
+    governance: &MemoryGovernance,
+    actor: Option<&str>,
+    op_type: &str,
+) -> Result<String> {
+    governance.validate()?;
+    let memory = get_memory_by_id_any_namespace(db, memory_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("memory not found: {memory_id}"))?;
+    let scope = clamp_scope(scope);
+    let kind = clamp_kind(kind);
+    let namespace = normalize_namespace(&governance.namespace);
+    let record_hash = memory_record_hash(
+        &memory.project,
+        &memory.session_id,
+        &memory.summary,
+        memory.tags.as_deref(),
+        scope,
+        kind,
+        governance,
+    );
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO memory_meta(
+            memory_id, importance, created_at, scope, kind, namespace, source_type, trust_tier,
+            writer_identity, source_ref, parent_memory_id, classification, consent_state,
+            residency, retention_policy_id, expires_at, legal_hold, record_hash
+         )
+         VALUES($1, 0.5, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+         ON CONFLICT(memory_id) DO UPDATE SET
+            scope = excluded.scope,
+            kind = excluded.kind,
+            namespace = excluded.namespace,
+            source_type = excluded.source_type,
+            trust_tier = excluded.trust_tier,
+            writer_identity = excluded.writer_identity,
+            source_ref = excluded.source_ref,
+            parent_memory_id = excluded.parent_memory_id,
+            classification = excluded.classification,
+            consent_state = excluded.consent_state,
+            residency = excluded.residency,
+            retention_policy_id = excluded.retention_policy_id,
+            expires_at = excluded.expires_at,
+            legal_hold = excluded.legal_hold,
+            record_hash = excluded.record_hash",
+    )
+    .bind(memory_id)
+    .bind(now)
+    .bind(scope)
+    .bind(kind)
+    .bind(&namespace)
+    .bind(source_type_str(governance.source_type))
+    .bind(trust_tier_str(governance.trust_tier))
+    .bind(governance.writer_identity.as_deref())
+    .bind(governance.source_ref.as_deref())
+    .bind(governance.parent_memory_id)
+    .bind(classification_str(governance.classification))
+    .bind(governance.consent_state.map(consent_state_str))
+    .bind(governance.residency.as_deref())
+    .bind(governance.retention_policy_id.as_deref())
+    .bind(governance.expires_at)
+    .bind(if governance.legal_hold { 1_i64 } else { 0_i64 })
+    .bind(&record_hash)
+    .execute(&db.pool)
+    .await?;
+
+    let payload = serde_json::json!({
+        "classification": classification_str(governance.classification),
+        "consent_state": governance.consent_state.map(consent_state_str),
+        "expires_at": governance.expires_at,
+        "kind": kind,
+        "legal_hold": governance.legal_hold,
+        "namespace": namespace,
+        "parent_memory_id": governance.parent_memory_id,
+        "project": memory.project,
+        "record_hash": record_hash,
+        "residency": governance.residency.as_deref(),
+        "retention_policy_id": governance.retention_policy_id.as_deref(),
+        "scope": scope,
+        "source_ref": governance.source_ref.as_deref(),
+        "source_type": source_type_str(governance.source_type),
+        "trust_tier": trust_tier_str(governance.trust_tier),
+        "writer_identity": governance.writer_identity.as_deref(),
+    });
+    append_memory_ledger(
+        db,
+        &namespace,
+        Some(memory_id),
+        op_type,
+        actor.or(governance.writer_identity.as_deref()),
+        &payload.to_string(),
+    )
+    .await
+}
+
+pub async fn append_memory_ledger(
+    db: &Database,
+    namespace: &str,
+    memory_id: Option<i64>,
+    op_type: &str,
+    actor: Option<&str>,
+    payload: &str,
+) -> Result<String> {
+    let namespace = normalize_namespace(namespace);
+    let prev_hash = latest_ledger_hash(db, &namespace).await?;
+    let now = Utc::now().timestamp();
+    let entry_hash = ledger_entry_hash(
+        prev_hash.as_deref(),
+        &namespace,
+        memory_id,
+        op_type,
+        actor,
+        payload,
+        now,
+    );
+    sqlx::query(
+        "INSERT INTO memory_ledger(namespace, memory_id, op_type, actor, prev_hash, entry_hash, payload, created_at)
+         VALUES($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(&namespace)
+    .bind(memory_id)
+    .bind(op_type)
+    .bind(actor)
+    .bind(prev_hash.as_deref())
+    .bind(&entry_hash)
+    .bind(payload)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    Ok(entry_hash)
+}
+
+pub async fn latest_ledger_hash(db: &Database, namespace: &str) -> Result<Option<String>> {
+    let row = sqlx::query(
+        "SELECT entry_hash FROM memory_ledger
+         WHERE namespace = $1
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(normalize_namespace(namespace))
+    .fetch_optional(&db.pool)
+    .await?;
+    Ok(row.and_then(|r| r.try_get::<String, _>("entry_hash").ok()))
+}
+
+#[cfg(test)]
+pub async fn memory_ledger_for_memory(
+    db: &Database,
+    memory_id: i64,
+) -> Result<Vec<MemoryLedgerEntry>> {
+    let rows = sqlx::query(
+        "SELECT id, namespace, memory_id, op_type, actor, prev_hash, entry_hash, payload, created_at
+         FROM memory_ledger WHERE memory_id = $1 ORDER BY id ASC",
+    )
+    .bind(memory_id)
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| MemoryLedgerEntry {
+            id: r.get("id"),
+            namespace: r.get("namespace"),
+            memory_id: r.try_get::<Option<i64>, _>("memory_id").ok().flatten(),
+            op_type: r.get("op_type"),
+            actor: r.try_get::<Option<String>, _>("actor").ok().flatten(),
+            prev_hash: r.try_get::<Option<String>, _>("prev_hash").ok().flatten(),
+            entry_hash: r.get("entry_hash"),
+            payload: r.get("payload"),
+            created_at: r.get("created_at"),
+        })
+        .collect())
+}
+
+pub async fn get_memory_by_id_any_namespace(db: &Database, id: i64) -> Result<Option<Memory>> {
+    let query_str = match db.backend {
+        Backend::Sqlite => {
+            "SELECT rowid as id, project, session_id, summary, tags, created_at
+             FROM memories WHERE rowid = $1"
+        }
+        Backend::Postgres => {
+            "SELECT id, project, session_id, summary, tags, created_at
+             FROM memories WHERE id = $1"
+        }
+    };
+    let row: Option<sqlx::any::AnyRow> = sqlx::query(query_str)
+        .bind(id)
+        .fetch_optional(&db.pool)
+        .await?;
+    Ok(row.map(|r| Memory {
+        id: r.get("id"),
+        project: r.get("project"),
+        session_id: r.get("session_id"),
+        summary: r.get("summary"),
+        tags: r.try_get("tags").ok().flatten(),
+        created_at: r.get("created_at"),
+    }))
 }
 
 /// Memory ids whose recorded `event_time` contains `needle` (typically a year),
@@ -2527,35 +3156,62 @@ pub async fn chunks_for_memories(
     Ok(out)
 }
 
+#[allow(dead_code)]
 pub async fn recent_memory_chunks(
     db: &Database,
     project: Option<&str>,
     limit: i64,
 ) -> Result<Vec<MemoryChunk>> {
-    let rows = match project {
-        Some(p) => sqlx::query(
-            "SELECT id, chunk_id, project, memory_id, session_id, ordinal, density, kind, title,
-                        summary, source_hash, source_start, source_end, token_estimate, created_at
-                 FROM memory_chunks
-                 WHERE project = $1
-                 ORDER BY created_at DESC, memory_id DESC, ordinal ASC
-                 LIMIT $2",
-        )
-        .bind(p)
-        .bind(limit)
-        .fetch_all(&db.pool)
-        .await?,
-        None => sqlx::query(
-            "SELECT id, chunk_id, project, memory_id, session_id, ordinal, density, kind, title,
-                        summary, source_hash, source_start, source_end, token_estimate, created_at
-                 FROM memory_chunks
-                 ORDER BY created_at DESC, memory_id DESC, ordinal ASC
-                 LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&db.pool)
-        .await?,
-    };
+    recent_memory_chunks_in_namespace(db, DEFAULT_NAMESPACE, project, limit).await
+}
+
+pub async fn recent_memory_chunks_in_namespace(
+    db: &Database,
+    namespace: &str,
+    project: Option<&str>,
+    limit: i64,
+) -> Result<Vec<MemoryChunk>> {
+    let namespace = normalize_namespace(namespace);
+    let now = Utc::now().timestamp();
+    let rows =
+        match project {
+            Some(p) => sqlx::query(
+                "SELECT mc.id, mc.chunk_id, mc.project, mc.memory_id, mc.session_id, mc.ordinal,
+                        mc.density, mc.kind, mc.title, mc.summary, mc.source_hash,
+                        mc.source_start, mc.source_end, mc.token_estimate, mc.created_at
+                 FROM memory_chunks mc
+                 LEFT JOIN memory_meta mm ON mm.memory_id = mc.memory_id
+                 WHERE mc.project = $1
+                   AND COALESCE(mm.namespace, 'local') = $2
+                   AND mm.tombstoned_at IS NULL
+                   AND (mm.expires_at IS NULL OR mm.expires_at > $3)
+                 ORDER BY mc.created_at DESC, mc.memory_id DESC, mc.ordinal ASC
+                 LIMIT $4",
+            )
+            .bind(p)
+            .bind(&namespace)
+            .bind(now)
+            .bind(limit)
+            .fetch_all(&db.pool)
+            .await?,
+            None => sqlx::query(
+                "SELECT mc.id, mc.chunk_id, mc.project, mc.memory_id, mc.session_id, mc.ordinal,
+                        mc.density, mc.kind, mc.title, mc.summary, mc.source_hash,
+                        mc.source_start, mc.source_end, mc.token_estimate, mc.created_at
+                 FROM memory_chunks mc
+                 LEFT JOIN memory_meta mm ON mm.memory_id = mc.memory_id
+                 WHERE COALESCE(mm.namespace, 'local') = $1
+                   AND mm.tombstoned_at IS NULL
+                   AND (mm.expires_at IS NULL OR mm.expires_at > $2)
+                 ORDER BY mc.created_at DESC, mc.memory_id DESC, mc.ordinal ASC
+                 LIMIT $3",
+            )
+            .bind(&namespace)
+            .bind(now)
+            .bind(limit)
+            .fetch_all(&db.pool)
+            .await?,
+        };
     Ok(rows.into_iter().map(memory_chunk_from_row).collect())
 }
 
@@ -3119,9 +3775,26 @@ pub async fn insert_sync_event(
     payload: &str,
 ) -> Result<bool> {
     let now = Utc::now().timestamp();
+    let payload_hash = crate::governance::sha256_hex(payload.as_bytes());
+    let prev_hash = latest_sync_event_hash(db, project).await?;
+    let event_hash = crate::governance::sha256_hex(
+        serde_json::json!({
+            "event_id": event_id,
+            "lamport": lamport,
+            "node_id": node_id,
+            "op_type": op_type,
+            "payload_hash": payload_hash,
+            "prev_hash": prev_hash,
+            "project": project,
+            "signer": node_id,
+        })
+        .to_string()
+        .as_bytes(),
+    );
     let result = sqlx::query(
-        "INSERT INTO sync_events(event_id, node_id, project, lamport, op_type, payload, created_at)
-         VALUES($1, $2, $3, $4, $5, $6, $7)
+        "INSERT INTO sync_events(event_id, node_id, project, lamport, op_type, payload, created_at,
+                                 payload_hash, prev_hash, event_hash, signer)
+         VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          ON CONFLICT(event_id) DO NOTHING",
     )
     .bind(event_id)
@@ -3131,9 +3804,41 @@ pub async fn insert_sync_event(
     .bind(op_type)
     .bind(payload)
     .bind(now)
+    .bind(&payload_hash)
+    .bind(prev_hash.as_deref())
+    .bind(&event_hash)
+    .bind(node_id)
     .execute(&db.pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+pub async fn latest_sync_event_hash(
+    db: &Database,
+    project: Option<&str>,
+) -> Result<Option<String>> {
+    let row = match project {
+        Some(p) => {
+            sqlx::query(
+                "SELECT event_hash FROM sync_events
+                 WHERE project = $1 AND event_hash IS NOT NULL
+                 ORDER BY lamport DESC, created_at DESC LIMIT 1",
+            )
+            .bind(p)
+            .fetch_optional(&db.pool)
+            .await?
+        }
+        None => {
+            sqlx::query(
+                "SELECT event_hash FROM sync_events
+                 WHERE project IS NULL AND event_hash IS NOT NULL
+                 ORDER BY lamport DESC, created_at DESC LIMIT 1",
+            )
+            .fetch_optional(&db.pool)
+            .await?
+        }
+    };
+    Ok(row.and_then(|r| r.try_get::<Option<String>, _>("event_hash").ok().flatten()))
 }
 
 pub async fn list_sync_events(
@@ -3143,27 +3848,33 @@ pub async fn list_sync_events(
     limit: i64,
 ) -> Result<Vec<SyncEvent>> {
     let rows = match project {
-        Some(p) => sqlx::query(
-            "SELECT event_id, node_id, project, lamport, op_type, payload, created_at, applied_at
+        Some(p) => {
+            sqlx::query(
+                "SELECT event_id, node_id, project, lamport, op_type, payload,
+                    payload_hash, prev_hash, event_hash, signer, created_at, applied_at
                  FROM sync_events
                  WHERE project = $1 AND lamport > $2
                  ORDER BY lamport ASC, created_at ASC LIMIT $3",
-        )
-        .bind(p)
-        .bind(after_lamport)
-        .bind(limit)
-        .fetch_all(&db.pool)
-        .await?,
-        None => sqlx::query(
-            "SELECT event_id, node_id, project, lamport, op_type, payload, created_at, applied_at
+            )
+            .bind(p)
+            .bind(after_lamport)
+            .bind(limit)
+            .fetch_all(&db.pool)
+            .await?
+        }
+        None => {
+            sqlx::query(
+                "SELECT event_id, node_id, project, lamport, op_type, payload,
+                    payload_hash, prev_hash, event_hash, signer, created_at, applied_at
                  FROM sync_events
                  WHERE lamport > $1
                  ORDER BY lamport ASC, created_at ASC LIMIT $2",
-        )
-        .bind(after_lamport)
-        .bind(limit)
-        .fetch_all(&db.pool)
-        .await?,
+            )
+            .bind(after_lamport)
+            .bind(limit)
+            .fetch_all(&db.pool)
+            .await?
+        }
     };
     Ok(rows
         .into_iter()
@@ -3174,6 +3885,13 @@ pub async fn list_sync_events(
             lamport: r.get("lamport"),
             op_type: r.get("op_type"),
             payload: r.get("payload"),
+            payload_hash: r
+                .try_get::<Option<String>, _>("payload_hash")
+                .ok()
+                .flatten(),
+            prev_hash: r.try_get::<Option<String>, _>("prev_hash").ok().flatten(),
+            event_hash: r.try_get::<Option<String>, _>("event_hash").ok().flatten(),
+            signer: r.try_get::<Option<String>, _>("signer").ok().flatten(),
             created_at: r.get("created_at"),
             applied_at: r.try_get("applied_at").ok().flatten(),
         })
@@ -3218,25 +3936,43 @@ pub async fn get_recent_memories_scoped(
     project: Option<&str>,
     limit: i64,
 ) -> Result<Vec<Memory>> {
+    get_recent_memories_scoped_in_namespace(db, DEFAULT_NAMESPACE, scope, project, limit).await
+}
+
+pub async fn get_recent_memories_scoped_in_namespace(
+    db: &Database,
+    namespace: &str,
+    scope: &str,
+    project: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Memory>> {
     let id_col = match db.backend {
         Backend::Sqlite => "m.rowid",
         Backend::Postgres => "m.id",
     };
+    let namespace = normalize_namespace(namespace);
+    let now = Utc::now().timestamp();
     let mut sql = format!(
         "SELECT {id_col} AS id, m.project, m.session_id, m.summary, m.tags, m.created_at
          FROM memories m
          LEFT JOIN memory_meta mm ON mm.memory_id = {id_col}
-         WHERE COALESCE(mm.scope, 'project') = $1"
+         WHERE COALESCE(mm.scope, 'project') = $1
+           AND COALESCE(mm.namespace, 'local') = $2
+           AND mm.tombstoned_at IS NULL
+           AND (mm.expires_at IS NULL OR mm.expires_at > $3)"
     );
     let limit_ph = if project.is_some() {
-        sql.push_str(" AND m.project = $2");
-        "$3"
+        sql.push_str(" AND m.project = $4");
+        "$5"
     } else {
-        "$2"
+        "$4"
     };
     sql.push_str(&format!(" ORDER BY m.created_at DESC LIMIT {limit_ph}"));
 
-    let mut q = sqlx::query(&sql).bind(clamp_scope(scope));
+    let mut q = sqlx::query(&sql)
+        .bind(clamp_scope(scope))
+        .bind(namespace)
+        .bind(now);
     if let Some(p) = project {
         q = q.bind(p);
     }
@@ -3266,10 +4002,17 @@ pub async fn get_profile_memory(db: &Database) -> Result<Option<Memory>> {
         "SELECT {id_col} AS id, m.project, m.session_id, m.summary, m.tags, m.created_at
          FROM memories m
          JOIN memory_meta mm ON mm.memory_id = {id_col}
-         WHERE mm.scope = 'user' AND mm.kind = 'profile'
+         WHERE mm.scope = 'user'
+           AND mm.kind = 'profile'
+           AND COALESCE(mm.namespace, 'local') = 'local'
+           AND mm.tombstoned_at IS NULL
+           AND (mm.expires_at IS NULL OR mm.expires_at > $1)
          ORDER BY m.created_at DESC LIMIT 1"
     );
-    let row: Option<sqlx::any::AnyRow> = sqlx::query(&sql).fetch_optional(&db.pool).await?;
+    let row: Option<sqlx::any::AnyRow> = sqlx::query(&sql)
+        .bind(Utc::now().timestamp())
+        .fetch_optional(&db.pool)
+        .await?;
     Ok(row.map(|r: sqlx::any::AnyRow| Memory {
         id: r.get("id"),
         project: r.get("project"),
@@ -3291,9 +4034,16 @@ pub async fn count_user_memories(db: &Database) -> Result<i64> {
         "SELECT COUNT(*) AS cnt
          FROM memories m
          JOIN memory_meta mm ON mm.memory_id = {id_col}
-         WHERE mm.scope = 'user' AND mm.kind <> 'profile'"
+         WHERE mm.scope = 'user'
+           AND mm.kind <> 'profile'
+           AND COALESCE(mm.namespace, 'local') = 'local'
+           AND mm.tombstoned_at IS NULL
+           AND (mm.expires_at IS NULL OR mm.expires_at > $1)"
     );
-    let row: sqlx::any::AnyRow = sqlx::query(&sql).fetch_one(&db.pool).await?;
+    let row: sqlx::any::AnyRow = sqlx::query(&sql)
+        .bind(Utc::now().timestamp())
+        .fetch_one(&db.pool)
+        .await?;
     Ok(row.get("cnt"))
 }
 
@@ -3314,17 +4064,22 @@ pub async fn get_memories_by_kind(
         "SELECT {id_col} AS id, m.project, m.session_id, m.summary, m.tags, m.created_at
          FROM memories m
          JOIN memory_meta mm ON mm.memory_id = {id_col}
-         WHERE mm.kind = $1"
+         WHERE mm.kind = $1
+           AND COALESCE(mm.namespace, 'local') = 'local'
+           AND mm.tombstoned_at IS NULL
+           AND (mm.expires_at IS NULL OR mm.expires_at > $2)"
     );
     let limit_ph = if project.is_some() {
-        sql.push_str(" AND m.project = $2");
-        "$3"
+        sql.push_str(" AND m.project = $3");
+        "$4"
     } else {
-        "$2"
+        "$3"
     };
     sql.push_str(&format!(" ORDER BY m.created_at DESC LIMIT {limit_ph}"));
 
-    let mut q = sqlx::query(&sql).bind(clamp_kind(kind));
+    let mut q = sqlx::query(&sql)
+        .bind(clamp_kind(kind))
+        .bind(Utc::now().timestamp());
     if let Some(p) = project {
         q = q.bind(p);
     }
@@ -3592,18 +4347,40 @@ pub async fn memory_ids_missing_embedding(
 /// Fetch a single memory by id (rowid in sqlite / id in pg). Used by hybrid
 /// search to materialize vector-only hits in their fused order.
 pub async fn get_memory_by_id(db: &Database, id: i64) -> Result<Option<Memory>> {
+    get_memory_by_id_in_namespace(db, id, DEFAULT_NAMESPACE).await
+}
+
+pub async fn get_memory_by_id_in_namespace(
+    db: &Database,
+    id: i64,
+    namespace: &str,
+) -> Result<Option<Memory>> {
+    let namespace = normalize_namespace(namespace);
+    let now = Utc::now().timestamp();
     let query_str = match db.backend {
         Backend::Sqlite => {
-            "SELECT rowid as id, project, session_id, summary, tags, created_at
-             FROM memories WHERE rowid = $1"
+            "SELECT memories.rowid as id, memories.project, memories.session_id, memories.summary, memories.tags, memories.created_at
+             FROM memories
+             LEFT JOIN memory_meta mm ON mm.memory_id = memories.rowid
+             WHERE memories.rowid = $1
+               AND COALESCE(mm.namespace, 'local') = $2
+               AND mm.tombstoned_at IS NULL
+               AND (mm.expires_at IS NULL OR mm.expires_at > $3)"
         }
         Backend::Postgres => {
-            "SELECT id, project, session_id, summary, tags, created_at
-             FROM memories WHERE id = $1"
+            "SELECT m.id, m.project, m.session_id, m.summary, m.tags, m.created_at
+             FROM memories m
+             LEFT JOIN memory_meta mm ON mm.memory_id = m.id
+             WHERE m.id = $1
+               AND COALESCE(mm.namespace, 'local') = $2
+               AND mm.tombstoned_at IS NULL
+               AND (mm.expires_at IS NULL OR mm.expires_at > $3)"
         }
     };
     let row: Option<sqlx::any::AnyRow> = sqlx::query(query_str)
         .bind(id)
+        .bind(namespace)
+        .bind(now)
         .fetch_optional(&db.pool)
         .await?;
     Ok(row.map(|r| Memory {
@@ -4682,6 +5459,100 @@ mod tests {
             small_blob.is_none(),
             "small output should not allocate a blob"
         );
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn governance_requires_consent_for_phi_and_pii() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let s = create_session(&db, "/tmp/p").await?;
+        let id = insert_memory(&db, "/tmp/p", &s, "patient detail", Some("phi")).await?;
+
+        let mut denied = crate::governance::MemoryGovernance::explicit();
+        denied.classification = crate::governance::DataClassification::Phi;
+        assert!(
+            apply_memory_governance(&db, id, "project", "session", &denied, None, "remember")
+                .await
+                .is_err(),
+            "PHI without granted consent must fail closed"
+        );
+
+        denied.consent_state = Some(crate::governance::ConsentState::Granted);
+        apply_memory_governance(&db, id, "project", "session", &denied, None, "remember").await?;
+        let info = get_memory_meta_full(&db, id).await?;
+        assert_eq!(info.classification, "phi");
+        assert_eq!(info.consent_state.as_deref(), Some("granted"));
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn namespace_filters_recall_boundaries() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let s = create_session(&db, "/tmp/p").await?;
+        let local = insert_memory(&db, "/tmp/p", &s, "alpha local fact", None).await?;
+        upsert_memory_meta(&db, local, 0.5).await?;
+        set_memory_scope_kind(&db, local, "project", "fact").await?;
+        apply_memory_governance(
+            &db,
+            local,
+            "project",
+            "fact",
+            &crate::governance::MemoryGovernance::explicit(),
+            None,
+            "remember",
+        )
+        .await?;
+
+        let other = insert_memory(&db, "/tmp/p", &s, "alpha tenant fact", None).await?;
+        upsert_memory_meta(&db, other, 0.5).await?;
+        set_memory_scope_kind(&db, other, "project", "fact").await?;
+        let mut gov = crate::governance::MemoryGovernance::explicit();
+        gov.namespace = "tenant-a".to_string();
+        apply_memory_governance(&db, other, "project", "fact", &gov, None, "remember").await?;
+
+        let local_hits = search_memories(&db, "/tmp/p", "alpha", 10).await?;
+        assert_eq!(
+            local_hits.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![local]
+        );
+        let tenant_hits =
+            search_memories_in_namespace(&db, "tenant-a", "/tmp/p", "alpha", 10).await?;
+        assert_eq!(
+            tenant_hits.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![other]
+        );
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn governed_delete_writes_ledger_and_removes_recall() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let s = create_session(&db, "/tmp/p").await?;
+        let id = insert_memory(&db, "/tmp/p", &s, "delete me", None).await?;
+        upsert_memory_meta(&db, id, 0.5).await?;
+        set_memory_scope_kind(&db, id, "project", "session").await?;
+        apply_memory_governance(
+            &db,
+            id,
+            "project",
+            "session",
+            &crate::governance::MemoryGovernance::explicit(),
+            Some("test"),
+            "remember",
+        )
+        .await?;
+
+        assert!(governed_delete_memory(&db, id, Some("test"), Some("unit test")).await?);
+        assert!(get_memory_by_id(&db, id).await?.is_none());
+        let ledger = memory_ledger_for_memory(&db, id).await?;
+        assert!(ledger.iter().any(|e| e.op_type == "remember"));
+        assert!(ledger.iter().any(|e| e.op_type == "forget"));
 
         let _ = std::fs::remove_file(path);
         Ok(())
