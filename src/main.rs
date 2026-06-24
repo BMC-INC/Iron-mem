@@ -385,6 +385,25 @@ enum Commands {
         list: bool,
     },
 
+    /// Run a dream/sleep consolidation pass (safe proposal store by default)
+    Dream {
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(short, long)]
+        all: bool,
+        /// Show proposed consolidations without writing proposals
+        #[arg(long)]
+        dry_run: bool,
+        /// Promote accepted proposals into consolidated memories
+        #[arg(long)]
+        apply: bool,
+        #[arg(short, long, default_value = "200")]
+        limit: i64,
+        /// List existing dream/reflection proposals
+        #[arg(long)]
+        list: bool,
+    },
+
     /// Anchor/relink memories to Rust AST symbols
     CodeRelink {
         #[arg(short, long)]
@@ -630,6 +649,14 @@ async fn async_main() -> Result<()> {
             .await?
         }
         Commands::Reflect {
+            project,
+            all,
+            dry_run,
+            apply,
+            limit,
+            list,
+        } => run_reflect(&cfg, project.as_deref(), all, dry_run, apply, limit, list).await?,
+        Commands::Dream {
             project,
             all,
             dry_run,

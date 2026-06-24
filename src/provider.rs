@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
+use std::{future::Future, time::Duration};
 
 use crate::config::Config;
 use crate::db::Observation;
@@ -12,6 +13,9 @@ pub enum Provider {
     Anthropic,
     Openai,
     Google,
+    /// Gemini on Google Cloud Vertex AI (ADC auth → bills GCP credit, not a
+    /// metered API key). Distinct from `Google`, which is the AI Studio API key.
+    Vertex,
 }
 
 impl Provider {
@@ -20,6 +24,8 @@ impl Provider {
             Provider::Anthropic => "ANTHROPIC_API_KEY",
             Provider::Openai => "OPENAI_API_KEY",
             Provider::Google => "GOOGLE_API_KEY",
+            // Vertex authenticates via Application Default Credentials, not a key.
+            Provider::Vertex => "GOOGLE_APPLICATION_CREDENTIALS",
         }
     }
 
@@ -28,6 +34,7 @@ impl Provider {
             Provider::Anthropic => "claude-sonnet-4-6",
             Provider::Openai => "gpt-4o",
             Provider::Google => "gemini-2.0-flash",
+            Provider::Vertex => "gemini-2.5-flash",
         }
     }
 }
@@ -388,15 +395,10 @@ pub async fn compress(observations: &[Observation], config: &Config) -> Result<C
         return Err(anyhow!("No observations to compress"));
     }
 
-    let api_key = resolve_api_key(config.provider)?;
     let model = &config.model;
     let prompt = build_prompt(observations);
-
-    match config.provider {
-        Provider::Anthropic => compress_anthropic(&prompt, model, &api_key).await,
-        Provider::Openai => compress_openai(&prompt, model, &api_key).await,
-        Provider::Google => compress_google(&prompt, model, &api_key).await,
-    }
+    let reply = complete_with(&prompt, model, config).await?;
+    Ok(parse_response(&reply))
 }
 
 /// Raw single-prompt completion against the configured provider, returning the
@@ -410,12 +412,64 @@ pub async fn complete(prompt: &str, config: &Config) -> Result<String> {
 /// compression model — used by retrieval reranking, which wants a fast, cheap
 /// model independent of the compression model.
 pub async fn complete_with(prompt: &str, model: &str, config: &Config) -> Result<String> {
-    let api_key = resolve_api_key(config.provider)?;
-    match config.provider {
-        Provider::Anthropic => anthropic_text(prompt, model, &api_key).await,
-        Provider::Openai => openai_text(prompt, model, &api_key).await,
-        Provider::Google => google_text(prompt, model, &api_key).await,
+    retry_provider_call(config, "llm completion", || async {
+        // Vertex authenticates via ADC (no API key) and needs project/location,
+        // so it dispatches off `config` directly rather than a resolved api_key.
+        if config.provider == Provider::Vertex {
+            return vertex_text(prompt, model, config).await;
+        }
+        let api_key = resolve_api_key(config.provider)?;
+        match config.provider {
+            Provider::Anthropic => anthropic_text(prompt, model, &api_key).await,
+            Provider::Openai => openai_text(prompt, model, &api_key).await,
+            Provider::Google => google_text(prompt, model, &api_key).await,
+            Provider::Vertex => unreachable!("vertex handled above"),
+        }
+    })
+    .await
+}
+
+async fn retry_provider_call<T, F, Fut>(config: &Config, label: &str, mut op: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let max_attempts = config.effective_llm_max_attempts();
+    let mut backoff = Duration::from_millis(config.effective_llm_initial_backoff_ms());
+    let mut attempt = 1;
+
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if attempt >= max_attempts || !is_retryable_provider_error(&err) {
+                    return Err(err);
+                }
+                tracing::warn!(
+                    "{label} failed on attempt {attempt}/{max_attempts}: {err}; retrying in {}ms",
+                    backoff.as_millis()
+                );
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+                backoff = backoff.saturating_mul(2);
+            }
+        }
     }
+}
+
+fn is_retryable_provider_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("429")
+        || msg.contains("resource_exhausted")
+        || msg.contains("rate limit")
+        || msg.contains("quota")
+        || msg.contains("timeout")
+        || msg.contains("temporarily unavailable")
+        || msg.contains("connection")
+        || msg.contains(" 500")
+        || msg.contains(" 502")
+        || msg.contains(" 503")
+        || msg.contains(" 504")
 }
 
 /// Extract only structured relation lines from an existing memory summary. Used
@@ -464,12 +518,6 @@ struct AnthropicContentBlock {
 #[derive(Deserialize)]
 struct AnthropicResponse {
     content: Vec<AnthropicContentBlock>,
-}
-
-async fn compress_anthropic(prompt: &str, model: &str, api_key: &str) -> Result<CompressionResult> {
-    Ok(parse_response(
-        &anthropic_text(prompt, model, api_key).await?,
-    ))
 }
 
 async fn anthropic_text(prompt: &str, model: &str, api_key: &str) -> Result<String> {
@@ -530,10 +578,6 @@ struct OpenAiResponse {
     choices: Vec<OpenAiChoice>,
 }
 
-async fn compress_openai(prompt: &str, model: &str, api_key: &str) -> Result<CompressionResult> {
-    Ok(parse_response(&openai_text(prompt, model, api_key).await?))
-}
-
 async fn openai_text(prompt: &str, model: &str, api_key: &str) -> Result<String> {
     let client = reqwest::Client::new();
     let req = OpenAiRequest {
@@ -572,10 +616,31 @@ async fn openai_text(prompt: &str, model: &str, api_key: &str) -> Result<String>
 #[derive(Serialize)]
 struct GeminiRequest {
     contents: Vec<GeminiContent>,
+    #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
+    generation_config: Option<GeminiGenerationConfig>,
+}
+
+#[derive(Serialize)]
+struct GeminiGenerationConfig {
+    temperature: f32,
+    #[serde(rename = "maxOutputTokens")]
+    max_output_tokens: u32,
+    #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<GeminiThinkingConfig>,
+}
+
+#[derive(Serialize)]
+struct GeminiThinkingConfig {
+    #[serde(rename = "thinkingBudget")]
+    thinking_budget: u32,
 }
 
 #[derive(Serialize)]
 struct GeminiContent {
+    // Vertex's generateContent requires an explicit role ("user"|"model");
+    // AI Studio tolerates its absence. Optional so the AI Studio path omits it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
     parts: Vec<GeminiPart>,
 }
 
@@ -604,10 +669,6 @@ struct GeminiPartResp {
     text: Option<String>,
 }
 
-async fn compress_google(prompt: &str, model: &str, api_key: &str) -> Result<CompressionResult> {
-    Ok(parse_response(&google_text(prompt, model, api_key).await?))
-}
-
 async fn google_text(prompt: &str, model: &str, api_key: &str) -> Result<String> {
     let client = reqwest::Client::new();
     let url = format!(
@@ -617,10 +678,12 @@ async fn google_text(prompt: &str, model: &str, api_key: &str) -> Result<String>
 
     let req = GeminiRequest {
         contents: vec![GeminiContent {
+            role: None,
             parts: vec![GeminiPart {
                 text: prompt.to_string(),
             }],
         }],
+        generation_config: None,
     };
 
     let resp = client
@@ -642,6 +705,86 @@ async fn google_text(prompt: &str, model: &str, api_key: &str) -> Result<String>
         .and_then(|c| c.content.parts.into_iter().next())
         .and_then(|p| p.text)
         .ok_or_else(|| anyhow!("No content in Gemini response"))
+}
+
+// ── Vertex AI (Gemini on Google Cloud; ADC auth → bills GCP credit) ──
+
+/// Mint an OAuth access token from Application Default Credentials by shelling
+/// out to gcloud (ADC is set up via `gcloud auth application-default login`).
+/// gcloud caches the token, so repeated calls are cheap.
+async fn vertex_access_token() -> Result<String> {
+    let out = tokio::process::Command::new("gcloud")
+        .args(["auth", "application-default", "print-access-token"])
+        .output()
+        .await
+        .map_err(|e| anyhow!("failed to run gcloud for ADC token: {e}"))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gcloud ADC token error: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+async fn vertex_text(prompt: &str, model: &str, config: &Config) -> Result<String> {
+    let project = config
+        .vertex_project
+        .clone()
+        .or_else(|| std::env::var("IRONMEM_VERTEX_PROJECT").ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "Vertex provider needs vertex_project (settings.json) or IRONMEM_VERTEX_PROJECT"
+            )
+        })?;
+    let location =
+        std::env::var("IRONMEM_VERTEX_LOCATION").unwrap_or_else(|_| config.vertex_location.clone());
+    let token = vertex_access_token().await?;
+
+    let host = if location == "global" {
+        "aiplatform.googleapis.com".to_string()
+    } else {
+        format!("{location}-aiplatform.googleapis.com")
+    };
+    let url = format!(
+        "https://{host}/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent"
+    );
+
+    let req = GeminiRequest {
+        contents: vec![GeminiContent {
+            role: Some("user".to_string()),
+            parts: vec![GeminiPart {
+                text: prompt.to_string(),
+            }],
+        }],
+        generation_config: Some(GeminiGenerationConfig {
+            temperature: 0.0,
+            max_output_tokens: 2048,
+            // Flash supports disabling thinking (0) for fast, cheap compression.
+            thinking_config: Some(GeminiThinkingConfig { thinking_budget: 0 }),
+        }),
+    };
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .json(&req)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("Vertex API error {}: {}", status, body));
+    }
+
+    let data: GeminiResponse = resp.json().await?;
+    data.candidates
+        .and_then(|c| c.into_iter().next())
+        .and_then(|c| c.content.parts.into_iter().find_map(|p| p.text))
+        .ok_or_else(|| anyhow!("No content in Vertex response"))
 }
 
 #[cfg(test)]

@@ -325,6 +325,19 @@ impl IronMemServer {
                 })),
             ),
             Tool::new(
+                "dream_memory",
+                "Run a safe sleep-cycle consolidation pass. Defaults to dry_run=true and apply=false; use apply=true only when proposed memories should be promoted.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project": { "type": "string", "description": "Optional project root path; omit for all projects" },
+                        "dry_run": { "type": "boolean", "description": "Preview proposals without writing them (default true)" },
+                        "apply": { "type": "boolean", "description": "Promote proposed consolidations into memories (default false)" },
+                        "limit": { "type": "integer", "description": "Max memories per kind to scan (default 200)" }
+                    }
+                })),
+            ),
+            Tool::new(
                 "wipe_project",
                 "Delete all memories for a project.",
                 schema(serde_json::json!({
@@ -393,7 +406,7 @@ impl IronMemServer {
             }
             Err(e) => {
                 let json = serde_json::json!({
-                    "ok": true,
+                    "ok": false,
                     "memory_id": null,
                     "skipped": true,
                     "reason": format!("Compression failed: {}", e)
@@ -908,6 +921,31 @@ impl IronMemServer {
         )]))
     }
 
+    async fn handle_dream_memory(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
+        let project = args.get("project").and_then(|v| v.as_str());
+        let dry_run = args
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
+        let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(200);
+        let report = crate::reflection::run(
+            &self.db,
+            self.embedder.as_deref(),
+            self.store.as_ref(),
+            project,
+            dry_run,
+            apply,
+            limit.max(1),
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let json = serde_json::json!({ "ok": true, "report": report });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json).unwrap(),
+        )]))
+    }
+
     async fn handle_wipe_project(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
         let project = args
             .get("project")
@@ -1066,6 +1104,7 @@ impl ServerHandler for IronMemServer {
             "list_corrections" => self.handle_list_corrections(&args).await,
             "memory_graph" => self.handle_memory_graph(&args).await,
             "reconcile_memory_graph" => self.handle_reconcile_memory_graph(&args).await,
+            "dream_memory" => self.handle_dream_memory(&args).await,
             "wipe_project" => self.handle_wipe_project(&args).await,
             _ => Err(ErrorData::invalid_params(
                 format!("unknown tool: {}", request.name),
@@ -1267,6 +1306,19 @@ mod tests {
         let props = &v["inputSchema"]["properties"];
         assert!(props.get("project").is_some(), "schema has project");
         assert!(props.get("global").is_some(), "schema has global");
+    }
+
+    #[test]
+    fn tool_list_includes_dream_memory() {
+        let tools = IronMemServer::build_tool_list();
+        let t = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "dream_memory")
+            .expect("dream_memory tool registered");
+        let v = serde_json::to_value(t).unwrap();
+        let props = &v["inputSchema"]["properties"];
+        assert!(props.get("dry_run").is_some(), "schema has dry_run");
+        assert!(props.get("apply").is_some(), "schema has apply");
     }
 
     #[tokio::test]

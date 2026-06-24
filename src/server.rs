@@ -70,6 +70,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/feedback", post(record_feedback))
         .route("/reflect", post(run_reflection))
+        .route("/dream", post(run_dream))
         .route("/code/relink", post(code_relink))
         .route("/snapshots", get(list_snapshots).post(create_snapshot))
         .route("/snapshots/{id}/restore", post(restore_snapshot))
@@ -162,7 +163,7 @@ async fn session_end(
         Err(e) => {
             tracing::warn!("Compression failed for session {}: {}", body.session_id, e);
             Ok(Json(SessionEndResponse {
-                ok: true,
+                ok: false,
                 memory_id: None,
                 skipped: true,
                 reason: Some(format!("Compression failed: {}", e)),
@@ -576,6 +577,24 @@ async fn run_reflection(
     Ok(Json(report))
 }
 
+async fn run_dream(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ReflectionRequest>,
+) -> Result<Json<crate::reflection::ReflectionReport>, (StatusCode, String)> {
+    let report = crate::reflection::run(
+        &state.db,
+        state.embedder.as_deref(),
+        state.store.as_ref(),
+        body.project.as_deref(),
+        body.dry_run.unwrap_or(true),
+        body.apply.unwrap_or(false),
+        body.limit.unwrap_or(200),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(report))
+}
+
 #[derive(Deserialize)]
 pub struct CodeRelinkRequest {
     pub project: String,
@@ -741,6 +760,10 @@ pub struct ContextQuery {
     /// Per-request override for LLM reranking ("1"/"true"/"yes"/"on"). Absent ⇒
     /// fall back to the server's `rerank.enabled` config default.
     pub rerank: Option<String>,
+    /// Optional wide candidate pool for reranking experiments. Final output is
+    /// still capped by `limit`; this only controls how many candidates the LLM
+    /// may promote from.
+    pub pool: Option<usize>,
 }
 
 /// Interpret a `?rerank=` value as a boolean opt-in. Accepts the common truthy
@@ -785,7 +808,7 @@ async fn get_context(
                 // Re-anchored reranked retrieval: protect the base@limit ordering
                 // (FTS-strong temporal answers) while letting the LLM promote
                 // buried wide-pool answers. Failure falls back to base order.
-                retrieval::rerank_search_in_namespace(
+                retrieval::rerank_search_in_namespace_with_pool(
                     &state.db,
                     state.embedder.as_deref(),
                     state.store.as_ref(),
@@ -794,6 +817,7 @@ async fn get_context(
                     Some(&params.project),
                     q,
                     limit as usize,
+                    params.pool,
                 )
                 .await
                 .unwrap_or_default()

@@ -4,6 +4,7 @@
 //! so the persistence half is unit-testable without network access.
 
 use anyhow::Result;
+use std::collections::HashSet;
 
 use crate::config::Config;
 use crate::db::{self, Database};
@@ -219,6 +220,63 @@ fn chunk_title(prefix: &str, text: &str) -> String {
     }
 }
 
+fn source_terms(text: &str) -> HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .map(|s| s.to_ascii_lowercase())
+        .filter(|s| s.chars().count() >= 4)
+        .filter(|s| {
+            !matches!(
+                s.as_str(),
+                "that"
+                    | "this"
+                    | "with"
+                    | "from"
+                    | "have"
+                    | "into"
+                    | "will"
+                    | "should"
+                    | "memory"
+                    | "session"
+            )
+        })
+        .collect()
+}
+
+/// Best-effort evidence locator for LLM-derived fact/procedure chunks. Exact
+/// substring matches get tight byte spans. When compression rewrites the fact,
+/// fall back to the observation section with the highest content-word overlap.
+fn best_source_span(
+    text: &str,
+    transcript: &str,
+    sections: &[TranscriptSection],
+) -> Option<(i64, i64)> {
+    let needle = text.trim();
+    if needle.chars().count() >= 8 {
+        let transcript_lower = transcript.to_ascii_lowercase();
+        let needle_lower = needle.to_ascii_lowercase();
+        if let Some(start) = transcript_lower.find(&needle_lower) {
+            return Some((start as i64, (start + needle.len()) as i64));
+        }
+    }
+
+    let terms = source_terms(needle);
+    if terms.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, usize, usize)> = None;
+    for section in sections {
+        let section_terms = source_terms(&section.text);
+        let overlap = terms
+            .iter()
+            .filter(|term| section_terms.contains(*term))
+            .count();
+        if overlap >= 2 && best.is_none_or(|(score, _, _)| overlap > score) {
+            best = Some((overlap, section.start, section.end));
+        }
+    }
+    best.map(|(_, start, end)| (start as i64, end as i64))
+}
+
 async fn persist_memory_skim(
     db: &Database,
     memory_id: i64,
@@ -231,6 +289,12 @@ async fn persist_memory_skim(
     let parent_density = memory_density(result);
     let mut chunks = Vec::new();
     let mut ordinal = 0_i64;
+    let (transcript, sections) = if source_hash.is_some() && !observations.is_empty() {
+        let (transcript, sections) = build_transcript_with_sections(observations);
+        (Some(transcript), sections)
+    } else {
+        (None, Vec::new())
+    };
 
     chunks.push(db::NewMemoryChunk {
         chunk_id: format!("mem:{memory_id}:overview"),
@@ -250,6 +314,9 @@ async fn persist_memory_skim(
     ordinal += 1;
 
     for (idx, fact) in result.facts.iter().enumerate() {
+        let source_span = transcript
+            .as_deref()
+            .and_then(|t| best_source_span(fact, t, &sections));
         chunks.push(db::NewMemoryChunk {
             chunk_id: format!("mem:{memory_id}:fact:{}", idx + 1),
             project: project.to_string(),
@@ -260,15 +327,18 @@ async fn persist_memory_skim(
             kind: "fact".to_string(),
             title: chunk_title("Fact", fact),
             summary: fact.trim().to_string(),
-            source_hash: None,
-            source_start: None,
-            source_end: None,
+            source_hash: source_span.and(source_hash.map(str::to_string)),
+            source_start: source_span.map(|(start, _)| start),
+            source_end: source_span.map(|(_, end)| end),
             token_estimate: token_estimate(fact),
         });
         ordinal += 1;
     }
 
     for (idx, procedure) in result.procedures.iter().enumerate() {
+        let source_span = transcript
+            .as_deref()
+            .and_then(|t| best_source_span(procedure, t, &sections));
         chunks.push(db::NewMemoryChunk {
             chunk_id: format!("mem:{memory_id}:procedure:{}", idx + 1),
             project: project.to_string(),
@@ -279,16 +349,15 @@ async fn persist_memory_skim(
             kind: "procedural".to_string(),
             title: chunk_title("Procedure", procedure),
             summary: procedure.trim().to_string(),
-            source_hash: None,
-            source_start: None,
-            source_end: None,
+            source_hash: source_span.and(source_hash.map(str::to_string)),
+            source_start: source_span.map(|(start, _)| start),
+            source_end: source_span.map(|(_, end)| end),
             token_estimate: token_estimate(procedure),
         });
         ordinal += 1;
     }
 
-    if source_hash.is_some() && !observations.is_empty() {
-        let (_, sections) = build_transcript_with_sections(observations);
+    if source_hash.is_some() && !sections.is_empty() {
         for section in sections {
             let density = section_density(&section, parent_density);
             let title = format!(
@@ -414,7 +483,7 @@ pub async fn persist(
     // Procedural memory: durable "how work should be done" rules are stored as
     // first-class typed memories so agents can retrieve operating instructions
     // without mixing them into ordinary narrative/fact recall.
-    for procedure in &result.procedures {
+    for (idx, procedure) in result.procedures.iter().enumerate() {
         persist_procedure(
             db,
             embedder,
@@ -425,6 +494,7 @@ pub async fn persist(
             result.importance,
             procedure,
             &result.entities,
+            idx + 1,
         )
         .await;
     }
@@ -435,7 +505,7 @@ pub async fn persist(
     // specifics (dates, names, quantities) survive compression and resolve on
     // direct lookup. Best-effort per fact — a single failure is logged, never
     // fatal (local-first posture, matching the inline-embed handling above).
-    for fact in &result.facts {
+    for (idx, fact) in result.facts.iter().enumerate() {
         persist_fact(
             db,
             embedder,
@@ -447,6 +517,7 @@ pub async fn persist(
             fact,
             &result.entities,
             result.event_time.as_deref(),
+            idx + 1,
         )
         .await;
     }
@@ -470,6 +541,7 @@ async fn persist_procedure(
     importance: u8,
     procedure: &str,
     entities: &[String],
+    ordinal: usize,
 ) {
     let tags = format!("procedural session:{session_id}");
     let pid = match db::insert_memory(db, project, session_id, procedure, Some(&tags)).await {
@@ -485,12 +557,14 @@ async fn persist_procedure(
     if let Err(e) = db::set_memory_scope_kind(db, pid, "project", "procedural").await {
         tracing::warn!("procedural kind tag failed (memory {pid}): {e}");
     }
+    let mut governance = MemoryGovernance::derived_from(parent_id);
+    governance.source_ref = Some(format!("mem:{parent_id}:procedure:{ordinal}"));
     if let Err(e) = db::apply_memory_governance(
         db,
         pid,
         "project",
         "procedural",
-        &MemoryGovernance::derived_from(parent_id),
+        &governance,
         Some("ironmem:derive"),
         "derive",
     )
@@ -536,6 +610,7 @@ async fn persist_fact(
     fact: &str,
     entities: &[String],
     event_time: Option<&str>,
+    ordinal: usize,
 ) {
     // Date-stamp the fact so its date rides INSIDE the retrievable text and is
     // visible to the answerer — the single biggest lever for temporal questions
@@ -559,12 +634,14 @@ async fn persist_fact(
     if let Err(e) = db::set_memory_scope_kind(db, fid, "project", "fact").await {
         tracing::warn!("fact kind tag failed (fact memory {fid}): {e}");
     }
+    let mut governance = MemoryGovernance::derived_from(parent_id);
+    governance.source_ref = Some(format!("mem:{parent_id}:fact:{ordinal}"));
     if let Err(e) = db::apply_memory_governance(
         db,
         fid,
         "project",
         "fact",
-        &MemoryGovernance::derived_from(parent_id),
+        &governance,
         Some("ironmem:derive"),
         "derive",
     )
@@ -824,6 +901,12 @@ mod tests {
         );
         let meta = db::get_memory_meta_full(&db, fact_hit.id).await.unwrap();
         assert_eq!(meta.kind, "fact", "fact memory must be tagged kind=fact");
+        assert_eq!(meta.parent_memory_id, Some(id));
+        let expected_source_ref = format!("mem:{id}:fact:1");
+        assert_eq!(
+            meta.source_ref.as_deref(),
+            Some(expected_source_ref.as_str())
+        );
 
         // The fact also carries an embedding (semantic recall path).
         assert!(db::get_embedding(&db, "memory", fact_hit.id, emb.id())
@@ -911,7 +994,73 @@ mod tests {
         assert_ne!(proc_mem.id, parent);
         let meta = db::get_memory_meta_full(&db, proc_mem.id).await.unwrap();
         assert_eq!(meta.kind, "procedural");
+        assert_eq!(meta.parent_memory_id, Some(parent));
+        let expected_source_ref = format!("mem:{parent}:procedure:1");
+        assert_eq!(
+            meta.source_ref.as_deref(),
+            Some(expected_source_ref.as_str())
+        );
         assert!(meta.importance >= 0.75);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn skim_fact_and_procedure_chunks_keep_source_spans() {
+        let path = std::env::temp_dir().join(format!("ironmem-span-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::new(&path.to_string_lossy()).await.unwrap();
+        db.migrate().await.unwrap();
+        let session = create_session(&db, "/tmp/p").await.unwrap();
+        let store = crate::vectorstore::BruteForceStore;
+        let result = CompressionResult {
+            summary: "Source-grounded memory upgrade".into(),
+            tags: "source spans".into(),
+            importance: 8,
+            kind: "session".into(),
+            facts: vec!["Caroline joined the LGBTQ support group on 7 May 2023".into()],
+            procedures: vec!["For IronMem, preserve source spans for extracted facts.".into()],
+            ..Default::default()
+        };
+        let observations = vec![db::Observation {
+            id: 42,
+            session_id: session.clone(),
+            project: "/tmp/p".into(),
+            tool: "note".into(),
+            input: Some("Caroline joined the LGBTQ support group on 7 May 2023.".into()),
+            output: Some("For IronMem, preserve source spans for extracted facts.".into()),
+            created_at: 1,
+        }];
+
+        let memory_id = persist(&db, None, &store, "/tmp/p", &session, result.clone())
+            .await
+            .unwrap();
+        let hash = store_session_transcript(&db, memory_id, &observations)
+            .await
+            .unwrap()
+            .expect("transcript blob hash");
+        persist_memory_skim(
+            &db,
+            memory_id,
+            "/tmp/p",
+            &session,
+            &result,
+            &observations,
+            Some(&hash),
+        )
+        .await
+        .unwrap();
+
+        let chunks = db::chunks_for_memories(&db, &[memory_id]).await.unwrap();
+        let chunks = chunks.get(&memory_id).unwrap();
+        for kind in ["fact", "procedural"] {
+            let chunk = chunks
+                .iter()
+                .find(|chunk| chunk.kind == kind)
+                .expect("source-linked derived chunk");
+            assert_eq!(chunk.source_hash.as_deref(), Some(hash.as_str()));
+            assert!(chunk.source_start.is_some());
+            assert!(chunk.source_end > chunk.source_start);
+        }
 
         let _ = std::fs::remove_file(path);
     }

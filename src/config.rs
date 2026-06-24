@@ -10,6 +10,14 @@ pub struct Config {
     #[serde(default)]
     pub provider: Provider,
     pub model: String,
+    /// Vertex AI (Google Cloud) project for `provider = "vertex"`. ADC auth, so
+    /// it bills GCP credit instead of a metered API key. Falls back to the
+    /// IRONMEM_VERTEX_PROJECT env var when unset.
+    #[serde(default)]
+    pub vertex_project: Option<String>,
+    /// Vertex region (or "global"). Override with IRONMEM_VERTEX_LOCATION.
+    #[serde(default = "default_vertex_location")]
+    pub vertex_location: String,
     pub inject_limit: usize,
     pub max_observation_bytes: usize,
     pub db_path: String,
@@ -25,6 +33,8 @@ pub struct Config {
     pub embedding: EmbeddingConfig,
     #[serde(default)]
     pub rerank: RerankConfig,
+    #[serde(default)]
+    pub llm_retry: LlmRetryConfig,
 }
 
 /// LLM reranking of retrieval candidates. Off by default: it adds one provider
@@ -65,7 +75,36 @@ fn default_rerank_model() -> String {
 }
 
 fn default_rerank_pool() -> usize {
-    20
+    50
+}
+
+/// Retry policy for provider calls that are safe to repeat: compression,
+/// profile/reflection completions, and retrieval reranking. The defaults are
+/// intentionally conservative for Vertex quota bursts while still surfacing
+/// hard failures quickly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmRetryConfig {
+    #[serde(default = "default_llm_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default = "default_llm_initial_backoff_ms")]
+    pub initial_backoff_ms: u64,
+}
+
+impl Default for LlmRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_llm_max_attempts(),
+            initial_backoff_ms: default_llm_initial_backoff_ms(),
+        }
+    }
+}
+
+fn default_llm_max_attempts() -> u32 {
+    3
+}
+
+fn default_llm_initial_backoff_ms() -> u64 {
+    500
 }
 
 /// Semantic-retrieval configuration. Local-first / no-egress by default.
@@ -172,6 +211,10 @@ fn default_mcp_sse_port() -> u16 {
     37779
 }
 
+fn default_vertex_location() -> String {
+    "us-central1".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         let provider = Provider::default();
@@ -179,6 +222,8 @@ impl Default for Config {
             port: 37778,
             provider,
             model: provider.default_model().to_string(),
+            vertex_project: None,
+            vertex_location: default_vertex_location(),
             inject_limit: 5,
             max_observation_bytes: 2048,
             db_path: ironmem_dir().join("mem.db").to_string_lossy().to_string(),
@@ -188,6 +233,7 @@ impl Default for Config {
             auth_token: None,
             embedding: EmbeddingConfig::default(),
             rerank: RerankConfig::default(),
+            llm_retry: LlmRetryConfig::default(),
         }
     }
 }
@@ -202,6 +248,22 @@ impl Config {
 
     pub fn effective_mcp_transport(&self) -> String {
         std::env::var("IRONMEM_MCP_TRANSPORT").unwrap_or_else(|_| self.mcp_transport.clone())
+    }
+
+    pub fn effective_llm_max_attempts(&self) -> u32 {
+        std::env::var("IRONMEM_LLM_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(self.llm_retry.max_attempts)
+            .clamp(1, 10)
+    }
+
+    pub fn effective_llm_initial_backoff_ms(&self) -> u64 {
+        std::env::var("IRONMEM_LLM_INITIAL_BACKOFF_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(self.llm_retry.initial_backoff_ms)
+            .clamp(50, 30_000)
     }
 
     /// Get or generate the auth token for SSE. Persists to settings on first generation.
@@ -287,12 +349,20 @@ mod tests {
             !cfg.rerank.enabled,
             "rerank is off unless explicitly enabled"
         );
-        assert_eq!(cfg.rerank.pool, 20);
+        assert_eq!(cfg.rerank.pool, 50);
         // Empty default ⇒ rerank falls back to the compression model.
         assert!(
             cfg.rerank.model.is_empty(),
             "default rerank model defers to compression model"
         );
+    }
+
+    #[test]
+    fn missing_retry_key_yields_defaults() {
+        let cfg: Config = serde_json::from_str(BASE).unwrap();
+        assert_eq!(cfg.llm_retry.max_attempts, 3);
+        assert_eq!(cfg.llm_retry.initial_backoff_ms, 500);
+        assert_eq!(cfg.effective_llm_max_attempts(), 3);
     }
 
     #[test]

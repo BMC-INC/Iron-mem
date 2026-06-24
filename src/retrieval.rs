@@ -28,6 +28,7 @@ const FUSE_ENTITY_SIGNAL: bool = false;
 /// ranked by relation/source/target relevance before their memory ids enter RRF.
 const MAX_GRAPH_ENTITIES: usize = 8;
 const GRAPH_EDGES_PER_ENTITY: usize = 12;
+const GRAPH_CHAIN_EDGES_PER_BRIDGE: usize = 6;
 const TEMPORAL_EVENT_POOL: usize = 512;
 
 /// Fuse several ranked id-lists into one ordering by Σ 1/(k + rank).
@@ -191,6 +192,10 @@ async fn graph_ids_for_query(
     let query_terms = graph_terms(query);
     let mut best: HashMap<i64, (f64, i64, usize)> = HashMap::new();
     let mut first_seen = 0_usize;
+    let mut bridge_entities = Vec::new();
+    let mut bridge_seen = HashSet::new();
+    let lookup_entities: HashSet<String> =
+        entities.iter().map(|e| e.to_ascii_lowercase()).collect();
 
     for entity in &entities {
         let edges = db::memory_edges_for_entity(db, project, entity, false, GRAPH_EDGES_PER_ENTITY)
@@ -198,6 +203,32 @@ async fn graph_ids_for_query(
             .unwrap_or_default();
         for edge in edges {
             let score = graph_edge_score(&edge, &query_terms);
+            let current =
+                best.entry(edge.memory_id)
+                    .or_insert((score, edge.observed_at, first_seen));
+            if score > current.0 || (score == current.0 && edge.observed_at > current.1) {
+                *current = (score, edge.observed_at, first_seen);
+            }
+            first_seen += 1;
+            for bridge in [&edge.source, &edge.target] {
+                let key = bridge.to_ascii_lowercase();
+                if !lookup_entities.contains(&key) && bridge_seen.insert(key) {
+                    bridge_entities.push(bridge.clone());
+                }
+            }
+        }
+    }
+
+    // Evidence-chain expansion: one hop through connected entities. This gives
+    // multi-hop questions a chance to retrieve both sides of a relation chain
+    // without turning graph lookup into a broad recency-ordered entity search.
+    for bridge in bridge_entities.into_iter().take(MAX_GRAPH_ENTITIES * 2) {
+        let edges =
+            db::memory_edges_for_entity(db, project, &bridge, false, GRAPH_CHAIN_EDGES_PER_BRIDGE)
+                .await
+                .unwrap_or_default();
+        for edge in edges {
+            let score = graph_edge_score(&edge, &query_terms) * 0.75;
             let current =
                 best.entry(edge.memory_id)
                     .or_insert((score, edge.observed_at, first_seen));
@@ -793,7 +824,27 @@ pub async fn rerank_search_in_namespace(
     query: &str,
     limit: usize,
 ) -> Result<Vec<Memory>> {
-    let pool = limit.saturating_mul(2).max(config.rerank.pool);
+    rerank_search_in_namespace_with_pool(
+        db, embedder, store, config, namespace, project, query, limit, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn rerank_search_in_namespace_with_pool(
+    db: &Database,
+    embedder: Option<&dyn Embedder>,
+    store: &dyn VectorStore,
+    config: &Config,
+    namespace: &str,
+    project: Option<&str>,
+    query: &str,
+    limit: usize,
+    pool_override: Option<usize>,
+) -> Result<Vec<Memory>> {
+    let pool = limit
+        .saturating_mul(2)
+        .max(pool_override.unwrap_or(config.rerank.pool));
     let narrow =
         hybrid_search_in_namespace(db, embedder, store, namespace, project, query, limit).await?;
     let wide =
@@ -1130,6 +1181,64 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(res.first().map(|m| m.id), Some(answer), "{res:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_graph_chain_surfaces_bridge_memory() {
+        let (db, path) = seeded_db().await;
+        let s = create_session(&db, "/tmp/p").await.unwrap();
+        let first_hop = insert_memory(&db, "/tmp/p", &s, "zzz chain alpha", Some("x"))
+            .await
+            .unwrap();
+        db::insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: "/tmp/p".to_string(),
+                memory_id: first_hop,
+                source: "Caroline".to_string(),
+                relation: "manages".to_string(),
+                target: "Project Atlas".to_string(),
+                valid_from: None,
+                valid_until: None,
+                confidence: 0.9,
+            },
+        )
+        .await
+        .unwrap();
+
+        let bridge = insert_memory(&db, "/tmp/p", &s, "yyy chain beta", Some("x"))
+            .await
+            .unwrap();
+        db::insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: "/tmp/p".to_string(),
+                memory_id: bridge,
+                source: "Project Atlas".to_string(),
+                relation: "depends_on".to_string(),
+                target: "Vertex AI".to_string(),
+                valid_from: None,
+                valid_until: None,
+                confidence: 0.9,
+            },
+        )
+        .await
+        .unwrap();
+
+        let res = hybrid_search(
+            &db,
+            None,
+            &crate::vectorstore::BruteForceStore,
+            Some("/tmp/p"),
+            "Which service does Caroline's project depend on?",
+            2,
+        )
+        .await
+        .unwrap();
+        let ids: Vec<i64> = res.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&first_hop), "first hop missing: {ids:?}");
+        assert!(ids.contains(&bridge), "bridge dependency missing: {ids:?}");
         let _ = std::fs::remove_file(path);
     }
 
