@@ -3389,6 +3389,39 @@ pub async fn score_adjustments_for_memories(
     Ok(out)
 }
 
+/// Batch-fetch the #5 temporal-trust columns for a set of candidate ids:
+/// memory_id -> (trust_ref_count, trust_last_validated_at). Rows without meta are
+/// simply absent → callers treat them as zero-trust. `ids` are DB-controlled
+/// integers, so the inlined IN-list is injection-safe (mirrors
+/// `score_adjustments_for_memories`).
+pub async fn trust_meta_for(
+    db: &Database,
+    ids: &[i64],
+) -> Result<HashMap<i64, (i64, Option<i64>)>> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let in_list = ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT memory_id, trust_ref_count, trust_last_validated_at
+         FROM memory_meta WHERE memory_id IN ({in_list})"
+    );
+    for r in sqlx::query(&sql).fetch_all(&db.pool).await? {
+        let id: i64 = r.get("memory_id");
+        let rc: i64 = r.try_get::<i64, _>("trust_ref_count").unwrap_or(0);
+        let lv: Option<i64> = r
+            .try_get::<Option<i64>, _>("trust_last_validated_at")
+            .unwrap_or(None);
+        out.insert(id, (rc, lv));
+    }
+    Ok(out)
+}
+
 pub fn reinforcement_multiplier(feedback_score: f64, injection_count: i64) -> f64 {
     let positive = (feedback_score.max(0.0) * 0.08).min(0.45);
     let negative = (feedback_score.min(0.0).abs() * 0.12).min(0.65);

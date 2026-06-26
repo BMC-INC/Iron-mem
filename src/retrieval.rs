@@ -31,6 +31,45 @@ const GRAPH_EDGES_PER_ENTITY: usize = 12;
 const GRAPH_CHAIN_EDGES_PER_BRIDGE: usize = 6;
 const TEMPORAL_EVENT_POOL: usize = 512;
 
+/// Process-wide retrieval tuning, installed once at server startup from `Config`
+/// (config is fixed for the process lifetime). Lets the gated temporal-event
+/// fusion weight (B) and the #5 temporal-trust boost reach the core ranker
+/// without threading `&Config` through every `hybrid_search` caller. Unset →
+/// `Default` → behaviour identical to before these levers existed.
+#[derive(Clone, Copy, Debug)]
+pub struct RetrievalTuning {
+    /// Times the temporal-event id-list is pushed into RRF (>=1). 1 = unchanged.
+    pub temporal_fusion_weight: usize,
+    /// #5 temporal-trust: additive boost weight (0.0 = off), recency half-life
+    /// (days), and reference saturation. See `governance::trust_trajectory_boost`.
+    pub trust_weight: f64,
+    pub trust_halflife_days: f64,
+    pub trust_ref_saturation: f64,
+}
+
+impl Default for RetrievalTuning {
+    fn default() -> Self {
+        Self {
+            temporal_fusion_weight: 1,
+            trust_weight: 0.0,
+            trust_halflife_days: 30.0,
+            trust_ref_saturation: 5.0,
+        }
+    }
+}
+
+static RETRIEVAL_TUNING: std::sync::OnceLock<RetrievalTuning> = std::sync::OnceLock::new();
+
+/// Install the retrieval tuning (call once at startup). Idempotent: later calls
+/// are ignored, matching the "config is fixed for the process" model.
+pub fn set_retrieval_tuning(t: RetrievalTuning) {
+    let _ = RETRIEVAL_TUNING.set(t);
+}
+
+fn tuning() -> RetrievalTuning {
+    RETRIEVAL_TUNING.get().copied().unwrap_or_default()
+}
+
 /// Fuse several ranked id-lists into one ordering by Σ 1/(k + rank).
 /// `rank` is 0-indexed (top of a list contributes the most). Ties keep
 /// first-appearance order so the result is deterministic.
@@ -53,6 +92,53 @@ pub fn rrf_fuse(lists: &[Vec<i64>], k: i64) -> Vec<i64> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     order
+}
+
+/// (#5) Temporal-trust re-rank of an already-fused candidate ordering. When
+/// `trust_weight > 0`, each candidate's reciprocal-rank base score is nudged by
+/// its trust trajectory (referenced + recently validated — see
+/// `governance::trust_trajectory_boost`). The base term keeps semantic/keyword
+/// order dominant, so trust only reorders near-ties. A no-op (and zero DB cost)
+/// when the lever is off or no candidate has accrued trust. The trust signal is
+/// populated by the synthesis pass, which positively reinforces source facts.
+async fn apply_trust_boost(db: &Database, candidates: Vec<i64>) -> Result<Vec<i64>> {
+    let t = tuning();
+    if t.trust_weight <= 0.0 || candidates.len() < 2 {
+        return Ok(candidates);
+    }
+    let trust = db::trust_meta_for(db, &candidates).await.unwrap_or_default();
+    if trust.is_empty() {
+        return Ok(candidates);
+    }
+    let now = Utc::now().timestamp();
+    let mut scored: Vec<(usize, i64, f64)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(rank, &id)| {
+            let base = 1.0 / (RRF_K as f64 + rank as f64);
+            let boost = trust
+                .get(&id)
+                .map(|(rc, lv)| {
+                    crate::governance::trust_trajectory_boost(
+                        *rc,
+                        *lv,
+                        now,
+                        t.trust_weight,
+                        t.trust_halflife_days,
+                        t.trust_ref_saturation,
+                    )
+                })
+                .unwrap_or(0.0);
+            (rank, id, base + boost)
+        })
+        .collect();
+    // Re-sort by combined score desc; equal scores keep the original fused order.
+    scored.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    Ok(scored.into_iter().map(|(_, id, _)| id).collect())
 }
 
 /// 4-digit years (1900–2099) named in a query. A temporal question ("what did X
@@ -573,22 +659,36 @@ pub async fn hybrid_search_in_namespace(
     if !entity_ids.is_empty() {
         aux.push(entity_ids);
     }
+    // (B) Temporal-event fusion weight: push the date-bearing event list into RRF
+    // `temporal_fusion_weight` times (>=1). 1 = unchanged; higher lifts exact
+    // dated facts that semantic/keyword channels rank low (LoCoMo temporal).
+    let tw = tuning().temporal_fusion_weight.max(1);
     let candidates: Vec<i64> = if aux.is_empty() {
         if temporal_event_ids.is_empty() {
             fts_ids
         } else {
-            rrf_fuse(&[temporal_event_ids, fts_ids], RRF_K)
+            let mut lists: Vec<Vec<i64>> = Vec::with_capacity(tw + 1);
+            for _ in 0..tw {
+                lists.push(temporal_event_ids.clone());
+            }
+            lists.push(fts_ids);
+            rrf_fuse(&lists, RRF_K)
         }
     } else {
-        let mut lists: Vec<Vec<i64>> =
-            Vec::with_capacity(aux.len() + 1 + usize::from(!temporal_event_ids.is_empty()));
+        let mut lists: Vec<Vec<i64>> = Vec::with_capacity(aux.len() + tw + 1);
         if !temporal_event_ids.is_empty() {
-            lists.push(temporal_event_ids);
+            for _ in 0..tw {
+                lists.push(temporal_event_ids.clone());
+            }
         }
         lists.push(fts_ids);
         lists.append(&mut aux);
         rrf_fuse(&lists, RRF_K)
     };
+
+    // (#5) Temporal-trust re-rank: nudge the fused order by each candidate's trust
+    // trajectory. No-op (and zero DB cost) unless temporal_trust.weight > 0.
+    let candidates = apply_trust_boost(db, candidates).await?;
 
     // Narrative-reserve quota, then materialize in rank order (reusing FTS rows).
     let chosen = reserve_narrative_slots(db, &candidates, limit).await?;

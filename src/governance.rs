@@ -297,9 +297,8 @@ pub fn ledger_entry_hash(
     sha256_hex(payload.to_string().as_bytes())
 }
 
-// Wired into the retrieval ranker in the gated #5-retrieval-weight increment
-// (folds into `retrieval.rs` fusion); built + unit-tested now, dormant until then.
-#[allow(dead_code)]
+// Wired into the retrieval ranker via `retrieval::apply_trust_boost`, gated by
+// `temporal_trust.weight`; the synthesis pass populates ref_count/last_validated.
 /// Temporal-trust retrieval boost (paper Finding 4 — trust earned over time, not a
 /// static scalar). Blends two trajectory signals, then scales by `weight`:
 ///   • reference — how many receipt-confirmed references the memory has (saturating)

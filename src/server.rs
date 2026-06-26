@@ -50,6 +50,15 @@ impl AppState {
 }
 
 pub fn router(state: AppState) -> Router {
+    // Install retrieval tuning once from config (B temporal-fusion weight + #5
+    // temporal-trust). Defaults (fusion weight 1, trust weight 0.0) reproduce the
+    // pre-lever ranker exactly, so this is a no-op unless settings.json opts in.
+    crate::retrieval::set_retrieval_tuning(crate::retrieval::RetrievalTuning {
+        temporal_fusion_weight: state.config.temporal_trust.temporal_event_fusion_weight,
+        trust_weight: state.config.temporal_trust.weight,
+        trust_halflife_days: state.config.temporal_trust.recency_halflife_days,
+        trust_ref_saturation: state.config.temporal_trust.ref_saturation,
+    });
     Router::new()
         .route("/session/start", post(session_start))
         .route("/session/end", post(session_end))
@@ -71,6 +80,7 @@ pub fn router(state: AppState) -> Router {
         .route("/feedback", post(record_feedback))
         .route("/reflect", post(run_reflection))
         .route("/dream", post(run_dream))
+        .route("/synthesize", post(run_synthesis))
         .route("/code/relink", post(code_relink))
         .route("/snapshots", get(list_snapshots).post(create_snapshot))
         .route("/snapshots/{id}/restore", post(restore_snapshot))
@@ -557,6 +567,9 @@ pub struct ReflectionRequest {
     pub dry_run: Option<bool>,
     pub apply: Option<bool>,
     pub limit: Option<i64>,
+    /// Synthesis only: cap on the number of entity-groups the LLM is run over
+    /// (bounds cost). Ignored by /reflect and /dream.
+    pub max_groups: Option<usize>,
 }
 
 async fn run_reflection(
@@ -589,6 +602,27 @@ async fn run_dream(
         body.dry_run.unwrap_or(true),
         body.apply.unwrap_or(false),
         body.limit.unwrap_or(200),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(report))
+}
+
+/// Track B transitive synthesis: derive new multi-hop facts from existing facts
+/// (additive) and reinforce their sources (which feeds the #5 trust signal).
+async fn run_synthesis(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ReflectionRequest>,
+) -> Result<Json<crate::reflection::SynthesisReport>, (StatusCode, String)> {
+    let report = crate::reflection::synthesize(
+        &state.db,
+        state.embedder.as_deref(),
+        state.store.as_ref(),
+        &state.config,
+        body.project.as_deref(),
+        body.apply.unwrap_or(false),
+        body.limit.unwrap_or(2000),
+        body.max_groups.unwrap_or(400),
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

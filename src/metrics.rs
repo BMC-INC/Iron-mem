@@ -114,8 +114,7 @@ fn round3(us: f64) -> f64 {
 /// JSON snapshot for `/status`: per op `{count, avg_us, max_us}`.
 pub fn snapshot() -> serde_json::Value {
     let mut ops = serde_json::Map::new();
-    for i in 0..GovOp::COUNT {
-        let s = &STATS[i];
+    for (i, s) in STATS.iter().enumerate() {
         let count = s.count.load(Ordering::Relaxed);
         let total = s.total_nanos.load(Ordering::Relaxed);
         let max = s.max_nanos.load(Ordering::Relaxed);

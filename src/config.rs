@@ -61,6 +61,11 @@ pub struct TemporalTrustConfig {
     /// memory can't dominate purely on popularity.
     #[serde(default = "default_trust_ref_saturation")]
     pub ref_saturation: f64,
+    /// (B) Times the date-bearing temporal-event id-list is pushed into RRF
+    /// fusion (>=1). 1 = unchanged; higher lifts exact dated facts that semantic
+    /// and keyword channels rank low (LoCoMo temporal questions). Gated, A/B-able.
+    #[serde(default = "default_temporal_event_fusion_weight")]
+    pub temporal_event_fusion_weight: usize,
 }
 
 impl Default for TemporalTrustConfig {
@@ -69,6 +74,7 @@ impl Default for TemporalTrustConfig {
             weight: 0.0,
             recency_halflife_days: default_trust_halflife_days(),
             ref_saturation: default_trust_ref_saturation(),
+            temporal_event_fusion_weight: default_temporal_event_fusion_weight(),
         }
     }
 }
@@ -79,6 +85,10 @@ fn default_trust_halflife_days() -> f64 {
 
 fn default_trust_ref_saturation() -> f64 {
     5.0
+}
+
+fn default_temporal_event_fusion_weight() -> usize {
+    1
 }
 
 /// LLM reranking of retrieval candidates. Off by default: it adds one provider
