@@ -14,6 +14,7 @@ mod expansion;
 mod governance;
 mod hooks;
 mod mcp;
+mod metrics;
 mod profile;
 mod provider;
 mod reflection;

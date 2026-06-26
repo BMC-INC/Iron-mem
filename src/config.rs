@@ -35,6 +35,50 @@ pub struct Config {
     pub rerank: RerankConfig,
     #[serde(default)]
     pub llm_retry: LlmRetryConfig,
+    #[serde(default)]
+    pub temporal_trust: TemporalTrustConfig,
+}
+
+/// Temporal trust trajectory as a retrieval signal (paper Finding 4: "standard
+/// semantic consolidation often destroys crucial chronological cues"). Each
+/// memory accrues a trajectory — first_seen / last_validated / receipt-confirmed
+/// ref_count — and this controls how much that trajectory boosts retrieval rank.
+/// `weight = 0.0` (the default) is a pure no-op: the trajectory is still recorded
+/// and exposed, but ranking is unchanged, so the lever can be A/B-tuned against
+/// the funnel without a rebuild.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemporalTrustConfig {
+    /// Multiplier on the trajectory boost added to a candidate's retrieval score.
+    /// 0.0 = off. Small values (≈0.05–0.15) nudge recently-validated, frequently-
+    /// referenced memories up without overriding semantic relevance.
+    #[serde(default)]
+    pub weight: f64,
+    /// Half-life (days) for the recency term: a memory last validated this many
+    /// days ago contributes half the recency boost of one validated just now.
+    #[serde(default = "default_trust_halflife_days")]
+    pub recency_halflife_days: f64,
+    /// Saturating scale on the reference-count term, so a heavily-referenced
+    /// memory can't dominate purely on popularity.
+    #[serde(default = "default_trust_ref_saturation")]
+    pub ref_saturation: f64,
+}
+
+impl Default for TemporalTrustConfig {
+    fn default() -> Self {
+        Self {
+            weight: 0.0,
+            recency_halflife_days: default_trust_halflife_days(),
+            ref_saturation: default_trust_ref_saturation(),
+        }
+    }
+}
+
+fn default_trust_halflife_days() -> f64 {
+    30.0
+}
+
+fn default_trust_ref_saturation() -> f64 {
+    5.0
 }
 
 /// LLM reranking of retrieval candidates. Off by default: it adds one provider
@@ -234,6 +278,7 @@ impl Default for Config {
             embedding: EmbeddingConfig::default(),
             rerank: RerankConfig::default(),
             llm_retry: LlmRetryConfig::default(),
+            temporal_trust: TemporalTrustConfig::default(),
         }
     }
 }

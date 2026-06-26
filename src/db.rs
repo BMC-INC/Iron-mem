@@ -566,6 +566,14 @@ impl Database {
         add_memory_meta_column(self, "record_hash TEXT").await?;
         add_memory_meta_column(self, "tombstoned_at BIGINT").await?;
         add_memory_meta_column(self, "tombstone_reason TEXT").await?;
+        // Temporal trust trajectory (paper Finding 4 + governance): trust is a
+        // signal earned over time, not a static scalar. first_seen = when the
+        // memory entered the store; last_validated = last receipt-confirmed
+        // reference; ref_count = number of confirmed references. Additive — legacy
+        // rows read back as ref_count 0 / NULL timestamps ("untouched").
+        add_memory_meta_column(self, "trust_first_seen_at BIGINT").await?;
+        add_memory_meta_column(self, "trust_last_validated_at BIGINT").await?;
+        add_memory_meta_column(self, "trust_ref_count BIGINT NOT NULL DEFAULT 0").await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_memory_meta_namespace
              ON memory_meta(namespace, memory_id)",
@@ -1690,6 +1698,7 @@ pub async fn governed_delete_memory(
     }
     let namespace = normalize_namespace(&meta.namespace);
     let now = Utc::now().timestamp();
+    let _tw = crate::metrics::start();
     sqlx::query(
         "UPDATE memory_meta
          SET tombstoned_at = $1, tombstone_reason = $2
@@ -1700,6 +1709,7 @@ pub async fn governed_delete_memory(
     .bind(memory_id)
     .execute(&db.pool)
     .await?;
+    crate::metrics::record(crate::metrics::GovOp::TombstoneWrite, _tw.elapsed());
 
     let payload = serde_json::json!({
         "classification": meta.classification,
@@ -2144,13 +2154,18 @@ pub async fn apply_memory_governance(
         governance,
     );
     let now = Utc::now().timestamp();
+    // trust_first_seen_at is stamped once and preserved across upserts (it is
+    // deliberately omitted from DO UPDATE SET), so a memory's trajectory origin
+    // is stable even when its governance metadata is rewritten.
+    let _gw = crate::metrics::start();
     sqlx::query(
         "INSERT INTO memory_meta(
             memory_id, importance, created_at, scope, kind, namespace, source_type, trust_tier,
             writer_identity, source_ref, parent_memory_id, classification, consent_state,
-            residency, retention_policy_id, expires_at, legal_hold, record_hash
+            residency, retention_policy_id, expires_at, legal_hold, record_hash,
+            trust_first_seen_at
          )
-         VALUES($1, 0.5, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+         VALUES($1, 0.5, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
          ON CONFLICT(memory_id) DO UPDATE SET
             scope = excluded.scope,
             kind = excluded.kind,
@@ -2185,8 +2200,10 @@ pub async fn apply_memory_governance(
     .bind(governance.expires_at)
     .bind(if governance.legal_hold { 1_i64 } else { 0_i64 })
     .bind(&record_hash)
+    .bind(now)
     .execute(&db.pool)
     .await?;
+    crate::metrics::record(crate::metrics::GovOp::GovernedWrite, _gw.elapsed());
 
     let payload = serde_json::json!({
         "classification": classification_str(governance.classification),
@@ -3252,7 +3269,7 @@ pub async fn record_memory_feedback(
 ) -> Result<i64> {
     let now = Utc::now().timestamp();
     let weight = weight.clamp(-2.0, 2.0);
-    match db.backend {
+    let id: i64 = match db.backend {
         Backend::Sqlite => {
             let mut conn = db.pool.acquire().await?;
             sqlx::query(
@@ -3270,7 +3287,7 @@ pub async fn record_memory_feedback(
             let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() AS id")
                 .fetch_one(&mut *conn)
                 .await?;
-            Ok(row.get("id"))
+            row.get("id")
         }
         Backend::Postgres => {
             let row: sqlx::any::AnyRow = sqlx::query(
@@ -3285,9 +3302,26 @@ pub async fn record_memory_feedback(
             .bind(now)
             .fetch_one(&db.pool)
             .await?;
-            Ok(row.get("id"))
+            row.get("id")
         }
+    };
+
+    // Receipt-confirmed reference: positive feedback is evidence the memory was
+    // actually used and useful, so advance its trust trajectory (paper Finding 4:
+    // trust earned over time as a first-class, temporally-grounded signal).
+    if weight > 0.0 {
+        let _ = sqlx::query(
+            "UPDATE memory_meta
+             SET trust_ref_count = trust_ref_count + 1, trust_last_validated_at = $1
+             WHERE memory_id = $2",
+        )
+        .bind(now)
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await;
     }
+
+    Ok(id)
 }
 
 #[allow(dead_code)]

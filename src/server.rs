@@ -897,6 +897,8 @@ pub struct StatusResponse {
     pub memory_chunks: i64,
     pub db_path: String,
     pub ccr: serde_json::Value,
+    /// Per-governance-operation cost (paper RQ5): count / avg_us / max_us.
+    pub governance_cost: serde_json::Value,
 }
 
 async fn get_status(
@@ -915,6 +917,7 @@ async fn get_status(
         memory_chunks: stats.total_memory_chunks,
         db_path: state.config.db_path.clone(),
         ccr: stats.ccr_json(),
+        governance_cost: crate::metrics::snapshot(),
     }))
 }
 

@@ -109,36 +109,40 @@ impl MemoryGovernance {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if matches!(
-            self.classification,
-            DataClassification::Phi | DataClassification::Pii
-        ) && self.consent_state != Some(ConsentState::Granted)
-        {
-            anyhow::bail!(
-                "{:?} memory requires consent_state=granted before it can be stored",
-                self.classification
-            );
-        }
-        Ok(())
+        crate::metrics::timed(crate::metrics::GovOp::ConsentCheck, || {
+            if matches!(
+                self.classification,
+                DataClassification::Phi | DataClassification::Pii
+            ) && self.consent_state != Some(ConsentState::Granted)
+            {
+                anyhow::bail!(
+                    "{:?} memory requires consent_state=granted before it can be stored",
+                    self.classification
+                );
+            }
+            Ok(())
+        })
     }
 }
 
 pub fn normalize_namespace(namespace: &str) -> String {
-    let cleaned = namespace.trim();
-    if cleaned.is_empty() {
-        DEFAULT_NAMESPACE.to_string()
-    } else {
-        cleaned
-            .chars()
-            .map(|c| {
-                if c.is_control() || c.is_whitespace() {
-                    '_'
-                } else {
-                    c
-                }
-            })
-            .collect()
-    }
+    crate::metrics::timed(crate::metrics::GovOp::NamespaceResolve, || {
+        let cleaned = namespace.trim();
+        if cleaned.is_empty() {
+            DEFAULT_NAMESPACE.to_string()
+        } else {
+            cleaned
+                .chars()
+                .map(|c| {
+                    if c.is_control() || c.is_whitespace() {
+                        '_'
+                    } else {
+                        c
+                    }
+                })
+                .collect()
+        }
+    })
 }
 
 pub fn parse_source_type(value: &str) -> MemorySourceType {
@@ -153,12 +157,14 @@ pub fn parse_source_type(value: &str) -> MemorySourceType {
 }
 
 pub fn parse_trust_tier(value: &str) -> TrustTier {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "high" => TrustTier::High,
-        "low" => TrustTier::Low,
-        "untrusted" => TrustTier::Untrusted,
-        _ => TrustTier::Medium,
-    }
+    crate::metrics::timed(crate::metrics::GovOp::TrustEval, || {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "high" => TrustTier::High,
+            "low" => TrustTier::Low,
+            "untrusted" => TrustTier::Untrusted,
+            _ => TrustTier::Medium,
+        }
+    })
 }
 
 pub fn parse_classification(value: &str) -> DataClassification {
@@ -289,4 +295,70 @@ pub fn ledger_entry_hash(
         "prev_hash": prev_hash,
     });
     sha256_hex(payload.to_string().as_bytes())
+}
+
+// Wired into the retrieval ranker in the gated #5-retrieval-weight increment
+// (folds into `retrieval.rs` fusion); built + unit-tested now, dormant until then.
+#[allow(dead_code)]
+/// Temporal-trust retrieval boost (paper Finding 4 — trust earned over time, not a
+/// static scalar). Blends two trajectory signals, then scales by `weight`:
+///   • reference — how many receipt-confirmed references the memory has (saturating)
+///   • recency   — how recently it was last validated (exponential half-life decay)
+/// The two are multiplied, so a memory must be BOTH referenced AND recently
+/// confirmed to score high; trust lapses if not revalidated. Returns an additive
+/// boost for a candidate's retrieval score. A never-validated memory contributes 0,
+/// and `weight <= 0.0` is a hard no-op (the lever is off by default).
+pub fn trust_trajectory_boost(
+    ref_count: i64,
+    last_validated_at: Option<i64>,
+    now: i64,
+    weight: f64,
+    recency_halflife_days: f64,
+    ref_saturation: f64,
+) -> f64 {
+    if weight <= 0.0 || ref_count <= 0 {
+        return 0.0;
+    }
+    let sat = ref_saturation.max(1.0);
+    let ref_term = (ref_count as f64) / (ref_count as f64 + sat); // (0, 1)
+    let recency_term = match last_validated_at {
+        Some(ts) => {
+            let age_days = ((now - ts).max(0) as f64) / 86_400.0;
+            let hl = recency_halflife_days.max(0.0001);
+            0.5_f64.powf(age_days / hl) // (0, 1]
+        }
+        None => return 0.0,
+    };
+    weight * ref_term * recency_term
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trajectory_boost_is_off_when_disabled_or_unreferenced() {
+        assert_eq!(
+            trust_trajectory_boost(5, Some(100), 100, 0.0, 30.0, 5.0),
+            0.0
+        );
+        assert_eq!(trust_trajectory_boost(0, None, 100, 0.1, 30.0, 5.0), 0.0);
+        assert_eq!(trust_trajectory_boost(3, None, 100, 0.1, 30.0, 5.0), 0.0);
+    }
+
+    #[test]
+    fn trajectory_boost_rewards_recent_and_referenced() {
+        let now = 1_000_000_000;
+        let fresh = trust_trajectory_boost(10, Some(now), now, 0.1, 30.0, 5.0);
+        let stale = trust_trajectory_boost(10, Some(now - 86_400 * 90), now, 0.1, 30.0, 5.0);
+        assert!(fresh > stale, "recent validation should outscore stale");
+        assert!(fresh > 0.0 && fresh <= 0.1, "boost stays within weight bound");
+    }
+
+    #[test]
+    fn trajectory_boost_saturates_on_reference_count() {
+        let now = 2_000;
+        let many = trust_trajectory_boost(100, Some(now), now, 0.1, 30.0, 5.0);
+        assert!(many < 0.1, "reference term saturates below the weight ceiling");
+    }
 }

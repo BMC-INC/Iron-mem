@@ -398,7 +398,100 @@ pub async fn compress(observations: &[Observation], config: &Config) -> Result<C
     let model = &config.model;
     let prompt = build_prompt(observations);
     let reply = complete_with(&prompt, model, config).await?;
-    Ok(parse_response(&reply))
+    let mut result = parse_response(&reply);
+
+    // Coverage pass (Reflexion-style) — ISOLATED from Phase 1's reverted
+    // untruncated-window change. The primary prompt stays tight (500/300) for
+    // dense, focused extraction; this second pass re-reads the FULL (untruncated)
+    // transcript against the facts we just got and recovers misses. It can only
+    // ADD facts, never drop them. Best-effort — a coverage hiccup must never fail
+    // the whole compression.
+    match recover_missed_facts(observations, &result.facts, model, config).await {
+        Ok(extra) if !extra.is_empty() => {
+            tracing::info!("coverage pass recovered {} missed fact(s)", extra.len());
+            merge_facts(&mut result.facts, extra);
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("coverage pass failed (keeping first-pass facts): {e}"),
+    }
+
+    Ok(result)
+}
+
+/// Second-pass fact-coverage check. Shows the model the FULL (untruncated)
+/// transcript plus the facts the first pass extracted, and asks only for concrete
+/// facts present in the transcript but missing from the list. Returns the
+/// recovered atomic facts (the "- none" sentinel is filtered by `push_fact`).
+async fn recover_missed_facts(
+    observations: &[Observation],
+    existing: &[String],
+    model: &str,
+    config: &Config,
+) -> Result<Vec<String>> {
+    let prompt = build_coverage_prompt(observations, existing);
+    let reply = complete_with(&prompt, model, config).await?;
+    let mut recovered: Vec<String> = Vec::new();
+    let mut in_missed = false;
+    for line in reply.lines() {
+        if let Some(rest) = line.strip_prefix("MISSED:") {
+            in_missed = true;
+            push_fact(&mut recovered, rest);
+        } else if in_missed {
+            push_fact(&mut recovered, line);
+        }
+    }
+    Ok(recovered)
+}
+
+/// Build the coverage-pass prompt. Renders the transcript WITHOUT truncation so
+/// the auditor can see facts the first pass may have missed (incl. anything past
+/// the primary prompt's per-turn caps).
+fn build_coverage_prompt(observations: &[Observation], existing: &[String]) -> String {
+    let mut lines = vec![
+        "You are a meticulous fact-coverage auditor for a memory system.".to_string(),
+        "Below is a session transcript, then the facts already extracted from it.".to_string(),
+        String::new(),
+        "TRANSCRIPT:".to_string(),
+    ];
+    for (i, obs) in observations.iter().enumerate() {
+        lines.push(format!("{}. Tool: {}", i + 1, obs.tool));
+        if let Some(input) = &obs.input {
+            lines.push(format!("   Input: {input}"));
+        }
+        if let Some(output) = &obs.output {
+            lines.push(format!("   Output: {output}"));
+        }
+    }
+    lines.push(String::new());
+    lines.push("FACTS ALREADY EXTRACTED:".to_string());
+    if existing.is_empty() {
+        lines.push("- (none yet)".to_string());
+    } else {
+        for f in existing {
+            lines.push(format!("- {f}"));
+        }
+    }
+    lines.push(String::new());
+    lines.push(
+        "Re-read the transcript carefully. List ONLY concrete facts that are explicitly stated or strongly implied in the transcript but are MISSING from the list above. Same rules as extraction: one atomic fact per line starting with \"- \"; each fact must stand on its own — name the person or subject explicitly (never a bare \"she/he/they/it\"), and carry every date, place, quantity, or proper noun it involves; resolve relative dates (\"yesterday\", \"last week\") to absolute dates where the transcript makes them clear. Do NOT repeat facts already listed. Omit greetings and filler.".to_string(),
+    );
+    lines.push("Respond with EXACTLY this format, nothing else:".to_string());
+    lines.push(
+        "MISSED: [one \"- \" bullet per missing fact; write \"- none\" if the extraction was already complete]"
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+/// Append `extra` facts to `facts`, skipping case-insensitive duplicates so the
+/// coverage pass can only ADD, never duplicate, what the first pass found.
+fn merge_facts(facts: &mut Vec<String>, extra: Vec<String>) {
+    for f in extra {
+        let key = f.trim().to_ascii_lowercase();
+        if !facts.iter().any(|e| e.trim().to_ascii_lowercase() == key) {
+            facts.push(f);
+        }
+    }
 }
 
 /// Raw single-prompt completion against the configured provider, returning the
