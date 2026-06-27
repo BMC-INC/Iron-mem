@@ -12,6 +12,7 @@
 //! returns `None` and the caller falls back to the LLM reranker, so selecting the
 //! cross-encoder can only help, never break retrieval.
 
+#[cfg(feature = "local-onnx")]
 use std::sync::OnceLock;
 
 #[cfg(feature = "local-onnx")]
