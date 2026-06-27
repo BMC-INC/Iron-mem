@@ -11,6 +11,7 @@ use crate::config::{Config, Weights};
 use crate::context;
 use crate::db::{self, Database, Memory};
 use crate::embedder::Embedder;
+use crate::storage::{NativeBackend, StorageBackend};
 use crate::vectorstore::VectorStore;
 
 /// Standard RRF damping constant. Larger ⇒ rank position matters less.
@@ -307,7 +308,7 @@ fn graph_edge_score(edge: &db::MemoryEdge, query_terms: &HashSet<String>) -> f64
 }
 
 async fn graph_ids_for_query(
-    db: &Database,
+    backend: &dyn StorageBackend,
     project: Option<&str>,
     query: &str,
     limit: usize,
@@ -326,7 +327,8 @@ async fn graph_ids_for_query(
         entities.iter().map(|e| e.to_ascii_lowercase()).collect();
 
     for entity in &entities {
-        let edges = db::memory_edges_for_entity(db, project, entity, false, GRAPH_EDGES_PER_ENTITY)
+        let edges = backend
+            .edges_for_entity(project, entity, false, GRAPH_EDGES_PER_ENTITY)
             .await
             .unwrap_or_default();
         for edge in edges {
@@ -351,10 +353,10 @@ async fn graph_ids_for_query(
     // multi-hop questions a chance to retrieve both sides of a relation chain
     // without turning graph lookup into a broad recency-ordered entity search.
     for bridge in bridge_entities.into_iter().take(MAX_GRAPH_ENTITIES * 2) {
-        let edges =
-            db::memory_edges_for_entity(db, project, &bridge, false, GRAPH_CHAIN_EDGES_PER_BRIDGE)
-                .await
-                .unwrap_or_default();
+        let edges = backend
+            .edges_for_entity(project, &bridge, false, GRAPH_CHAIN_EDGES_PER_BRIDGE)
+            .await
+            .unwrap_or_default();
         for edge in edges {
             let score = graph_edge_score(&edge, &query_terms) * 0.75;
             let current =
@@ -507,7 +509,7 @@ fn event_text_terms(memory: &Memory) -> HashSet<String> {
 }
 
 async fn temporal_event_ids_for_query(
-    db: &Database,
+    backend: &dyn StorageBackend,
     project: Option<&str>,
     query: &str,
     limit: usize,
@@ -518,7 +520,10 @@ async fn temporal_event_ids_for_query(
     }
 
     let mut scored = Vec::new();
-    for candidate in db::dated_memories(db, project, TEMPORAL_EVENT_POOL.max(limit)).await? {
+    for candidate in backend
+        .dated_memories(project, TEMPORAL_EVENT_POOL.max(limit))
+        .await?
+    {
         let text_terms = event_text_terms(&candidate.memory);
         let overlap = query_terms
             .iter()
@@ -598,21 +603,29 @@ pub async fn hybrid_search_in_namespace(
     // so the reranker has more buried-answer candidates to promote.
     let pool = (limit * 5).max(50);
 
+    // Storage substrate (#4): the native engine as the default StorageBackend.
+    // Ranking (RRF, reserve) and governance (trust/tier boosts) below compose ON
+    // TOP of this trait; only the raw recall/materialize calls flow through it,
+    // so behavior is identical to the prior direct-SQL path.
+    let backend = NativeBackend::new(db, store);
+
     // Keyword side (always run).
-    let fts = match project {
-        Some(p) => db::search_memories_in_namespace(db, namespace, p, query, pool as i64).await?,
-        None => db::search_all_memories_in_namespace(db, namespace, query, pool as i64).await?,
-    };
+    let fts: Vec<Memory> = backend
+        .fulltext_search(namespace, project, query, pool)
+        .await?
+        .into_iter()
+        .filter_map(|c| c.memory)
+        .collect();
 
     // Semantic side (best-effort; only when an embedder is configured).
     let vec_ids: Vec<i64> = if let Some(emb) = embedder {
         match embed_one(emb, query).await {
-            Some(qvec) => store
-                .knn(db, project, &qvec, emb.id(), pool)
+            Some(qvec) => backend
+                .vector_search(project, &qvec, emb.id(), pool)
                 .await
                 .unwrap_or_default()
                 .into_iter()
-                .map(|(id, _sim)| id)
+                .map(|c| c.id)
                 .collect(),
             None => Vec::new(),
         }
@@ -631,7 +644,8 @@ pub async fn hybrid_search_in_namespace(
             let mut seen = HashSet::new();
             let mut ids = Vec::new();
             for y in &years {
-                for id in db::memories_by_event_time(db, project, y, pool)
+                for id in backend
+                    .memories_by_event_time(project, y, pool)
                     .await
                     .unwrap_or_default()
                 {
@@ -649,7 +663,7 @@ pub async fn hybrid_search_in_namespace(
     // date-bearing event/fact memories by event-term overlap so old exact facts
     // can beat newer broad memories that only share the same person/topic.
     let temporal_event_ids = if is_temporal_lookup_query(query) {
-        temporal_event_ids_for_query(db, project, query, pool).await?
+        temporal_event_ids_for_query(&backend, project, query, pool).await?
     } else {
         Vec::new()
     };
@@ -662,7 +676,8 @@ pub async fn hybrid_search_in_namespace(
         let mut seen = HashSet::new();
         let mut ids = Vec::new();
         for e in &ents {
-            for id in db::memories_for_entity(db, project, e, pool)
+            for id in backend
+                .memories_for_entity(project, e, pool)
                 .await
                 .unwrap_or_default()
             {
@@ -683,7 +698,7 @@ pub async fn hybrid_search_in_namespace(
     let graph_ids = if is_temporal_lookup_query(query) {
         Vec::new()
     } else {
-        graph_ids_for_query(db, project, query, pool).await?
+        graph_ids_for_query(&backend, project, query, pool).await?
     };
 
     // Candidate ordering: RRF over keyword + any auxiliary signals (semantic,
@@ -745,7 +760,7 @@ pub async fn hybrid_search_in_namespace(
     for id in chosen {
         if let Some(m) = by_id.get(&id) {
             out.push(m.clone());
-        } else if let Some(m) = db::get_memory_by_id_in_namespace(db, id, namespace).await? {
+        } else if let Some(m) = backend.get_memory(namespace, id).await? {
             out.push(m);
         }
     }

@@ -21,6 +21,7 @@ mod reflection;
 mod retrieval;
 mod server;
 mod snapshot;
+mod storage;
 mod strutil;
 mod sync;
 mod vectorstore;

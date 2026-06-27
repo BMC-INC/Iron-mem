@@ -2311,6 +2311,37 @@ pub async fn memory_ledger_for_memory(
         .collect())
 }
 
+/// All ledger entries in a namespace, ordered by insertion (id ASC). Used by the
+/// storage conformance suite to verify hash-chain continuity across a backend.
+#[cfg(test)]
+pub async fn memory_ledger_for_namespace(
+    db: &Database,
+    namespace: &str,
+) -> Result<Vec<MemoryLedgerEntry>> {
+    let namespace = normalize_namespace(namespace);
+    let rows = sqlx::query(
+        "SELECT id, namespace, memory_id, op_type, actor, prev_hash, entry_hash, payload, created_at
+         FROM memory_ledger WHERE namespace = $1 ORDER BY id ASC",
+    )
+    .bind(&namespace)
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| MemoryLedgerEntry {
+            id: r.get("id"),
+            namespace: r.get("namespace"),
+            memory_id: r.try_get::<Option<i64>, _>("memory_id").ok().flatten(),
+            op_type: r.get("op_type"),
+            actor: r.try_get::<Option<String>, _>("actor").ok().flatten(),
+            prev_hash: r.try_get::<Option<String>, _>("prev_hash").ok().flatten(),
+            entry_hash: r.get("entry_hash"),
+            payload: r.get("payload"),
+            created_at: r.get("created_at"),
+        })
+        .collect())
+}
+
 pub async fn get_memory_by_id_any_namespace(db: &Database, id: i64) -> Result<Option<Memory>> {
     let query_str = match db.backend {
         Backend::Sqlite => {
