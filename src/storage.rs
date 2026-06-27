@@ -22,6 +22,8 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use reqwest::Client;
+use serde_json::{json, Value};
 
 use crate::db::{self, DatedMemory, Database, Memory, MemoryEdge};
 use crate::vectorstore::VectorStore;
@@ -318,6 +320,388 @@ impl StorageBackend for NativeBackend<'_> {
 
     async fn purge(&self, id: i64) -> Result<bool> {
         db::governed_delete_memory(self.db, id, None, Some("purge")).await
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// External reference adapters (P3 vector / P4 graph), REAL network backends.
+//
+// Both reuse the existing `reqwest` dependency (no new client crate) and follow
+// the Mem0/Zep split: content + governance (ledger, tombstones, consent, trust,
+// namespaces) stay native; only the vector index (Qdrant) or the entity/edge
+// store (Neo4j) lives in the external engine, addressed by the local i64 spine.
+// They are selected by config; the native engine remains the deployed default
+// (so the existing 28k-memory store keeps full enforcement). Each is proven
+// against a LIVE service by an env-gated integration test in `mod conformance`,
+// running the same governance conformance suite as the native backend.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Real vector adapter backed by an external **Qdrant** over its REST API.
+/// Embeddings live in Qdrant; everything governance-bearing stays native.
+#[allow(dead_code)]
+pub struct QdrantVectorBackend<'a> {
+    inner: NativeBackend<'a>,
+    http: Client,
+    base: String,
+    collection: String,
+}
+
+#[allow(dead_code)]
+impl<'a> QdrantVectorBackend<'a> {
+    /// Connect and ensure the collection exists (Cosine, `dim`-d vectors).
+    pub async fn new(
+        inner: NativeBackend<'a>,
+        base_url: &str,
+        collection: &str,
+        dim: usize,
+    ) -> Result<Self> {
+        let http = Client::new();
+        let base = base_url.trim_end_matches('/').to_string();
+        let resp = http
+            .put(format!("{base}/collections/{collection}"))
+            .json(&json!({"vectors": {"size": dim, "distance": "Cosine"}}))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            // A pre-existing collection is fine; anything else is a real failure.
+            if !body.contains("already exists") {
+                anyhow::bail!("qdrant create collection {collection}: {status} {body}");
+            }
+        }
+        Ok(Self {
+            inner,
+            http,
+            base,
+            collection: collection.to_string(),
+        })
+    }
+}
+
+#[async_trait]
+impl StorageBackend for QdrantVectorBackend<'_> {
+    fn capabilities(&self) -> BackendCaps {
+        BackendCaps {
+            vector: true,
+            native_namespacing: false, // Qdrant payload-filtered, not native ns
+            ..self.inner.capabilities()
+        }
+    }
+
+    async fn put_memory(&self, rec: &BackendMemory) -> Result<i64> {
+        let spine = BackendMemory {
+            embedding: None,
+            ..rec.clone()
+        };
+        let id = self.inner.put_memory(&spine).await?;
+        if let Some(emb) = &rec.embedding {
+            let body = json!({
+                "points": [{
+                    "id": id,
+                    "vector": emb.vector,
+                    "payload": {"project": rec.project, "model": emb.model},
+                }]
+            });
+            // wait=true makes the write visible to the read-after-write in the
+            // conformance suite (Qdrant indexes asynchronously by default).
+            self.http
+                .put(format!(
+                    "{}/collections/{}/points?wait=true",
+                    self.base, self.collection
+                ))
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?;
+        }
+        Ok(id)
+    }
+
+    async fn get_memory(&self, ns: &str, id: i64) -> Result<Option<Memory>> {
+        self.inner.get_memory(ns, id).await
+    }
+
+    async fn fulltext_search(
+        &self,
+        ns: &str,
+        project: Option<&str>,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<Candidate>> {
+        self.inner.fulltext_search(ns, project, query, k).await
+    }
+
+    async fn vector_search(
+        &self,
+        project: Option<&str>,
+        qvec: &[f32],
+        model: &str,
+        k: usize,
+    ) -> Result<Vec<Candidate>> {
+        let mut must = vec![json!({"key": "model", "match": {"value": model}})];
+        if let Some(p) = project {
+            must.push(json!({"key": "project", "match": {"value": p}}));
+        }
+        let body = json!({
+            "vector": qvec,
+            "limit": k,
+            "with_payload": false,
+            "filter": {"must": must},
+        });
+        let resp = self
+            .http
+            .post(format!(
+                "{}/collections/{}/points/search",
+                self.base, self.collection
+            ))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        let v: Value = resp.json().await?;
+        Ok(v["result"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|p| {
+                        let id = p["id"].as_i64()?;
+                        let score = p["score"].as_f64().unwrap_or(0.0) as f32;
+                        Some(Candidate::id_only(id, score))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn memories_by_event_time(
+        &self,
+        project: Option<&str>,
+        needle: &str,
+        k: usize,
+    ) -> Result<Vec<i64>> {
+        self.inner.memories_by_event_time(project, needle, k).await
+    }
+
+    async fn memories_for_entity(
+        &self,
+        project: Option<&str>,
+        entity: &str,
+        k: usize,
+    ) -> Result<Vec<i64>> {
+        self.inner.memories_for_entity(project, entity, k).await
+    }
+
+    async fn dated_memories(&self, project: Option<&str>, k: usize) -> Result<Vec<DatedMemory>> {
+        self.inner.dated_memories(project, k).await
+    }
+
+    async fn put_edge(&self, edge: &BackendEdge) -> Result<i64> {
+        self.inner.put_edge(edge).await
+    }
+
+    async fn edges_for_entity(
+        &self,
+        project: Option<&str>,
+        entity: &str,
+        include_superseded: bool,
+        k: usize,
+    ) -> Result<Vec<MemoryEdge>> {
+        self.inner
+            .edges_for_entity(project, entity, include_superseded, k)
+            .await
+    }
+
+    async fn hide(&self, id: i64, actor: Option<&str>, reason: Option<&str>) -> Result<bool> {
+        self.inner.hide(id, actor, reason).await
+    }
+
+    async fn purge(&self, id: i64) -> Result<bool> {
+        self.inner.purge(id).await
+    }
+}
+
+/// Real graph adapter backed by an external **Neo4j** over its transactional
+/// Cypher HTTP API. Entities + edges live in Neo4j; governance stays native.
+#[allow(dead_code)]
+pub struct Neo4jGraphBackend<'a> {
+    inner: NativeBackend<'a>,
+    http: Client,
+    endpoint: String,
+    user: String,
+    pass: String,
+}
+
+#[allow(dead_code)]
+impl<'a> Neo4jGraphBackend<'a> {
+    pub fn new(
+        inner: NativeBackend<'a>,
+        base_url: &str,
+        database: &str,
+        user: &str,
+        pass: &str,
+    ) -> Self {
+        let endpoint = format!(
+            "{}/db/{}/tx/commit",
+            base_url.trim_end_matches('/'),
+            database
+        );
+        Self {
+            inner,
+            http: Client::new(),
+            endpoint,
+            user: user.to_string(),
+            pass: pass.to_string(),
+        }
+    }
+
+    async fn cypher(&self, statement: &str, params: Value) -> Result<Value> {
+        let resp = self
+            .http
+            .post(&self.endpoint)
+            .basic_auth(&self.user, Some(&self.pass))
+            .json(&json!({"statements": [{"statement": statement, "parameters": params}]}))
+            .send()
+            .await?
+            .error_for_status()?;
+        let v: Value = resp.json().await?;
+        if let Some(errs) = v["errors"].as_array() {
+            if !errs.is_empty() {
+                anyhow::bail!("neo4j cypher error: {}", v["errors"]);
+            }
+        }
+        Ok(v)
+    }
+}
+
+#[async_trait]
+impl StorageBackend for Neo4jGraphBackend<'_> {
+    fn capabilities(&self) -> BackendCaps {
+        BackendCaps {
+            graph: true,
+            ..self.inner.capabilities()
+        }
+    }
+
+    async fn put_memory(&self, rec: &BackendMemory) -> Result<i64> {
+        self.inner.put_memory(rec).await
+    }
+
+    async fn get_memory(&self, ns: &str, id: i64) -> Result<Option<Memory>> {
+        self.inner.get_memory(ns, id).await
+    }
+
+    async fn fulltext_search(
+        &self,
+        ns: &str,
+        project: Option<&str>,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<Candidate>> {
+        self.inner.fulltext_search(ns, project, query, k).await
+    }
+
+    async fn vector_search(
+        &self,
+        project: Option<&str>,
+        qvec: &[f32],
+        model: &str,
+        k: usize,
+    ) -> Result<Vec<Candidate>> {
+        self.inner.vector_search(project, qvec, model, k).await
+    }
+
+    async fn memories_by_event_time(
+        &self,
+        project: Option<&str>,
+        needle: &str,
+        k: usize,
+    ) -> Result<Vec<i64>> {
+        self.inner.memories_by_event_time(project, needle, k).await
+    }
+
+    async fn memories_for_entity(
+        &self,
+        project: Option<&str>,
+        entity: &str,
+        k: usize,
+    ) -> Result<Vec<i64>> {
+        self.inner.memories_for_entity(project, entity, k).await
+    }
+
+    async fn dated_memories(&self, project: Option<&str>, k: usize) -> Result<Vec<DatedMemory>> {
+        self.inner.dated_memories(project, k).await
+    }
+
+    async fn put_edge(&self, edge: &BackendEdge) -> Result<i64> {
+        let stmt = "MERGE (s:Entity {name: $source, project: $project}) \
+                    MERGE (t:Entity {name: $target, project: $project}) \
+                    CREATE (s)-[r:REL {memory_id: $mid, relation: $relation, source: $source, \
+                            target: $target, project: $project, confidence: $conf}]->(t) \
+                    RETURN id(r) AS id";
+        let v = self
+            .cypher(
+                stmt,
+                json!({
+                    "source": edge.source, "target": edge.target, "project": edge.project,
+                    "mid": edge.memory_id, "relation": edge.relation, "conf": edge.confidence,
+                }),
+            )
+            .await?;
+        Ok(v["results"][0]["data"][0]["row"][0].as_i64().unwrap_or(0))
+    }
+
+    async fn edges_for_entity(
+        &self,
+        project: Option<&str>,
+        entity: &str,
+        _include_superseded: bool,
+        k: usize,
+    ) -> Result<Vec<MemoryEdge>> {
+        // k is a trusted usize; inline it (Cypher params are awkward in LIMIT).
+        let stmt = format!(
+            "MATCH (s:Entity)-[r:REL]->(t:Entity) \
+             WHERE ($project IS NULL OR r.project = $project) \
+               AND (toLower(r.source) CONTAINS toLower($entity) \
+                    OR toLower(r.target) CONTAINS toLower($entity)) \
+             RETURN r.memory_id AS memory_id, r.source AS source, r.relation AS relation, \
+                    r.target AS target, r.project AS project, r.confidence AS confidence \
+             LIMIT {k}"
+        );
+        let v = self
+            .cypher(&stmt, json!({"project": project, "entity": entity}))
+            .await?;
+        let rows = v["results"][0]["data"].as_array().cloned().unwrap_or_default();
+        Ok(rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let row = &r["row"];
+                MemoryEdge {
+                    id: i as i64 + 1,
+                    project: row[4].as_str().unwrap_or_default().to_string(),
+                    memory_id: row[0].as_i64().unwrap_or(0),
+                    source: row[1].as_str().unwrap_or_default().to_string(),
+                    relation: row[2].as_str().unwrap_or_default().to_string(),
+                    target: row[3].as_str().unwrap_or_default().to_string(),
+                    valid_from: None,
+                    valid_until: None,
+                    observed_at: 0,
+                    confidence: row[5].as_f64().unwrap_or(0.0),
+                    superseded_by: None,
+                    superseded_reason: None,
+                    created_at: 0,
+                }
+            })
+            .collect())
+    }
+
+    async fn hide(&self, id: i64, actor: Option<&str>, reason: Option<&str>) -> Result<bool> {
+        self.inner.hide(id, actor, reason).await
+    }
+
+    async fn purge(&self, id: i64) -> Result<bool> {
+        self.inner.purge(id).await
     }
 }
 
@@ -884,6 +1268,50 @@ mod conformance {
             inner: NativeBackend::new(&db, &store),
             graph: InProcessGraphStore::default(),
         };
+        assert_conformance(&db, &backend).await;
+    }
+
+    // ── Live external-service integration (env-gated) ─────────────────────────
+    // These run the IDENTICAL conformance suite against a REAL Qdrant / Neo4j.
+    // They skip when the service env var is unset (so CI without the services
+    // stays green); run with the containers up to prove the real adapters:
+    //   IRONMEM_TEST_QDRANT_URL=http://localhost:6333
+    //   IRONMEM_TEST_NEO4J_URL=http://localhost:7474  (+ _USER / _PASS)
+
+    #[tokio::test]
+    async fn qdrant_vector_adapter_passes_conformance() {
+        let Ok(url) = std::env::var("IRONMEM_TEST_QDRANT_URL") else {
+            eprintln!("SKIP qdrant integration: set IRONMEM_TEST_QDRANT_URL");
+            return;
+        };
+        let db = fresh_db().await;
+        let store = BruteForceStore;
+        let collection = format!("conf_{}", uuid::Uuid::new_v4().simple());
+        let backend =
+            super::QdrantVectorBackend::new(NativeBackend::new(&db, &store), &url, &collection, 4)
+                .await
+                .expect("connect to live Qdrant");
+        assert_conformance(&db, &backend).await;
+    }
+
+    #[tokio::test]
+    async fn neo4j_graph_adapter_passes_conformance() {
+        let Ok(url) = std::env::var("IRONMEM_TEST_NEO4J_URL") else {
+            eprintln!("SKIP neo4j integration: set IRONMEM_TEST_NEO4J_URL");
+            return;
+        };
+        let user = std::env::var("IRONMEM_TEST_NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string());
+        let pass =
+            std::env::var("IRONMEM_TEST_NEO4J_PASS").unwrap_or_else(|_| "ironmempass".to_string());
+        let db = fresh_db().await;
+        let store = BruteForceStore;
+        let backend = super::Neo4jGraphBackend::new(
+            NativeBackend::new(&db, &store),
+            &url,
+            "neo4j",
+            &user,
+            &pass,
+        );
         assert_conformance(&db, &backend).await;
     }
 }
