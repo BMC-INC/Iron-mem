@@ -45,6 +45,10 @@ pub struct RetrievalTuning {
     pub trust_weight: f64,
     pub trust_halflife_days: f64,
     pub trust_ref_saturation: f64,
+    /// #1 governed-retrieval router: writer trust-tier authority weight (0.0 =
+    /// off). High-tier (user-explicit) facts outrank machine-derived ones on
+    /// near-ties. See `governance::tier_authority_boost`.
+    pub tier_weight: f64,
 }
 
 impl Default for RetrievalTuning {
@@ -54,6 +58,7 @@ impl Default for RetrievalTuning {
             trust_weight: 0.0,
             trust_halflife_days: 30.0,
             trust_ref_saturation: 5.0,
+            tier_weight: 0.0,
         }
     }
 }
@@ -133,6 +138,43 @@ async fn apply_trust_boost(db: &Database, candidates: Vec<i64>) -> Result<Vec<i6
         })
         .collect();
     // Re-sort by combined score desc; equal scores keep the original fused order.
+    scored.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    Ok(scored.into_iter().map(|(_, id, _)| id).collect())
+}
+
+/// (#1) Governed-retrieval router: nudge the fused order by each candidate's
+/// *writer trust tier* (recorded at write time, consulted here at query time).
+/// Same shape as `apply_trust_boost` — the reciprocal-rank base term stays
+/// dominant so tier authority only reorders near-ties, lifting user-explicit
+/// (`High`) facts above machine-`Derived` (`Medium`) ones and demoting
+/// `Low`/`Untrusted` writers. No-op (and zero DB cost) when `tier_weight <= 0`.
+async fn apply_tier_boost(db: &Database, candidates: Vec<i64>) -> Result<Vec<i64>> {
+    let t = tuning();
+    if t.tier_weight <= 0.0 || candidates.len() < 2 {
+        return Ok(candidates);
+    }
+    let tiers = db::trust_tiers_for(db, &candidates).await.unwrap_or_default();
+    if tiers.is_empty() {
+        return Ok(candidates);
+    }
+    let mut scored: Vec<(usize, i64, f64)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(rank, &id)| {
+            let base = 1.0 / (RRF_K as f64 + rank as f64);
+            // A missing tier reads as Medium (neutral), so legacy rows are unmoved.
+            let tier = tiers
+                .get(&id)
+                .map(|s| crate::governance::parse_trust_tier(s))
+                .unwrap_or(crate::governance::TrustTier::Medium);
+            let boost = crate::governance::tier_authority_boost(tier, t.tier_weight);
+            (rank, id, base + boost)
+        })
+        .collect();
     scored.sort_by(|a, b| {
         b.2.partial_cmp(&a.2)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -551,7 +593,10 @@ pub async fn hybrid_search_in_namespace(
 ) -> Result<Vec<Memory>> {
     // Candidate pool: pull more than `limit` per signal so the narrative-reserve
     // quota below has narratives to choose from even when facts dominate ranking.
-    let pool = (limit * 3).max(30);
+    // (W1.2) 5×/floor-50: the LLM-free recall@N curve showed gold sitting in pool
+    // positions 11–50 that a 3×/floor-30 window couldn't surface — widen the pool
+    // so the reranker has more buried-answer candidates to promote.
+    let pool = (limit * 5).max(50);
 
     // Keyword side (always run).
     let fts = match project {
@@ -689,6 +734,10 @@ pub async fn hybrid_search_in_namespace(
     // (#5) Temporal-trust re-rank: nudge the fused order by each candidate's trust
     // trajectory. No-op (and zero DB cost) unless temporal_trust.weight > 0.
     let candidates = apply_trust_boost(db, candidates).await?;
+
+    // (#1) Governed-retrieval router: nudge by writer trust-tier authority.
+    // No-op (and zero DB cost) unless governance_router.weight > 0.
+    let candidates = apply_tier_boost(db, candidates).await?;
 
     // Narrative-reserve quota, then materialize in rank order (reusing FTS rows).
     let chosen = reserve_narrative_slots(db, &candidates, limit).await?;
@@ -951,6 +1000,143 @@ pub async fn rerank_search_in_namespace_with_pool(
         hybrid_search_in_namespace(db, embedder, store, namespace, project, query, pool).await?;
     let candidates = reanchor(narrow, wide);
     Ok(llm_rerank(config, query, candidates, limit).await)
+}
+
+/// (W3.1) Heuristic gate for the iterative multi-hop loop: a question that chains
+/// facts across turns ("what city did X move to after the job in session 3?").
+/// Cheap and conservative — single-hop questions must NOT pay the extra LLM
+/// reason + re-retrieval cost. Triggers on relational/bridge cues or on ≥2 named
+/// entities (a relation between two proper nouns is the canonical multi-hop case).
+pub fn is_multi_hop_query(query: &str) -> bool {
+    let q = format!(" {} ", query.to_lowercase());
+    const CUES: &[&str] = &[
+        " after ", " before ", " then ", " same ", " also ", " both ",
+        " who else", " what else", " where did ", " how did ", " because ",
+        " led to ", " compared ", " related to ", " connected ", " between ",
+    ];
+    if CUES.iter().any(|c| q.contains(c)) {
+        return true;
+    }
+    query_entities(query).len() >= 2
+}
+
+/// Prompt the rerank model for the single missing bridge fact (or DONE) given the
+/// question and the facts retrieved so far. Intentionally asks for a SHORT
+/// keyword query, not prose, so the follow-up feeds `hybrid_search` cleanly.
+fn build_followup_prompt(question: &str, retrieved: &[Memory]) -> String {
+    let mut facts = String::new();
+    for (i, m) in retrieved.iter().take(12).enumerate() {
+        facts.push_str(&format!("{}. {}\n", i + 1, m.summary));
+    }
+    format!(
+        "You are helping answer a question that may require chaining several facts.\n\
+         Question: {question}\n\n\
+         Facts retrieved so far:\n{facts}\n\
+         If these facts are sufficient to answer the question, reply with exactly: DONE\n\
+         Otherwise reply with a SHORT search query (a few keywords, no punctuation) for the single \
+         missing bridge fact you still need — the name, date, place, or entity that links the facts \
+         above to the answer. Reply with ONLY `DONE` or the query, nothing else."
+    )
+}
+
+/// Parse the follow-up reply: `None` means stop (DONE / empty / unusable), `Some`
+/// is the next bridge query. Guards against the model returning a sentence or
+/// echoing the instruction.
+fn parse_followup_query(reply: &str) -> Option<String> {
+    // DONE on any line → stop (models sometimes wrap it in punctuation/markdown).
+    for l in reply.lines() {
+        let t = l.trim().trim_matches(|c: char| {
+            c == '"' || c == '`' || c == '.' || c == '*' || c == '#'
+        });
+        if t.eq_ignore_ascii_case("DONE") {
+            return None;
+        }
+    }
+    // Otherwise the bridge query is the LAST non-empty line: a well-behaved model
+    // returns just the query, and a chatty one puts its preamble first and the
+    // query last.
+    let last = reply
+        .lines()
+        .map(|l| l.trim())
+        .rfind(|l| !l.is_empty())
+        .unwrap_or("");
+    let q = last.trim_matches(|c: char| c == '"' || c == '`' || c == '.').trim();
+    if q.is_empty() || q.len() > 200 || q.to_ascii_uppercase().starts_with("DONE") {
+        return None;
+    }
+    Some(q.to_string())
+}
+
+/// (W3.1) Iterative multi-hop retrieval. Hop 1 is the standard reranked search;
+/// then, up to `max_hops`, the model names the missing bridge fact, we retrieve
+/// on it, and merge new candidates. A final rerank over the accumulated union
+/// against the ORIGINAL question picks the best `limit`. Every step degrades
+/// safely: a provider/parse failure or a hop that adds nothing stops the loop and
+/// returns what hop 1 already had, so recall is never below a single-pass rerank.
+#[allow(clippy::too_many_arguments)]
+pub async fn iterative_rerank_search_in_namespace(
+    db: &Database,
+    embedder: Option<&dyn Embedder>,
+    store: &dyn VectorStore,
+    config: &Config,
+    namespace: &str,
+    project: Option<&str>,
+    query: &str,
+    limit: usize,
+    max_hops: usize,
+    pool_override: Option<usize>,
+) -> Result<Vec<Memory>> {
+    let mut pool = rerank_search_in_namespace_with_pool(
+        db, embedder, store, config, namespace, project, query, limit, pool_override,
+    )
+    .await?;
+    let hops = max_hops.max(1);
+    if hops <= 1 || pool.is_empty() {
+        return Ok(pool);
+    }
+
+    let model = if config.rerank.model.is_empty() {
+        config.model.as_str()
+    } else {
+        config.rerank.model.as_str()
+    };
+    let mut seen: HashSet<i64> = pool.iter().map(|m| m.id).collect();
+    let mut last_query = query.to_string();
+
+    for _ in 1..hops {
+        let prompt = build_followup_prompt(query, &pool);
+        let follow = match crate::provider::complete_with(&prompt, model, config).await {
+            Ok(reply) => parse_followup_query(&reply),
+            Err(e) => {
+                tracing::warn!("multi-hop follow-up failed ({e}); stopping at current hop");
+                None
+            }
+        };
+        let Some(fq) = follow else { break };
+        if fq.eq_ignore_ascii_case(last_query.trim()) {
+            break; // model repeated itself → no new ground to cover
+        }
+        last_query = fq.clone();
+
+        let next = rerank_search_in_namespace_with_pool(
+            db, embedder, store, config, namespace, project, &fq, limit, pool_override,
+        )
+        .await
+        .unwrap_or_default();
+        let mut added = false;
+        for m in next {
+            if seen.insert(m.id) {
+                pool.push(m);
+                added = true;
+            }
+        }
+        if !added {
+            break; // bridge query surfaced nothing new → done
+        }
+    }
+
+    // Final precision pass over the union, scored against the original question.
+    Ok(llm_rerank(config, query, pool, limit).await)
 }
 
 // ── Blended injection ranking ───────────────────────────────────────
@@ -1536,6 +1722,34 @@ mod tests {
         let ids: Vec<i64> = out.iter().map(|m| m.id).collect();
         assert!(ids.contains(&13), "promoted candidate is present: {ids:?}");
         assert!(ids.contains(&10), "strong base hit is NOT dropped: {ids:?}");
+    }
+
+    #[test]
+    fn multi_hop_gate_triggers_on_cues_and_multi_entity_only() {
+        // Relational/bridge cues → multi-hop.
+        assert!(is_multi_hop_query("what city did Alice move to after the job"));
+        assert!(is_multi_hop_query("the place connected to the trip"));
+        // Two named entities → multi-hop (a relation between proper nouns).
+        assert!(is_multi_hop_query("how do Alice and Bob know each other"));
+        // Single-hop factoid with one entity and no cue → NOT multi-hop (no extra cost).
+        assert!(!is_multi_hop_query("when is Alice's birthday"));
+        assert!(!is_multi_hop_query("what is the capital"));
+    }
+
+    #[test]
+    fn followup_parse_stops_on_done_and_extracts_bridge_query() {
+        assert_eq!(parse_followup_query("DONE"), None);
+        assert_eq!(parse_followup_query("  done  "), None);
+        assert_eq!(parse_followup_query(""), None);
+        // First non-empty line, stripped of quotes/backticks/trailing period.
+        assert_eq!(
+            parse_followup_query("`Caroline new job city`."),
+            Some("Caroline new job city".to_string())
+        );
+        assert_eq!(
+            parse_followup_query("Here is the query:\nAlice employer 2023"),
+            Some("Alice employer 2023".to_string())
+        );
     }
 
     #[test]

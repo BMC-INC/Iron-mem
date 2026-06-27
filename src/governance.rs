@@ -331,9 +331,46 @@ pub fn trust_trajectory_boost(
     weight * ref_term * recency_term
 }
 
+// Wired into the retrieval ranker via `retrieval::apply_tier_boost`, gated by
+// `governance_router.weight` (paper M3 — query-time governance routing).
+/// Governed-retrieval authority boost (#1): a memory's *writer trust tier* —
+/// recorded at write time but, until now, never consulted at query time — nudges
+/// its retrieval rank. User-explicit (`High`) facts outrank machine-`Derived`
+/// (`Medium`) ones on near-ties; `Low`/`Untrusted` writers are pushed down.
+/// Additive and symmetric around `Medium` (the default tier), so undifferentiated
+/// corpora are unaffected. `weight <= 0.0` is a hard no-op (lever off).
+pub fn tier_authority_boost(tier: TrustTier, weight: f64) -> f64 {
+    if weight <= 0.0 {
+        return 0.0;
+    }
+    let scale = match tier {
+        TrustTier::High => 1.0,
+        TrustTier::Medium => 0.0,
+        TrustTier::Low => -1.0,
+        TrustTier::Untrusted => -2.0,
+    };
+    weight * scale
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tier_authority_boost_orders_high_above_low_and_is_gated() {
+        // Off by default (weight 0) regardless of tier.
+        assert_eq!(tier_authority_boost(TrustTier::High, 0.0), 0.0);
+        assert_eq!(tier_authority_boost(TrustTier::Untrusted, 0.0), 0.0);
+        // When on: High > Medium(==0) > Low > Untrusted.
+        let w = 0.05;
+        let high = tier_authority_boost(TrustTier::High, w);
+        let med = tier_authority_boost(TrustTier::Medium, w);
+        let low = tier_authority_boost(TrustTier::Low, w);
+        let unt = tier_authority_boost(TrustTier::Untrusted, w);
+        assert!(high > med && med == 0.0 && med > low && low > unt);
+        assert_eq!(high, w);
+        assert_eq!(unt, -2.0 * w);
+    }
 
     #[test]
     fn trajectory_boost_is_off_when_disabled_or_unreferenced() {

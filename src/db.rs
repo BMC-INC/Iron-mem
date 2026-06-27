@@ -3993,6 +3993,66 @@ pub async fn kinds_for_memories(
     Ok(out)
 }
 
+/// Writer trust-tier per memory id (the #1 governed-retrieval-router signal).
+/// Mirrors `kinds_for_memories`; reads the `trust_tier` column recorded at write
+/// time. Rows with no meta are omitted (the caller treats a missing tier as
+/// `Medium`, the neutral default). String values map via `parse_trust_tier`.
+pub async fn trust_tiers_for(
+    db: &Database,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, String>> {
+    let mut out = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let in_list = ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql =
+        format!("SELECT memory_id, trust_tier FROM memory_meta WHERE memory_id IN ({in_list})");
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql).fetch_all(&db.pool).await?;
+    for r in rows {
+        let id: i64 = r.get("memory_id");
+        if let Some(tier) = r.try_get::<Option<String>, _>("trust_tier").ok().flatten() {
+            out.insert(id, tier);
+        }
+    }
+    Ok(out)
+}
+
+/// Event date (`event_time`) per memory id (the W3.3 temporal-grounding signal).
+/// Mirrors `kinds_for_memories`. Date-stamped at extraction (`compress.rs`); the
+/// `/context` endpoint surfaces it as a field so the answerer reasons over the
+/// actual event date instead of inferring it from prose. Null/empty are omitted.
+pub async fn event_times_for(
+    db: &Database,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, String>> {
+    let mut out = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let in_list = ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql =
+        format!("SELECT memory_id, event_time FROM memory_meta WHERE memory_id IN ({in_list})");
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql).fetch_all(&db.pool).await?;
+    for r in rows {
+        let id: i64 = r.get("memory_id");
+        if let Some(et) = r.try_get::<Option<String>, _>("event_time").ok().flatten() {
+            if !et.trim().is_empty() {
+                out.insert(id, et);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Recent memories filtered by scope. `user`-scope memories are global (the
 /// `project` argument is ignored); `project`-scope returns the project's
 /// memories — including legacy rows with no meta or a null scope, which read as

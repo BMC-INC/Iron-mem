@@ -37,6 +37,66 @@ pub struct Config {
     pub llm_retry: LlmRetryConfig,
     #[serde(default)]
     pub temporal_trust: TemporalTrustConfig,
+    #[serde(default)]
+    pub governance_router: GovernanceRouterConfig,
+    #[serde(default)]
+    pub multi_hop: MultiHopConfig,
+}
+
+/// (W3.1) Iterative multi-hop retrieval. For questions that chain facts across
+/// turns, the retriever runs extra retrieve→reason→re-query hops. Gated to
+/// multi-hop-looking queries only (see `retrieval::is_multi_hop_query`), so
+/// single-hop recall pays no extra latency. `enabled` is overridable at runtime
+/// via `IRONMEM_MULTI_HOP_ENABLED` (0/1) when latency needs to be cut fast.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiHopConfig {
+    #[serde(default = "default_multi_hop_enabled")]
+    pub enabled: bool,
+    /// Total retrieval passes (>=1). 2 = one bridge hop after the first search.
+    #[serde(default = "default_multi_hop_max_hops")]
+    pub max_hops: usize,
+}
+
+impl Default for MultiHopConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_multi_hop_enabled(),
+            max_hops: default_multi_hop_max_hops(),
+        }
+    }
+}
+
+fn default_multi_hop_enabled() -> bool {
+    true
+}
+
+fn default_multi_hop_max_hops() -> usize {
+    2
+}
+
+/// (#1) Governed retrieval router (paper M3): the writer trust-tier recorded on
+/// every memory becomes a query-time ranking signal, so user-explicit (`High`)
+/// facts outrank machine-derived (`Medium`) ones and `Low`/`Untrusted` writers
+/// are demoted. Additive and symmetric around `Medium`, so it only reorders
+/// near-ties. See `governance::tier_authority_boost`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceRouterConfig {
+    /// Authority weight added to a candidate's retrieval score by writer tier.
+    /// 0.0 = off. Defaults to a conservative on-value (matches `temporal_trust`).
+    #[serde(default = "default_router_weight")]
+    pub weight: f64,
+}
+
+impl Default for GovernanceRouterConfig {
+    fn default() -> Self {
+        Self {
+            weight: default_router_weight(),
+        }
+    }
+}
+
+fn default_router_weight() -> f64 {
+    0.05
 }
 
 /// Temporal trust trajectory as a retrieval signal (paper Finding 4: "standard
@@ -50,8 +110,10 @@ pub struct Config {
 pub struct TemporalTrustConfig {
     /// Multiplier on the trajectory boost added to a candidate's retrieval score.
     /// 0.0 = off. Small values (≈0.05–0.15) nudge recently-validated, frequently-
-    /// referenced memories up without overriding semantic relevance.
-    #[serde(default)]
+    /// referenced memories up without overriding semantic relevance. Defaults to a
+    /// conservative on-value so the trust trajectory actually shapes ranking; the
+    /// base reciprocal-rank term stays dominant, so it only reorders near-ties.
+    #[serde(default = "default_trust_weight")]
     pub weight: f64,
     /// Half-life (days) for the recency term: a memory last validated this many
     /// days ago contributes half the recency boost of one validated just now.
@@ -71,12 +133,16 @@ pub struct TemporalTrustConfig {
 impl Default for TemporalTrustConfig {
     fn default() -> Self {
         Self {
-            weight: 0.0,
+            weight: default_trust_weight(),
             recency_halflife_days: default_trust_halflife_days(),
             ref_saturation: default_trust_ref_saturation(),
             temporal_event_fusion_weight: default_temporal_event_fusion_weight(),
         }
     }
+}
+
+fn default_trust_weight() -> f64 {
+    0.05
 }
 
 fn default_trust_halflife_days() -> f64 {
@@ -289,11 +355,22 @@ impl Default for Config {
             rerank: RerankConfig::default(),
             llm_retry: LlmRetryConfig::default(),
             temporal_trust: TemporalTrustConfig::default(),
+            governance_router: GovernanceRouterConfig::default(),
+            multi_hop: MultiHopConfig::default(),
         }
     }
 }
 
 impl Config {
+    /// Whether iterative multi-hop retrieval is active. `IRONMEM_MULTI_HOP_ENABLED`
+    /// (0/1/true/false/on/off) overrides the configured default at runtime.
+    pub fn multi_hop_enabled(&self) -> bool {
+        match std::env::var("IRONMEM_MULTI_HOP_ENABLED") {
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+            Err(_) => self.multi_hop.enabled,
+        }
+    }
+
     pub fn effective_database_url(&self) -> String {
         std::env::var("DATABASE_URL")
             .ok()

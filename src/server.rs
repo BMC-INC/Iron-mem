@@ -50,14 +50,27 @@ impl AppState {
 }
 
 pub fn router(state: AppState) -> Router {
-    // Install retrieval tuning once from config (B temporal-fusion weight + #5
-    // temporal-trust). Defaults (fusion weight 1, trust weight 0.0) reproduce the
-    // pre-lever ranker exactly, so this is a no-op unless settings.json opts in.
+    // Install retrieval tuning once from config (B temporal-fusion weight, #5
+    // temporal-trust, #1 governance router). Env vars override settings.json so a
+    // weight can be A/B-tuned at deploy time without editing config or rebuilding.
+    let env_f64 = |key: &str, fallback: f64| {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(fallback)
+    };
     crate::retrieval::set_retrieval_tuning(crate::retrieval::RetrievalTuning {
         temporal_fusion_weight: state.config.temporal_trust.temporal_event_fusion_weight,
-        trust_weight: state.config.temporal_trust.weight,
+        trust_weight: env_f64(
+            "IRONMEM_TEMPORAL_TRUST_WEIGHT",
+            state.config.temporal_trust.weight,
+        ),
         trust_halflife_days: state.config.temporal_trust.recency_halflife_days,
         trust_ref_saturation: state.config.temporal_trust.ref_saturation,
+        tier_weight: env_f64(
+            "IRONMEM_GOVERNANCE_ROUTER_WEIGHT",
+            state.config.governance_router.weight,
+        ),
     });
     Router::new()
         .route("/session/start", post(session_start))
@@ -815,6 +828,43 @@ fn truthy(v: &Option<String>) -> Option<bool> {
 pub struct ContextResponse {
     pub memories: Vec<db::Memory>,
     pub expansions: Vec<ContextExpansion>,
+    /// (W3.3) Event date per memory id (ISO-ish, from `event_time`), so the
+    /// answerer reads the date as a field instead of inferring it from prose.
+    /// Only memories that carry a date appear here.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub event_times: std::collections::HashMap<i64, String>,
+}
+
+/// (W1.3) Lost-in-the-middle mitigation: re-order rank-sorted memories (best
+/// first) into a U-shape — the strongest items at the FRONT and BACK, weakest in
+/// the middle — since LLMs attend most to the ends of a context window. Pairs
+/// with a near-duplicate filter so repeated facts don't crowd the salient ends.
+fn u_shaped_order<T>(items: Vec<T>) -> Vec<T> {
+    let mut front: Vec<T> = Vec::with_capacity(items.len());
+    let mut back: std::collections::VecDeque<T> = std::collections::VecDeque::new();
+    for (i, it) in items.into_iter().enumerate() {
+        if i % 2 == 0 {
+            front.push(it);
+        } else {
+            back.push_front(it);
+        }
+    }
+    front.extend(back);
+    front
+}
+
+/// Drop near-duplicate memories by a normalized summary key (lowercased,
+/// whitespace-collapsed), keeping the highest-ranked occurrence.
+fn dedup_by_summary(memories: Vec<db::Memory>) -> Vec<db::Memory> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(memories.len());
+    for m in memories {
+        let key: String = m.summary.split_whitespace().collect::<Vec<_>>().join(" ");
+        if seen.insert(key.to_lowercase()) {
+            out.push(m);
+        }
+    }
+    out
 }
 
 #[derive(Serialize)]
@@ -836,9 +886,32 @@ async fn get_context(
             .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
     );
 
+    let ranked_query = matches!(&params.query, Some(q) if !q.is_empty());
     let memories = match &params.query {
         Some(q) if !q.is_empty() => {
-            if rerank_on {
+            if rerank_on
+                && state.config.multi_hop_enabled()
+                && retrieval::is_multi_hop_query(q)
+            {
+                // (W3.1) Multi-hop question → iterative retrieve→reason→re-query.
+                // Gated to multi-hop-looking queries so single-hop pays no extra
+                // latency; degrades to a single reranked pass on any failure. An
+                // explicit ?pool= override is threaded through every hop.
+                retrieval::iterative_rerank_search_in_namespace(
+                    &state.db,
+                    state.embedder.as_deref(),
+                    state.store.as_ref(),
+                    &state.config,
+                    &namespace,
+                    Some(&params.project),
+                    q,
+                    limit as usize,
+                    state.config.multi_hop.max_hops,
+                    params.pool,
+                )
+                .await
+                .unwrap_or_default()
+            } else if rerank_on {
                 // Re-anchored reranked retrieval: protect the base@limit ordering
                 // (FTS-strong temporal answers) while letting the LLM promote
                 // buried wide-pool answers. Failure falls back to base order.
@@ -866,10 +939,25 @@ async fn get_context(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
 
+    // (W1.3) For ranked (query) results only: drop near-duplicate facts, then
+    // U-shape the order so the most-relevant memories sit at the ends of the
+    // answerer's context. The recent-memories fallback stays in chronological
+    // order (reordering it would be wrong).
+    let memories = if ranked_query {
+        u_shaped_order(dedup_by_summary(memories))
+    } else {
+        memories
+    };
+
     let memory_ids: Vec<i64> = memories.iter().map(|m| m.id).collect();
     let chunks = db::chunks_for_memories(&state.db, &memory_ids)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // (W3.3) Surface event dates as fields so the answerer reads the date instead
+    // of inferring it from prose. Best-effort: a fetch failure just omits dates.
+    let event_times = db::event_times_for(&state.db, &memory_ids)
+        .await
+        .unwrap_or_default();
     let expansions = memory_ids
         .into_iter()
         .map(|memory_id| ContextExpansion {
@@ -881,6 +969,7 @@ async fn get_context(
     Ok(Json(ContextResponse {
         memories,
         expansions,
+        event_times,
     }))
 }
 
