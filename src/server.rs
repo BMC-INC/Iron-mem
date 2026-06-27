@@ -1022,6 +1022,8 @@ pub struct StatusResponse {
     pub ccr: serde_json::Value,
     /// Per-governance-operation cost (paper RQ5): count / avg_us / max_us.
     pub governance_cost: serde_json::Value,
+    /// Rerank backend and cross-encoder readiness (Wave 4).
+    pub rerank: serde_json::Value,
 }
 
 async fn get_status(
@@ -1041,6 +1043,10 @@ async fn get_status(
         db_path: state.config.db_path.clone(),
         ccr: stats.ccr_json(),
         governance_cost: crate::metrics::snapshot(),
+        rerank: serde_json::json!({
+            "backend": state.config.rerank.backend,
+            "cross_encoder_ready": crate::reranker::is_ready(),
+        }),
     }))
 }
 

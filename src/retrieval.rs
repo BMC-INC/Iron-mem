@@ -855,6 +855,20 @@ fn build_rerank_prompt(query: &str, candidates: &[Memory]) -> String {
     s
 }
 
+/// Candidate text for the cross-encoder: the leading content of the summary
+/// (plus tags), trimmed to the same budget the LLM reranker's snippet uses so
+/// the two backends judge the same evidence.
+fn rerank_doc(m: &Memory) -> String {
+    let mut doc: String = m.summary.chars().take(RERANK_SNIPPET_CHARS).collect();
+    if let Some(tags) = m.tags.as_deref() {
+        if !tags.is_empty() {
+            doc.push(' ');
+            doc.push_str(tags);
+        }
+    }
+    doc.replace('\n', " ")
+}
+
 /// Parse a rerank reply into 0-based candidate positions. Pulls integer runs in
 /// order, maps 1-based → 0-based, and drops out-of-range and duplicate indices.
 /// Tolerant of stray prose/years: only valid candidate numbers survive.
@@ -1014,6 +1028,22 @@ pub async fn rerank_search_in_namespace_with_pool(
     let wide =
         hybrid_search_in_namespace(db, embedder, store, namespace, project, query, pool).await?;
     let candidates = reanchor(narrow, wide);
+    // (Wave 4) Cross-encoder rerank when selected and its model is loaded. On any
+    // unavailability `rerank_order` returns None and we keep the LLM reranker, so
+    // selecting the cross-encoder can only help. `fuse_rerank` preserves recall
+    // (a base candidate omitted by the order is still appended), identical to the
+    // LLM path's guarantee.
+    if config.rerank.backend.eq_ignore_ascii_case("cross_encoder") {
+        // Score only the top-N of the reanchored pool (CPU cost is linear in N);
+        // `fuse_rerank` keeps the un-scored tail in base order, so recall is
+        // preserved even though the cross-encoder never saw it.
+        let cap = config.rerank.cross_encoder_max_candidates.max(limit);
+        let head = candidates.len().min(cap);
+        let docs: Vec<String> = candidates[..head].iter().map(rerank_doc).collect();
+        if let Some(order) = crate::reranker::rerank_order(query, &docs) {
+            return Ok(fuse_rerank(&candidates, &order, limit));
+        }
+    }
     Ok(llm_rerank(config, query, candidates, limit).await)
 }
 

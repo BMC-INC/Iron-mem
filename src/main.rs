@@ -18,6 +18,7 @@ mod metrics;
 mod profile;
 mod provider;
 mod reflection;
+mod reranker;
 mod retrieval;
 mod server;
 mod snapshot;
@@ -682,7 +683,15 @@ async fn async_main() -> Result<()> {
     Ok(())
 }
 
-async fn run_server(cfg: config::Config) -> Result<()> {
+async fn run_server(mut cfg: config::Config) -> Result<()> {
+    // (Wave 4) Env overrides let the cross-encoder rerank backend be selected
+    // without editing settings.json (e.g. for an A/B against the LLM reranker).
+    if let Ok(b) = std::env::var("IRONMEM_RERANK_BACKEND") {
+        cfg.rerank.backend = b;
+    }
+    if let Ok(m) = std::env::var("IRONMEM_RERANK_CROSS_ENCODER_MODEL") {
+        cfg.rerank.cross_encoder_model = m;
+    }
     let db_url = cfg.effective_database_url();
     let database = db::Database::new(&db_url).await?;
     database.migrate().await?;
@@ -695,6 +704,13 @@ async fn run_server(cfg: config::Config) -> Result<()> {
     tracing::info!("ironmem REST server listening on http://{}", addr);
 
     let (embedder, store) = vectorstore::build_semantic(&rest_db, &rest_cfg).await;
+    // (Wave 4) Load the cross-encoder reranker once at startup if selected. The
+    // load is blocking (model download + ONNX init); on failure the rerank path
+    // falls back to the LLM reranker.
+    if rest_cfg.rerank.backend.eq_ignore_ascii_case("cross_encoder") {
+        let model = rest_cfg.rerank.cross_encoder_model.clone();
+        let _ = tokio::task::spawn_blocking(move || crate::reranker::init(&model)).await;
+    }
     let state = server::AppState {
         db: (*rest_db).clone(),
         config: rest_cfg,

@@ -177,6 +177,21 @@ pub struct RerankConfig {
     /// answer memory into the top results).
     #[serde(default = "default_rerank_pool")]
     pub pool: usize,
+    /// Rerank backend: "llm" (generative reorder, default) or "cross_encoder"
+    /// (on-device ONNX cross-encoder via fastembed — stable calibrated scores).
+    /// The cross-encoder falls back to the LLM reranker if its model can't load.
+    #[serde(default = "default_rerank_backend")]
+    pub backend: String,
+    /// Cross-encoder model id when `backend = "cross_encoder"`
+    /// (e.g. "bge-reranker-v2-m3", "bge-reranker-base").
+    #[serde(default = "default_cross_encoder_model")]
+    pub cross_encoder_model: String,
+    /// Max candidates the cross-encoder scores per query. Reranking the full wide
+    /// pool (~100+) on CPU is slow; capping to the top-N by base rank keeps the
+    /// per-query cost bounded while still covering most buried answers. The tail
+    /// beyond N keeps its base order (recall-safe).
+    #[serde(default = "default_cross_encoder_max_candidates")]
+    pub cross_encoder_max_candidates: usize,
 }
 
 impl Default for RerankConfig {
@@ -185,8 +200,23 @@ impl Default for RerankConfig {
             enabled: false,
             model: default_rerank_model(),
             pool: default_rerank_pool(),
+            backend: default_rerank_backend(),
+            cross_encoder_model: default_cross_encoder_model(),
+            cross_encoder_max_candidates: default_cross_encoder_max_candidates(),
         }
     }
+}
+
+fn default_rerank_backend() -> String {
+    "llm".to_string()
+}
+
+fn default_cross_encoder_model() -> String {
+    "bge-reranker-v2-m3".to_string()
+}
+
+fn default_cross_encoder_max_candidates() -> usize {
+    64
 }
 
 fn default_rerank_model() -> String {
