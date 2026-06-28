@@ -41,6 +41,8 @@ pub struct Config {
     pub governance_router: GovernanceRouterConfig,
     #[serde(default)]
     pub multi_hop: MultiHopConfig,
+    #[serde(default)]
+    pub auto_dream: AutoDreamConfig,
 }
 
 /// (W3.1) Iterative multi-hop retrieval. For questions that chain facts across
@@ -72,6 +74,38 @@ fn default_multi_hop_enabled() -> bool {
 
 fn default_multi_hop_max_hops() -> usize {
     2
+}
+
+/// (#3) Heuristic auto-dream trigger. When enabled, a background watcher fires a
+/// consolidation + synthesis pass for a project after it has been idle past the
+/// gap threshold. Opt-in (default OFF) and intentionally thin: one signal (idle
+/// gap), ledgered with a trigger_reason. Volume triggers and depth scaling are
+/// deliberately deferred.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoDreamConfig {
+    #[serde(default = "default_auto_dream_enabled")]
+    pub enabled: bool,
+    /// Idle minutes after a project's last activity before a consolidation pass
+    /// is triggered.
+    #[serde(default = "default_auto_dream_gap_minutes")]
+    pub gap_minutes: u32,
+}
+
+impl Default for AutoDreamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_auto_dream_enabled(),
+            gap_minutes: default_auto_dream_gap_minutes(),
+        }
+    }
+}
+
+fn default_auto_dream_enabled() -> bool {
+    false
+}
+
+fn default_auto_dream_gap_minutes() -> u32 {
+    15
 }
 
 /// (#1) Governed retrieval router (paper M3): the writer trust-tier recorded on
@@ -387,6 +421,7 @@ impl Default for Config {
             temporal_trust: TemporalTrustConfig::default(),
             governance_router: GovernanceRouterConfig::default(),
             multi_hop: MultiHopConfig::default(),
+            auto_dream: AutoDreamConfig::default(),
         }
     }
 }

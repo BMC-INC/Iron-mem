@@ -1924,6 +1924,11 @@ pub const MEMORY_KINDS: &[&str] = &[
     // as their own searchable memories so dates/names/quantities survive and
     // resolve on direct lookup (see compress::persist).
     "fact",
+    // Inferred facts derived by the dreaming/synthesis pass from 2+ source
+    // memories. Governed (source_type=derived, trust=medium) and QUARANTINED
+    // from default retrieval (see retrieval::exclude_derived); surfaced only on
+    // explicit request, with a `derives` provenance edge back to each source.
+    "inference",
 ];
 
 /// Clamp an arbitrary kind string to the known set, case-insensitively.

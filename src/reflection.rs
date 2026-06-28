@@ -357,20 +357,65 @@ pub async fn synthesize(
             report.derived += derived.len();
             continue;
         }
+        // Primary source for the governance parent link; the full source set is
+        // captured as `derives` edges + a ledger entry below.
+        let primary_source = group.first().map(|m| m.id).unwrap_or(0);
+        let source_ids: Vec<i64> = group.iter().map(|m| m.id).collect();
         for fact in &derived {
-            let id = crate::compress::remember(
+            // Govern the derived memory: source_type=derived, trust=medium,
+            // writer="ironmem:derive", and kind="inference" so it is QUARANTINED
+            // from default retrieval (retrieval::exclude_derived) until a caller
+            // explicitly asks for derived memories.
+            let governance = crate::governance::MemoryGovernance::derived_from(primary_source);
+            let id = crate::compress::remember_with_governance(
                 db,
                 embedder,
                 store,
                 project_for_write,
                 "project",
-                "fact",
+                "inference",
                 fact,
                 Some("synthesized,derived"),
+                governance,
             )
             .await?;
             report.derived_ids.push(id);
             report.derived += 1;
+
+            // Provenance: a `derives` edge from each source memory to the derived
+            // memory. memory_edges is an entity graph, so memories are addressed
+            // as `memory:{id}` nodes — queryable via memory_edges_for_memory(id).
+            for &src in &source_ids {
+                let edge = db::NewMemoryEdge {
+                    project: project_for_write.to_string(),
+                    memory_id: id,
+                    source: format!("memory:{src}"),
+                    relation: "derives".to_string(),
+                    target: format!("memory:{id}"),
+                    valid_from: None,
+                    valid_until: None,
+                    confidence: 0.5,
+                };
+                let _ = db::insert_memory_edge(db, &edge).await;
+            }
+
+            // Tamper-evident ledger entry recording the inference and its
+            // sources, so any derived fact can be traced back to its evidence.
+            let payload = serde_json::json!({
+                "derived_memory_id": id,
+                "source_memory_ids": source_ids,
+                "fact": fact,
+            })
+            .to_string();
+            let _ = db::append_memory_ledger(
+                db,
+                crate::governance::DEFAULT_NAMESPACE,
+                Some(id),
+                "derive",
+                Some("ironmem:derive"),
+                &payload,
+            )
+            .await;
         }
         // Reinforce the sources: positive feedback bumps trust_ref_count +
         // trust_last_validated_at (the #5 signal), so facts that corroborated a

@@ -1468,6 +1468,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn derived_memories_are_quarantined_from_retrieval() {
+        let (server, path) = test_server().await;
+        let proj = "/tmp/projQ";
+
+        // A normal memory and a derived (kind="inference") memory share a term.
+        let mut a = JsonObject::new();
+        a.insert("project".into(), serde_json::json!(proj));
+        a.insert(
+            "text".into(),
+            serde_json::json!("zorptamine lowers blood pressure"),
+        );
+        let va: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_remember(&a).await.unwrap())).unwrap();
+        let normal_id = va["memory_id"].as_i64().unwrap();
+
+        let mut b = JsonObject::new();
+        b.insert("project".into(), serde_json::json!(proj));
+        b.insert(
+            "text".into(),
+            serde_json::json!("zorptamine therefore cures hypertension"),
+        );
+        b.insert("kind".into(), serde_json::json!("inference"));
+        let vb: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_remember(&b).await.unwrap())).unwrap();
+        // The new kind survives clamp_kind (else it would collapse to "session").
+        assert_eq!(vb["kind"], "inference");
+        let derived_id = vb["memory_id"].as_i64().unwrap();
+
+        // Default retrieval surfaces the normal memory but quarantines the derived one.
+        let mut q = JsonObject::new();
+        q.insert("project".into(), serde_json::json!(proj));
+        q.insert("query".into(), serde_json::json!("zorptamine"));
+        let res: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_search_memories(&q).await.unwrap()))
+                .unwrap();
+        let ids: Vec<i64> = res["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_i64())
+            .collect();
+        assert!(ids.contains(&normal_id), "normal memory is retrievable");
+        assert!(
+            !ids.contains(&derived_id),
+            "derived (inference) memory is quarantined from default retrieval"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn get_and_refresh_profile_tools() {
         // Use a provider whose key resolves from the env only (no ~/.ironmem
         // file fallback) and leave it unset, so refresh uses the deterministic

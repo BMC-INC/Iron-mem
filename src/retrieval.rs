@@ -754,6 +754,11 @@ pub async fn hybrid_search_in_namespace(
     // No-op (and zero DB cost) unless governance_router.weight > 0.
     let candidates = apply_tier_boost(db, candidates).await?;
 
+    // Quarantine derived inferences (kind="inference") from default retrieval:
+    // a wrong inference that ranked high would poison the answer. They stay
+    // reachable on demand via the governance/edge APIs (see exclude_derived).
+    let candidates = exclude_derived(db, candidates).await?;
+
     // Narrative-reserve quota, then materialize in rank order (reusing FTS rows).
     let chosen = reserve_narrative_slots(db, &candidates, limit).await?;
     let mut out = Vec::with_capacity(chosen.len());
@@ -816,6 +821,23 @@ async fn reserve_narrative_slots(
         .collect();
     chosen.sort_by_key(|id| rank[id]);
     Ok(chosen)
+}
+
+/// Quarantine derived inferences (`kind="inference"`) from default retrieval.
+/// Derived memories are LLM inferences; a wrong one that ranked high would
+/// poison every downstream answer, so they never enter the candidate set the
+/// answerer sees. They remain reachable on demand via the governance/edge APIs.
+/// A missing kind (legacy/no-meta row) is kept — only an explicit `inference`
+/// kind is excluded.
+async fn exclude_derived(db: &Database, candidates: Vec<i64>) -> Result<Vec<i64>> {
+    if candidates.is_empty() {
+        return Ok(candidates);
+    }
+    let kinds = db::kinds_for_memories(db, &candidates).await?;
+    Ok(candidates
+        .into_iter()
+        .filter(|id| kinds.get(id).map(|k| k != "inference").unwrap_or(true))
+        .collect())
 }
 
 // ── LLM reranking ───────────────────────────────────────────────────
