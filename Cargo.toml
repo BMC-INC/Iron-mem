@@ -58,10 +58,13 @@ sqlite-vec = "0.1"
 # Must match the libsqlite3-sys that sqlx 0.8 bundles (0.30.x) so there is ONE statically linked sqlite.
 libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 fastembed = { version = "4", optional = true }
+ort = { version = "=2.0.0-rc.9", features = ["cuda"], optional = true }
 
 [features]
 default = []
 local-onnx = ["dep:fastembed"]
+# Wave 4 cross-encoder on GPU: local-onnx + ort's CUDA execution provider.
+gpu = ["local-onnx", "dep:ort"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
