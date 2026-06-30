@@ -62,6 +62,9 @@
 - **User profile** — cross-project memories are distilled into a single always-injected profile (LLM summary, or deterministic local rollup when offline). Read/regenerate with **`get_profile`** / **`refresh_profile`**.
 - **Correction miner** — error→fix loops in a session (a failing command, edits, then the same command passing) are mined into `error_solution` memories and surfaced via **`list_corrections`**, so past fixes resurface when the work recurs.
 - **21 MCP tools** now — including `memory_skim`, `retrieve_original`, `remember`, `get_profile`, `refresh_profile`, `list_corrections`, `memory_graph`, and `reconcile_memory_graph`.
+- **Benchmarked on LoCoMo:** 68.4% overall (Gemini 2.5 Pro answerer + Pro judge, 1,540 scored questions, 0 errors) with governance-off retrieval, +2.1 points over the governed baseline. Full harness, result files, and reproduction: **[ironmem-locomo-benchmark](https://github.com/BMC-INC/ironmem-locomo-benchmark)**. See [Benchmarks](#benchmarks).
+- **External storage adapters:** a `StorageBackend` trait with a HYBRID mode lets vector and graph layers run on real external backends (Qdrant over HTTP for vectors, Neo4j for the graph) instead of only the embedded SQLite store, while keeping the native path the default.
+- **Retrieval + governance instrumentation:** governance-cost timings in `/status`, a temporal-trust trajectory signal, a compression coverage pass, and the path-to-70 retrieval batch (routed fusion, pool/context tuning, multi-hop and date handling).
 - **Current verification:** `cargo test --bin ironmem` passes **160 tests** with **1 ignored benchmark**, `cargo test --test mcp_stdio_clean` passes, and `cargo clippy --bin ironmem -- -D warnings` is clean.
 - **Still zero telemetry. Still local-first. Your data stays yours.**
 
@@ -246,6 +249,21 @@ Retrieval is routed by query shape:
 - **Skim/expand workflows** use `memory_skim` or `/skim` first, then `retrieve_original` with a `chunk_id` for exact transcript evidence.
 
 This is intentionally model-agnostic. The durable store is hard-token, structured, and auditable, so Claude, Codex, Operator OS, desktop clients, and remote MCP clients can share the same backing memory.
+
+---
+
+## Benchmarks
+
+IronMem is evaluated on [LoCoMo](https://github.com/snap-research/locomo) (Maharana et al., ACL 2024), a long-term conversational memory benchmark. The full harness, result files, and reproduction steps live in a dedicated repo: **[ironmem-locomo-benchmark](https://github.com/BMC-INC/ironmem-locomo-benchmark)**.
+
+Headline (Gemini 2.5 Pro answerer + Pro judge, hybrid retrieval, pool 100, retrieve-limit 25, v2 answer prompt, 1,986 questions of which 1,540 are scored, 0 errors):
+
+| Configuration | Overall | single_hop | multi_hop | temporal | open_domain |
+|---|---|---|---|---|---|
+| Governed (trust-tier ranking on) | 66.3% | 69.0% | 50.0% | 77.9% | 52.1% |
+| **Governance-off (pure relevance ranking)** | **68.4%** | 72.1% | 52.5% | 78.2% | 50.0% |
+
+Setting the writer-tier and temporal-trust retrieval weights to 0 (ranking on pure relevance) scores **68.4%**, **+2.1 points** over the governed configuration. Governance metadata (writer identity, trust tier, provenance, ledger) is still recorded and queryable on every memory; the finding is only that letting trust tier tilt retrieval ranking was net-negative on this benchmark. The benchmark repo has the per-category analysis, second-judge agreement (Cohen's kappa 0.88), and the documented path past 70%.
 
 ---
 
@@ -930,10 +948,16 @@ This starts IronMem with Streamable HTTP on `http://localhost:37779/mcp` and Pos
 - [x] **Operator OS adapter + eval harness** — `docs/operator-os-memory-adapter.md` defines tenant/worker/work-item memory mapping, and `ironmem eval` writes repeatable graph/temporal/procedural eval reports with command, model, and commit metadata.
 - [x] **Closed-loop quality + curation** — usage feedback and injection events adjust ranking; the Web UI can inspect graph edges and mark hallucinated links as user-deleted.
 - [x] **AST-bound memory + reflection + time travel + sync** — Tree-sitter Rust code anchors, dry-run/apply reflection proposals, CCR-backed snapshots, and an idempotent sync event log are implemented.
+- [x] **External storage adapters (#4):** a `StorageBackend` trait with native / vector / graph backends and a HYBRID mode; real Qdrant (vector) and Neo4j (graph) adapters over HTTP, with the native SQLite path remaining the default.
+- [x] **Governance cost instrumentation + temporal-trust trajectory:** per-operation governance timings in `/status`, a temporal-trust ranking signal, and a compression coverage pass that roughly doubles retained facts per session.
+- [x] **Path-to-70 retrieval batch:** routed weighted fusion (#1 router), pool and context-window tuning, multi-hop follow-up, per-fact date handling, and transitive synthesis (Track B).
+- [x] **LoCoMo benchmark:** public reproduction harness scoring 68.4% governance-off (Pro-judged); see [Benchmarks](#benchmarks) and [ironmem-locomo-benchmark](https://github.com/BMC-INC/ironmem-locomo-benchmark).
+- [x] **Experimental on-device cross-encoder reranker:** ONNX cross-encoder backend (off by default; on LoCoMo it currently trails the LLM reranker, see the benchmark repo).
 - [x] **Current verification** — 160 Rust tests pass, 1 benchmark is intentionally ignored, standalone MCP stdio cleanliness passes, and clippy is clean with `-D warnings`.
 
 ### Next
 
+- [ ] **Structured-evidence reranking:** rerank atomic facts, event dates, speakers, and source turn ids instead of truncated document text (the LoCoMo path past 70%)
 - [ ] **Bespoke per-content-type transforms** — invertible log timestamp-delta / diff-token / AST-aware code normalization on top of the dictionary codecs (currently documented-future; the byte-exact contract is the gate)
 - [ ] **Observation-blob lifecycle GC** — reclaim CCR blobs behind deleted observations (memory-session blobs are already GC'd)
 
