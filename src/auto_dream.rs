@@ -2,8 +2,8 @@
 //!
 //! When `auto_dream.enabled`, a thin background watcher periodically scans
 //! projects and, for any idle longer than `gap_minutes`, fires a consolidation
-//! + synthesis pass — the same work `dream_memory` does with `apply=true`. Every
-//! auto-triggered pass is recorded in the governance ledger with a
+//! and synthesis pass, the same work `dream_memory` does with `apply=true`.
+//! Every auto-triggered pass is recorded in the governance ledger with a
 //! `trigger_reason`, so it is auditable; that auditability is the differentiator
 //! over a black-box "dreaming" system. One signal only (idle gap); volume
 //! triggers and depth scaling are deliberately deferred.
