@@ -1,3 +1,4 @@
+mod auto_dream;
 mod ccr;
 mod code_anchor;
 mod compress;
@@ -711,6 +712,18 @@ async fn run_server(mut cfg: config::Config) -> Result<()> {
         let model = rest_cfg.rerank.cross_encoder_model.clone();
         let _ = tokio::task::spawn_blocking(move || crate::reranker::init(&model)).await;
     }
+    // (#3) Clone handles for the auto-dream watcher before embedder/store move
+    // into AppState (cheap Arc clones; only when the feature is enabled).
+    let auto_dream_handles = if cfg.auto_dream.enabled {
+        Some((
+            (*rest_db).clone(),
+            cfg.clone(),
+            embedder.clone(),
+            store.clone(),
+        ))
+    } else {
+        None
+    };
     let state = server::AppState {
         db: (*rest_db).clone(),
         config: rest_cfg,
@@ -730,6 +743,13 @@ async fn run_server(mut cfg: config::Config) -> Result<()> {
             if let Err(e) = mcp::run_streamable_http(sse_db, sse_cfg, sse_addr).await {
                 tracing::error!("MCP Streamable HTTP server error: {}", e);
             }
+        });
+    }
+
+    // (#3) Heuristic auto-dream watcher (opt-in via auto_dream.enabled).
+    if let Some((dream_db, dream_cfg, dream_embedder, dream_store)) = auto_dream_handles {
+        tokio::spawn(async move {
+            auto_dream::watch(dream_db, dream_cfg, dream_embedder, dream_store).await;
         });
     }
 

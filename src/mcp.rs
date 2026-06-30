@@ -256,6 +256,7 @@ impl IronMemServer {
                         "scope": { "type": "string", "description": "'project' (default) or 'user' (cross-project)" },
                         "kind": { "type": "string", "description": "session | error_solution | preference | architecture | learned_pattern | project_config | profile (default preference)" },
                         "tags": { "type": "string", "description": "Optional space-separated keywords" },
+                        "event_at": { "type": "string", "description": "Optional ISO date YYYY-MM-DD (or range YYYY-MM-DD..YYYY-MM-DD) of when the described event actually occurred or will occur. This is the event/valid time, distinct from the storage time (created_at). Powers time-aware retrieval." },
                         "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
                         "source_type": { "type": "string", "description": "user_input | tool_output | agent_generated | derived | external | sync_peer" },
                         "trust_tier": { "type": "string", "description": "high | medium | low | untrusted" },
@@ -498,6 +499,18 @@ impl IronMemServer {
         )]))
     }
 
+    /// Dual-naming surfacing: build the `event_times` side map (memory id ->
+    /// event/valid date), mirroring the HTTP /context response so the read
+    /// tools expose when an event happened alongside created_at (when it was
+    /// stored). Empty object when no returned memory carries an event date.
+    async fn event_times_map(&self, memories: &[db::Memory]) -> serde_json::Value {
+        let ids: Vec<i64> = memories.iter().map(|m| m.id).collect();
+        let map = db::event_times_for(&self.db, &ids)
+            .await
+            .unwrap_or_default();
+        serde_json::to_value(map).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
     async fn handle_get_context(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
         let project = args
             .get("project")
@@ -535,7 +548,9 @@ impl IronMemServer {
             })
             .collect();
 
-        let json = serde_json::json!({ "memories": memories, "expansions": expansions });
+        let event_times = self.event_times_map(&memories).await;
+        let json =
+            serde_json::json!({ "memories": memories, "expansions": expansions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -556,7 +571,14 @@ impl IronMemServer {
         let chunks = db::recent_memory_chunks_in_namespace(&self.db, &namespace, project, limit)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        let json = serde_json::json!({ "chunks": chunks });
+        let mem_ids: Vec<i64> = chunks.iter().map(|c| c.memory_id).collect();
+        let event_times = serde_json::to_value(
+            db::event_times_for(&self.db, &mem_ids)
+                .await
+                .unwrap_or_default(),
+        )
+        .unwrap_or_else(|_| serde_json::json!({}));
+        let json = serde_json::json!({ "chunks": chunks, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -594,7 +616,8 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let json = serde_json::json!({ "memories": memories });
+        let event_times = self.event_times_map(&memories).await;
+        let json = serde_json::json!({ "memories": memories, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -618,7 +641,8 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let json = serde_json::json!({ "memories": memories });
+        let event_times = self.event_times_map(&memories).await;
+        let json = serde_json::json!({ "memories": memories, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -638,7 +662,8 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let json = serde_json::json!({ "memories": memories });
+        let event_times = self.event_times_map(&memories).await;
+        let json = serde_json::json!({ "memories": memories, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -731,6 +756,23 @@ impl IronMemServer {
             .and_then(|v| v.as_str())
             .unwrap_or("preference");
         let tags = args.get("tags").and_then(|v| v.as_str());
+        // Dual-naming: the caller-supplied event/valid time (when the thing
+        // described happened), distinct from created_at (when we stored it).
+        // Validate up front against the same ISO date/range format the
+        // compressor's WHEN: extraction uses, so an invalid value never creates
+        // an orphan memory.
+        let event_at = args
+            .get("event_at")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(when) = event_at {
+            if !crate::provider::is_valid_memory_date_or_range(when) {
+                return Ok(error_result(
+                    "'event_at' must be an ISO date YYYY-MM-DD or range YYYY-MM-DD..YYYY-MM-DD",
+                ));
+            }
+        }
         let governance = crate::governance::MemoryGovernance {
             namespace: crate::governance::normalize_namespace(
                 args.get("namespace")
@@ -796,12 +838,21 @@ impl IronMemServer {
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
+        // Stamp the event/valid time after creation (validated above). Reuses
+        // the same metadata path the compressor uses for WHEN: extraction.
+        if let Some(when) = event_at {
+            db::set_memory_event_time(&self.db, memory_id, when)
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        }
+
         let json = serde_json::json!({
             "ok": true,
             "memory_id": memory_id,
             "namespace": namespace,
             "scope": db::clamp_scope(scope),
             "kind": db::clamp_kind(kind),
+            "event_at": event_at,
         });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
@@ -1356,6 +1407,113 @@ mod tests {
             serde_json::from_str(&result_text(&server.handle_remember(&bad).await.unwrap()))
                 .unwrap();
         assert_eq!(v2["ok"], false);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tool_list_remember_has_event_at() {
+        let tools = IronMemServer::build_tool_list();
+        let t = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "remember")
+            .expect("remember tool registered");
+        let v = serde_json::to_value(t).unwrap();
+        assert!(
+            v["inputSchema"]["properties"].get("event_at").is_some(),
+            "remember schema exposes event_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_accepts_and_surfaces_event_at() {
+        let (server, path) = test_server().await;
+
+        // Dual-naming write path: store with an explicit event date (valid
+        // time), distinct from created_at (when we stored it).
+        let mut args = JsonObject::new();
+        args.insert("project".into(), serde_json::json!("/tmp/projE"));
+        args.insert("text".into(), serde_json::json!("the acquisition closed"));
+        args.insert("event_at".into(), serde_json::json!("2023-05-07"));
+        let v: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_remember(&args).await.unwrap()))
+                .unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["event_at"], "2023-05-07");
+        let mid = v["memory_id"].as_i64().unwrap();
+
+        // Surfaced back through a read tool as the event_times side map.
+        let mut q = JsonObject::new();
+        q.insert("project".into(), serde_json::json!("/tmp/projE"));
+        let read: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_list_memories(&q).await.unwrap()))
+                .unwrap();
+        assert_eq!(
+            read["event_times"][mid.to_string().as_str()],
+            "2023-05-07",
+            "event date surfaces on the read tool"
+        );
+
+        // An invalid event_at is rejected gracefully (ok:false, not a protocol error).
+        let mut bad = JsonObject::new();
+        bad.insert("project".into(), serde_json::json!("/tmp/projE"));
+        bad.insert("text".into(), serde_json::json!("undated note"));
+        bad.insert("event_at".into(), serde_json::json!("last Friday"));
+        let vbad: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_remember(&bad).await.unwrap()))
+                .unwrap();
+        assert_eq!(vbad["ok"], false);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn derived_memories_are_quarantined_from_retrieval() {
+        let (server, path) = test_server().await;
+        let proj = "/tmp/projQ";
+
+        // A normal memory and a derived (kind="inference") memory share a term.
+        let mut a = JsonObject::new();
+        a.insert("project".into(), serde_json::json!(proj));
+        a.insert(
+            "text".into(),
+            serde_json::json!("zorptamine lowers blood pressure"),
+        );
+        let va: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_remember(&a).await.unwrap())).unwrap();
+        let normal_id = va["memory_id"].as_i64().unwrap();
+
+        let mut b = JsonObject::new();
+        b.insert("project".into(), serde_json::json!(proj));
+        b.insert(
+            "text".into(),
+            serde_json::json!("zorptamine therefore cures hypertension"),
+        );
+        b.insert("kind".into(), serde_json::json!("inference"));
+        let vb: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_remember(&b).await.unwrap())).unwrap();
+        // The new kind survives clamp_kind (else it would collapse to "session").
+        assert_eq!(vb["kind"], "inference");
+        let derived_id = vb["memory_id"].as_i64().unwrap();
+
+        // Default retrieval surfaces the normal memory but quarantines the derived one.
+        let mut q = JsonObject::new();
+        q.insert("project".into(), serde_json::json!(proj));
+        q.insert("query".into(), serde_json::json!("zorptamine"));
+        let res: serde_json::Value =
+            serde_json::from_str(&result_text(&server.handle_search_memories(&q).await.unwrap()))
+                .unwrap();
+        let ids: Vec<i64> = res["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_i64())
+            .collect();
+        assert!(ids.contains(&normal_id), "normal memory is retrievable");
+        assert!(
+            !ids.contains(&derived_id),
+            "derived (inference) memory is quarantined from default retrieval"
+        );
 
         let _ = std::fs::remove_file(path);
     }
