@@ -853,18 +853,6 @@ fn is_synthesized_or_derived(memory: &Memory) -> bool {
     text.contains("synthesized") || text.contains("derived")
 }
 
-fn has_strong_lexical_overlap(query_terms: &HashSet<String>, memory: &Memory) -> bool {
-    if query_terms.is_empty() {
-        return false;
-    }
-    let text_terms = event_text_terms(memory);
-    let overlap = query_terms
-        .iter()
-        .filter(|term| text_terms.contains(*term))
-        .count();
-    overlap >= 2 || (overlap >= 1 && query_terms.len() == 1)
-}
-
 async fn lexical_source_fact_floor_ids(
     db: &Database,
     query: &str,
@@ -881,11 +869,8 @@ async fn lexical_source_fact_floor_ids(
     }
     let ids: Vec<i64> = fts.iter().map(|m| m.id).collect();
     let kinds = db::kinds_for_memories(db, &ids).await?;
-    let mut floor = Vec::with_capacity(slots);
-    for memory in fts {
-        if floor.len() >= slots {
-            break;
-        }
+    let mut scored_floor: Vec<(i64, usize, usize)> = Vec::with_capacity(slots);
+    for (idx, memory) in fts.iter().enumerate() {
         let kind = kinds.get(&memory.id).map(|s| s.as_str());
         if matches!(kind, Some("inference")) {
             continue;
@@ -894,13 +879,24 @@ async fn lexical_source_fact_floor_ids(
             continue;
         }
         let is_fact = matches!(kind, Some("fact"));
-        if (is_fact || is_source_linked(memory))
-            && has_strong_lexical_overlap(&query_terms, memory)
-        {
-            floor.push(memory.id);
+        if !(is_fact || is_source_linked(memory)) {
+            continue;
+        }
+        let text_terms = event_text_terms(memory);
+        let overlap = query_terms
+            .iter()
+            .filter(|term| text_terms.contains(*term))
+            .count();
+        if overlap >= 2 || (overlap >= 1 && query_terms.len() == 1) {
+            scored_floor.push((memory.id, overlap, idx));
         }
     }
-    Ok(floor)
+    scored_floor.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+    Ok(scored_floor
+        .into_iter()
+        .take(slots)
+        .map(|(id, _, _)| id)
+        .collect())
 }
 
 fn promote_source_fact_floor(candidates: &[i64], floor_ids: &[i64], limit: usize) -> Vec<i64> {
