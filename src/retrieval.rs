@@ -31,6 +31,7 @@ const MAX_GRAPH_ENTITIES: usize = 8;
 const GRAPH_EDGES_PER_ENTITY: usize = 12;
 const GRAPH_CHAIN_EDGES_PER_BRIDGE: usize = 6;
 const TEMPORAL_EVENT_POOL: usize = 512;
+const SOURCE_FACT_FLOOR_MAX_SLOTS: usize = 5;
 
 /// Process-wide retrieval tuning, installed once at server startup from `Config`
 /// (config is fixed for the process lifetime). Lets the gated temporal-event
@@ -704,6 +705,7 @@ pub async fn hybrid_search_in_namespace(
     // Candidate ordering: RRF over keyword + any auxiliary signals (semantic,
     // temporal, graph, entity). With no auxiliary signal this is the FTS order.
     let fts_ids: Vec<i64> = fts.iter().map(|m| m.id).collect();
+    let lexical_floor_ids = lexical_source_fact_floor_ids(db, query, &fts, limit).await?;
     let by_id: HashMap<i64, Memory> = fts.into_iter().map(|m| (m.id, m)).collect();
 
     let mut aux: Vec<Vec<i64>> = Vec::new();
@@ -759,7 +761,10 @@ pub async fn hybrid_search_in_namespace(
     // reachable on demand via the governance/edge APIs (see exclude_derived).
     let candidates = exclude_derived(db, candidates).await?;
 
-    // Narrative-reserve quota, then materialize in rank order (reusing FTS rows).
+    // Source-fact retention floor, then narrative-reserve quota, then materialize
+    // in rank order (reusing FTS rows). The floor protects strong exact lexical
+    // evidence from route-fusion demotion without disabling route fusion.
+    let candidates = promote_source_fact_floor(&candidates, &lexical_floor_ids, limit);
     let chosen = reserve_narrative_slots(db, &candidates, limit).await?;
     let mut out = Vec::with_capacity(chosen.len());
     for id in chosen {
@@ -821,6 +826,111 @@ async fn reserve_narrative_slots(
         .collect();
     chosen.sort_by_key(|id| rank[id]);
     Ok(chosen)
+}
+
+fn source_fact_floor_slots(limit: usize) -> usize {
+    if limit == 0 {
+        0
+    } else {
+        (limit / 5).clamp(1, SOURCE_FACT_FLOOR_MAX_SLOTS)
+    }
+}
+
+fn is_source_linked(memory: &Memory) -> bool {
+    let tags = memory.tags.as_deref().unwrap_or("").to_ascii_lowercase();
+    tags.contains("locomo")
+        || tags.contains("source")
+        || tags.contains("fact")
+        || memory.summary.contains("(as of ")
+}
+
+fn is_synthesized_or_derived(memory: &Memory) -> bool {
+    let text = format!(
+        "{} {}",
+        memory.summary.to_ascii_lowercase(),
+        memory.tags.as_deref().unwrap_or("").to_ascii_lowercase()
+    );
+    text.contains("synthesized") || text.contains("derived")
+}
+
+fn has_strong_lexical_overlap(query_terms: &HashSet<String>, memory: &Memory) -> bool {
+    if query_terms.is_empty() {
+        return false;
+    }
+    let text_terms = event_text_terms(memory);
+    let overlap = query_terms
+        .iter()
+        .filter(|term| text_terms.contains(*term))
+        .count();
+    overlap >= 2 || (overlap >= 1 && query_terms.len() == 1)
+}
+
+async fn lexical_source_fact_floor_ids(
+    db: &Database,
+    query: &str,
+    fts: &[Memory],
+    limit: usize,
+) -> Result<Vec<i64>> {
+    let slots = source_fact_floor_slots(limit);
+    if slots == 0 || fts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let query_terms = temporal_event_terms(query);
+    if query_terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<i64> = fts.iter().map(|m| m.id).collect();
+    let kinds = db::kinds_for_memories(db, &ids).await?;
+    let mut floor = Vec::with_capacity(slots);
+    for memory in fts {
+        if floor.len() >= slots {
+            break;
+        }
+        let kind = kinds.get(&memory.id).map(|s| s.as_str());
+        if matches!(kind, Some("inference")) {
+            continue;
+        }
+        if is_synthesized_or_derived(memory) {
+            continue;
+        }
+        let is_fact = matches!(kind, Some("fact"));
+        if (is_fact || is_source_linked(memory))
+            && has_strong_lexical_overlap(&query_terms, memory)
+        {
+            floor.push(memory.id);
+        }
+    }
+    Ok(floor)
+}
+
+fn promote_source_fact_floor(candidates: &[i64], floor_ids: &[i64], limit: usize) -> Vec<i64> {
+    if floor_ids.is_empty() || candidates.len() <= limit || limit == 0 {
+        return candidates.to_vec();
+    }
+    let slots = source_fact_floor_slots(limit);
+    let candidate_set: HashSet<i64> = candidates.iter().copied().collect();
+    let mut promoted = Vec::new();
+    let mut seen = HashSet::new();
+    for &id in floor_ids {
+        if promoted.len() >= slots {
+            break;
+        }
+        if candidate_set.contains(&id) && seen.insert(id) {
+            promoted.push(id);
+        }
+    }
+    if promoted.is_empty() {
+        return candidates.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(candidates.len());
+    out.extend(promoted.iter().copied());
+    for &id in candidates {
+        if seen.insert(id) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 /// Quarantine derived inferences (`kind="inference"`) from default retrieval.
@@ -1443,6 +1553,73 @@ mod tests {
         );
         // Quota is ~40% of 3 ⇒ 1 narrative slot; the other 2 are top facts by rank.
         assert!(chosen.contains(&facts[0]) && chosen.contains(&facts[1]));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn source_fact_floor_keeps_exact_fact_against_narrative_quota() {
+        let (db, path) = seeded_db().await;
+        let s = create_session(&db, "/tmp/p").await.unwrap();
+
+        let fact = insert_memory(
+            &db,
+            "/tmp/p",
+            &s,
+            "Melanie and her kids go to the beach once or twice a year.",
+            Some("locomo fact"),
+        )
+        .await
+        .unwrap();
+        db::set_memory_scope_kind(&db, fact, "project", "fact")
+            .await
+            .unwrap();
+        let fact_memory = db::get_memory_by_id_any_namespace(&db, fact)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut narratives = Vec::new();
+        for i in 0..4 {
+            let id = insert_memory(
+                &db,
+                "/tmp/p",
+                &s,
+                &format!("broad narrative {i} about Melanie and family"),
+                Some("locomo"),
+            )
+            .await
+            .unwrap();
+            db::set_memory_scope_kind(&db, id, "project", "session")
+                .await
+                .unwrap();
+            narratives.push(id);
+        }
+
+        let mut candidates = narratives.clone();
+        candidates.push(fact);
+        let without_floor = reserve_narrative_slots(&db, &candidates, 3).await.unwrap();
+        assert!(
+            !without_floor.contains(&fact),
+            "test setup should bury the fact before applying the floor: {without_floor:?}"
+        );
+
+        let floor = lexical_source_fact_floor_ids(
+            &db,
+            "How often does Melanie go to the beach with her kids?",
+            &[fact_memory],
+            3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(floor, vec![fact]);
+
+        let promoted = promote_source_fact_floor(&candidates, &floor, 3);
+        let chosen = reserve_narrative_slots(&db, &promoted, 3).await.unwrap();
+        assert!(chosen.contains(&fact), "source fact floor missing: {chosen:?}");
+        assert!(
+            narratives.iter().any(|id| chosen.contains(id)),
+            "narrative quota should still keep a bridge/narrative slot: {chosen:?}"
+        );
         let _ = std::fs::remove_file(path);
     }
 
