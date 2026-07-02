@@ -25,6 +25,7 @@ mod server;
 mod snapshot;
 mod storage;
 mod strutil;
+mod sweep;
 mod sync;
 mod vectorstore;
 
@@ -89,6 +90,16 @@ enum SyncCommands {
         #[arg(short, long, default_value = "100")]
         limit: i64,
     },
+}
+
+#[derive(Subcommand)]
+enum SchedulerCommands {
+    /// Run the long-lived sleep-cycle scheduler loop
+    Run,
+    /// Install and start the macOS launchd sleep-cycle agent
+    InstallLaunchd,
+    /// Stop and remove the macOS launchd sleep-cycle agent
+    UninstallLaunchd,
 }
 
 #[derive(Subcommand)]
@@ -335,6 +346,34 @@ enum Commands {
     Compress {
         /// Session ID to compress
         session_id: String,
+    },
+
+    /// Sweep idle/large sessions into memories or run due dream consolidation
+    Sweep {
+        /// Idle age before a session is compressible. Supports s/m/h/d suffixes.
+        #[arg(long, default_value = "30m")]
+        compress_idle: String,
+        /// Compress sessions with at least this many observations even if not idle
+        #[arg(long, default_value_t = 50)]
+        min_observations: i64,
+        /// Max sessions/projects to sweep in one run
+        #[arg(short, long, default_value_t = 20)]
+        limit: i64,
+        /// Report candidates without mutating the database
+        #[arg(long)]
+        dry_run: bool,
+        /// Run due dream/reflection work instead of compression
+        #[arg(long)]
+        dream_due: bool,
+        /// Apply dream synthesis/consolidation. Without this, dream is proposal-first.
+        #[arg(long)]
+        apply: bool,
+    },
+
+    /// Manage the unattended sleep-cycle scheduler
+    Scheduler {
+        #[command(subcommand)]
+        action: SchedulerCommands,
     },
 
     /// Garbage-collect unreferenced CCR blobs (reclaim space after wipes)
@@ -628,6 +667,26 @@ async fn async_main() -> Result<()> {
             dry_run,
         } => run_graph_backfill(&cfg, project.as_deref(), all, limit, dry_run).await?,
         Commands::Compress { session_id } => run_compress_cmd(&cfg, &session_id).await?,
+        Commands::Sweep {
+            compress_idle,
+            min_observations,
+            limit,
+            dry_run,
+            dream_due,
+            apply,
+        } => {
+            run_sweep_cmd(
+                &cfg,
+                &compress_idle,
+                min_observations,
+                limit,
+                dry_run,
+                dream_due,
+                apply,
+            )
+            .await?
+        }
+        Commands::Scheduler { action } => run_scheduler_cmd(cfg, action).await?,
         Commands::Gc => run_gc(&cfg).await?,
         Commands::Embed {
             project,
@@ -708,7 +767,11 @@ async fn run_server(mut cfg: config::Config) -> Result<()> {
     // (Wave 4) Load the cross-encoder reranker once at startup if selected. The
     // load is blocking (model download + ONNX init); on failure the rerank path
     // falls back to the LLM reranker.
-    if rest_cfg.rerank.backend.eq_ignore_ascii_case("cross_encoder") {
+    if rest_cfg
+        .rerank
+        .backend
+        .eq_ignore_ascii_case("cross_encoder")
+    {
         let model = rest_cfg.rerank.cross_encoder_model.clone();
         let _ = tokio::task::spawn_blocking(move || crate::reranker::init(&model)).await;
     }
@@ -1784,6 +1847,189 @@ async fn run_compress_cmd(cfg: &config::Config, session_id: &str) -> Result<()> 
         println!("\nTags: {}", memory.tags.unwrap_or_default());
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_sweep_cmd(
+    cfg: &config::Config,
+    compress_idle: &str,
+    min_observations: i64,
+    limit: i64,
+    dry_run: bool,
+    dream_due: bool,
+    apply: bool,
+) -> Result<()> {
+    let (database, embedder, store) = sweep::open_db_and_semantic(cfg).await?;
+    if dream_due {
+        let due_after_secs = (cfg.scheduler.dream_interval_hours as i64).max(1) * 60 * 60;
+        let options = sweep::DreamSweepOptions {
+            due_after_secs,
+            apply,
+            dry_run,
+            limit: limit.max(1),
+        };
+        let report = sweep::run_dream_sweep(
+            &database,
+            cfg,
+            &options,
+            embedder.as_deref(),
+            store.as_ref(),
+        )
+        .await?;
+        print_sweep_report(
+            "dream",
+            dry_run,
+            &format!(
+                "dream_due=true apply={} due_after={}h limit={}",
+                apply,
+                cfg.scheduler.dream_interval_hours,
+                limit.max(1)
+            ),
+            &report,
+        );
+        return Ok(());
+    }
+
+    let options = sweep::CompressionSweepOptions {
+        compress_idle_secs: sweep::parse_duration_secs(compress_idle)?,
+        min_observations: min_observations.max(0),
+        limit: limit.max(1),
+        dry_run,
+        lease_secs: (cfg.auto_compress.lease_minutes as i64).max(1) * 60,
+    };
+    let report = sweep::run_compression_sweep(
+        &database,
+        cfg,
+        &options,
+        embedder.as_deref(),
+        store.as_ref(),
+    )
+    .await?;
+    print_sweep_report(
+        "compress",
+        dry_run,
+        &format!(
+            "compress_idle={} min_observations={} limit={}",
+            compress_idle,
+            min_observations.max(0),
+            limit.max(1)
+        ),
+        &report,
+    );
+    Ok(())
+}
+
+fn print_sweep_report(kind: &str, dry_run: bool, header: &str, report: &sweep::SweepReport) {
+    let dry_run = dry_run || report.dry_run;
+    println!("SWEEP kind={kind} dry_run={dry_run} {header}");
+    for action in &report.actions {
+        let session = action.session_id.as_deref().unwrap_or("-");
+        let idle = action
+            .idle_secs
+            .map(format_duration)
+            .unwrap_or_else(|| "-".to_string());
+        let observations = action
+            .observation_count
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "candidate session={} project={} idle={} observations={} action={} status={} reason={}{}",
+            session,
+            action.project,
+            idle,
+            observations,
+            action.action,
+            action.status,
+            action.reason,
+            action
+                .detail
+                .as_deref()
+                .map(|d| format!(" detail={}", d.replace('\n', " ")))
+                .unwrap_or_default()
+        );
+    }
+    println!(
+        "summary candidates={} compressed={} dreamed={} skipped={} failed={}",
+        report.candidates, report.compressed, report.dreamed, report.skipped, report.failed
+    );
+}
+
+fn format_duration(secs: i64) -> String {
+    if secs >= 3600 {
+        format!("{:.1}h", secs as f64 / 3600.0)
+    } else if secs >= 60 {
+        format!("{:.1}m", secs as f64 / 60.0)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+async fn run_scheduler_cmd(cfg: config::Config, action: SchedulerCommands) -> Result<()> {
+    match action {
+        SchedulerCommands::Run => sweep::run_scheduler(cfg).await,
+        SchedulerCommands::InstallLaunchd => {
+            let path = sweep::install_launchd(&cfg)?;
+            println!("Installed launchd agent: {}", path.display());
+            #[cfg(target_os = "macos")]
+            {
+                let domain = launchd_gui_domain()?;
+                let _ = std::process::Command::new("launchctl")
+                    .arg("bootout")
+                    .arg(&domain)
+                    .arg(&path)
+                    .status();
+                match std::process::Command::new("launchctl")
+                    .arg("bootstrap")
+                    .arg(&domain)
+                    .arg(&path)
+                    .status()
+                {
+                    Ok(status) if status.success() => {
+                        println!("launchd agent started: {}", cfg.scheduler.launchd_label);
+                    }
+                    Ok(status) => {
+                        println!(
+                            "launchd plist written, but bootstrap exited with status {status}. Start manually with: launchctl bootstrap {} {}",
+                            domain,
+                            path.display()
+                        );
+                    }
+                    Err(e) => {
+                        println!(
+                            "launchd plist written, but bootstrap failed: {e}. Start manually with: launchctl bootstrap {} {}",
+                            domain,
+                            path.display()
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        SchedulerCommands::UninstallLaunchd => {
+            #[cfg(target_os = "macos")]
+            {
+                let domain = launchd_gui_domain()?;
+                let label = format!("{}/{}", domain, cfg.scheduler.launchd_label);
+                let _ = std::process::Command::new("launchctl")
+                    .arg("bootout")
+                    .arg(&label)
+                    .status();
+            }
+            let path = sweep::uninstall_launchd(&cfg)?;
+            println!("Removed launchd agent: {}", path.display());
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_gui_domain() -> Result<String> {
+    let output = std::process::Command::new("id").arg("-u").output()?;
+    if !output.status.success() {
+        anyhow::bail!("failed to resolve uid with id -u");
+    }
+    let uid = String::from_utf8(output.stdout)?.trim().to_string();
+    Ok(format!("gui/{uid}"))
 }
 
 async fn run_embed(

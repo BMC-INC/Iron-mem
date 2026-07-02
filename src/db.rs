@@ -166,6 +166,37 @@ pub struct SessionHistoryEntry {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct SweepCandidate {
+    pub session_id: String,
+    pub project: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub last_observation_at: Option<i64>,
+    pub last_activity_at: i64,
+    pub observation_count: i64,
+    pub compressed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct DreamCandidate {
+    pub project: String,
+    pub memory_count: i64,
+    pub last_activity: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewSweepEvent<'a> {
+    pub session_id: Option<&'a str>,
+    pub project: &'a str,
+    pub action: &'a str,
+    pub dry_run: bool,
+    pub status: &'a str,
+    pub reason: &'a str,
+    pub detail: Option<&'a str>,
+    pub subject_last_activity: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[allow(dead_code)]
 pub struct MemoryFeedback {
     pub id: i64,
@@ -347,6 +378,74 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_obs_project ON observations(project)")
             .execute(&self.pool)
             .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS sweep_leases (
+                session_id  TEXT PRIMARY KEY,
+                owner       TEXT NOT NULL,
+                acquired_at BIGINT NOT NULL,
+                lease_until BIGINT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_sweep_leases_until
+             ON sweep_leases(lease_until)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        match self.backend {
+            Backend::Sqlite => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS sweep_events (
+                        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id            TEXT,
+                        project               TEXT NOT NULL,
+                        action                TEXT NOT NULL,
+                        dry_run               BIGINT NOT NULL DEFAULT 0,
+                        status                TEXT NOT NULL,
+                        reason                TEXT NOT NULL,
+                        detail                TEXT,
+                        subject_last_activity BIGINT,
+                        created_at            BIGINT NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+            Backend::Postgres => {
+                sqlx::query(
+                    "CREATE TABLE IF NOT EXISTS sweep_events (
+                        id                    BIGSERIAL PRIMARY KEY,
+                        session_id            TEXT,
+                        project               TEXT NOT NULL,
+                        action                TEXT NOT NULL,
+                        dry_run               BIGINT NOT NULL DEFAULT 0,
+                        status                TEXT NOT NULL,
+                        reason                TEXT NOT NULL,
+                        detail                TEXT,
+                        subject_last_activity BIGINT,
+                        created_at            BIGINT NOT NULL
+                    )",
+                )
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_sweep_events_session
+             ON sweep_events(session_id, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_sweep_events_project_action
+             ON sweep_events(project, action, status, subject_last_activity)",
+        )
+        .execute(&self.pool)
+        .await?;
 
         // CCR: lossless pointer to the verbatim full output (when the inline
         // `output` is only a truncated FTS preview). Additive + backward-
@@ -1130,6 +1229,17 @@ pub async fn end_session(db: &Database, session_id: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn end_session_if_open(db: &Database, session_id: &str) -> Result<bool> {
+    let now = Utc::now().timestamp();
+    let result =
+        sqlx::query("UPDATE sessions SET ended_at = $1 WHERE id = $2 AND ended_at IS NULL")
+            .bind(now)
+            .bind(session_id)
+            .execute(&db.pool)
+            .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn mark_compressed(db: &Database, session_id: &str) -> Result<()> {
     sqlx::query("UPDATE sessions SET compressed = 1 WHERE id = $1")
         .bind(session_id)
@@ -1234,6 +1344,202 @@ pub async fn observation_count_for_session(db: &Database, session_id: &str) -> R
             .fetch_one(&db.pool)
             .await?;
     Ok(row.get("cnt"))
+}
+
+pub async fn list_sweep_candidates(
+    db: &Database,
+    idle_before_ts: i64,
+    min_observations: i64,
+    limit: i64,
+) -> Result<Vec<SweepCandidate>> {
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(
+        "SELECT s.id AS session_id,
+                s.project,
+                s.started_at,
+                s.ended_at,
+                s.compressed,
+                MAX(o.created_at) AS last_observation_at,
+                COALESCE(MAX(o.created_at), s.ended_at, s.started_at) AS last_activity_at,
+                COUNT(o.id) AS observation_count
+         FROM sessions s
+         LEFT JOIN observations o ON o.session_id = s.id
+         WHERE s.compressed = 0
+         GROUP BY s.id, s.project, s.started_at, s.ended_at, s.compressed
+         HAVING COUNT(o.id) > 0
+            AND (COUNT(o.id) >= $1
+                 OR COALESCE(MAX(o.created_at), s.ended_at, s.started_at) <= $2)
+         ORDER BY last_activity_at ASC, s.started_at ASC
+         LIMIT $3",
+    )
+    .bind(min_observations.max(0))
+    .bind(idle_before_ts)
+    .bind(limit.max(0))
+    .fetch_all(&db.pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r: sqlx::any::AnyRow| SweepCandidate {
+            session_id: r.get("session_id"),
+            project: r.get("project"),
+            started_at: r.get("started_at"),
+            ended_at: r.try_get("ended_at").ok().flatten(),
+            last_observation_at: r.try_get("last_observation_at").ok().flatten(),
+            last_activity_at: r.get("last_activity_at"),
+            observation_count: r.get("observation_count"),
+            compressed: r.get::<i64, _>("compressed") != 0,
+        })
+        .collect())
+}
+
+pub async fn try_acquire_sweep_lease(
+    db: &Database,
+    session_id: &str,
+    owner: &str,
+    lease_secs: i64,
+) -> Result<bool> {
+    let now = Utc::now().timestamp();
+    sqlx::query("DELETE FROM sweep_leases WHERE session_id = $1 AND lease_until <= $2")
+        .bind(session_id)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+
+    let lease_until = now + lease_secs.max(1);
+    let inserted = sqlx::query(
+        "INSERT INTO sweep_leases(session_id, owner, acquired_at, lease_until)
+         VALUES($1, $2, $3, $4)",
+    )
+    .bind(session_id)
+    .bind(owner)
+    .bind(now)
+    .bind(lease_until)
+    .execute(&db.pool)
+    .await;
+
+    match inserted {
+        Ok(_) => Ok(true),
+        Err(e) if is_unique_constraint_error(&e) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub async fn release_sweep_lease(db: &Database, session_id: &str, owner: &str) -> Result<()> {
+    sqlx::query("DELETE FROM sweep_leases WHERE session_id = $1 AND owner = $2")
+        .bind(session_id)
+        .bind(owner)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+fn is_unique_constraint_error(e: &sqlx::Error) -> bool {
+    let msg = e.to_string().to_ascii_lowercase();
+    msg.contains("unique") || msg.contains("duplicate") || msg.contains("constraint")
+}
+
+pub async fn record_sweep_event(db: &Database, event: NewSweepEvent<'_>) -> Result<()> {
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO sweep_events(
+            session_id, project, action, dry_run, status, reason, detail, subject_last_activity, created_at
+         ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(event.session_id)
+    .bind(event.project)
+    .bind(event.action)
+    .bind(if event.dry_run { 1_i64 } else { 0_i64 })
+    .bind(event.status)
+    .bind(event.reason)
+    .bind(event.detail)
+    .bind(event.subject_last_activity)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub async fn sweep_event_count(db: &Database) -> Result<i64> {
+    let row: sqlx::any::AnyRow = sqlx::query("SELECT COUNT(*) AS cnt FROM sweep_events")
+        .fetch_one(&db.pool)
+        .await?;
+    Ok(row.get("cnt"))
+}
+
+pub async fn list_dream_candidates(
+    db: &Database,
+    due_before_ts: i64,
+    limit: i64,
+) -> Result<Vec<DreamCandidate>> {
+    let now = Utc::now().timestamp();
+    let query_str = match db.backend {
+        Backend::Sqlite => {
+            "SELECT p.project, p.memory_count, p.last_activity
+             FROM (
+                SELECT memories.project AS project,
+                       COUNT(*) AS memory_count,
+                       MAX(COALESCE(s.ended_at, s.started_at, memories.created_at)) AS last_activity
+                FROM memories
+                LEFT JOIN sessions s ON s.id = memories.session_id
+                LEFT JOIN memory_meta mm ON mm.memory_id = memories.rowid
+                WHERE COALESCE(mm.namespace, 'local') = 'local'
+                  AND mm.tombstoned_at IS NULL
+                  AND (mm.expires_at IS NULL OR mm.expires_at > $1)
+                GROUP BY memories.project
+             ) p
+             WHERE p.last_activity <= $2
+               AND NOT EXISTS (
+                   SELECT 1 FROM sweep_events se
+                   WHERE se.project = p.project
+                     AND se.action = 'dream'
+                     AND se.status = 'success'
+                     AND se.subject_last_activity >= p.last_activity
+               )
+             ORDER BY p.last_activity ASC
+             LIMIT $3"
+        }
+        Backend::Postgres => {
+            "SELECT p.project, p.memory_count, p.last_activity
+             FROM (
+                SELECT m.project AS project,
+                       COUNT(*) AS memory_count,
+                       MAX(COALESCE(s.ended_at, s.started_at, m.created_at)) AS last_activity
+                FROM memories m
+                LEFT JOIN sessions s ON s.id = m.session_id
+                LEFT JOIN memory_meta mm ON mm.memory_id = m.id
+                WHERE COALESCE(mm.namespace, 'local') = 'local'
+                  AND mm.tombstoned_at IS NULL
+                  AND (mm.expires_at IS NULL OR mm.expires_at > $1)
+                GROUP BY m.project
+             ) p
+             WHERE p.last_activity <= $2
+               AND NOT EXISTS (
+                   SELECT 1 FROM sweep_events se
+                   WHERE se.project = p.project
+                     AND se.action = 'dream'
+                     AND se.status = 'success'
+                     AND se.subject_last_activity >= p.last_activity
+               )
+             ORDER BY p.last_activity ASC
+             LIMIT $3"
+        }
+    };
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(query_str)
+        .bind(now)
+        .bind(due_before_ts)
+        .bind(limit.max(0))
+        .fetch_all(&db.pool)
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r: sqlx::any::AnyRow| DreamCandidate {
+            project: r.get("project"),
+            memory_count: r.get("memory_count"),
+            last_activity: r.get("last_activity"),
+        })
+        .collect())
 }
 
 /// The CCR blob hash backing an observation's verbatim full output, if one was

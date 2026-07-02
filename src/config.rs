@@ -43,6 +43,10 @@ pub struct Config {
     pub multi_hop: MultiHopConfig,
     #[serde(default)]
     pub auto_dream: AutoDreamConfig,
+    #[serde(default)]
+    pub auto_compress: AutoCompressConfig,
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
 }
 
 /// (W3.1) Iterative multi-hop retrieval. For questions that chain facts across
@@ -106,6 +110,101 @@ fn default_auto_dream_enabled() -> bool {
 
 fn default_auto_dream_gap_minutes() -> u32 {
     15
+}
+
+/// Sleep-cycle compression defaults. This stays off until the user runs
+/// `ironmem scheduler run` or explicitly enables a launcher, but the CLI uses
+/// these conservative thresholds when no flags are provided.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoCompressConfig {
+    #[serde(default = "default_auto_compress_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_auto_compress_idle_minutes")]
+    pub idle_minutes: u32,
+    #[serde(default = "default_auto_compress_min_observations")]
+    pub min_observations: i64,
+    #[serde(default = "default_auto_compress_limit")]
+    pub limit: i64,
+    #[serde(default = "default_auto_compress_provider_backoff_minutes")]
+    pub provider_backoff_minutes: u32,
+    #[serde(default = "default_auto_compress_lease_minutes")]
+    pub lease_minutes: u32,
+}
+
+impl Default for AutoCompressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_auto_compress_enabled(),
+            idle_minutes: default_auto_compress_idle_minutes(),
+            min_observations: default_auto_compress_min_observations(),
+            limit: default_auto_compress_limit(),
+            provider_backoff_minutes: default_auto_compress_provider_backoff_minutes(),
+            lease_minutes: default_auto_compress_lease_minutes(),
+        }
+    }
+}
+
+fn default_auto_compress_enabled() -> bool {
+    false
+}
+
+fn default_auto_compress_idle_minutes() -> u32 {
+    30
+}
+
+fn default_auto_compress_min_observations() -> i64 {
+    50
+}
+
+fn default_auto_compress_limit() -> i64 {
+    20
+}
+
+fn default_auto_compress_provider_backoff_minutes() -> u32 {
+    30
+}
+
+fn default_auto_compress_lease_minutes() -> u32 {
+    30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerConfig {
+    #[serde(default = "default_scheduler_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_scheduler_sweep_interval_minutes")]
+    pub sweep_interval_minutes: u32,
+    #[serde(default = "default_scheduler_dream_interval_hours")]
+    pub dream_interval_hours: u32,
+    #[serde(default = "default_scheduler_launchd_label")]
+    pub launchd_label: String,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_scheduler_enabled(),
+            sweep_interval_minutes: default_scheduler_sweep_interval_minutes(),
+            dream_interval_hours: default_scheduler_dream_interval_hours(),
+            launchd_label: default_scheduler_launchd_label(),
+        }
+    }
+}
+
+fn default_scheduler_enabled() -> bool {
+    false
+}
+
+fn default_scheduler_sweep_interval_minutes() -> u32 {
+    15
+}
+
+fn default_scheduler_dream_interval_hours() -> u32 {
+    24
+}
+
+fn default_scheduler_launchd_label() -> String {
+    "com.execlayer.ironmem.sleep".to_string()
 }
 
 /// (#1) Governed retrieval router (paper M3): the writer trust-tier recorded on
@@ -422,6 +521,8 @@ impl Default for Config {
             governance_router: GovernanceRouterConfig::default(),
             multi_hop: MultiHopConfig::default(),
             auto_dream: AutoDreamConfig::default(),
+            auto_compress: AutoCompressConfig::default(),
+            scheduler: SchedulerConfig::default(),
         }
     }
 }
@@ -431,7 +532,10 @@ impl Config {
     /// (0/1/true/false/on/off) overrides the configured default at runtime.
     pub fn multi_hop_enabled(&self) -> bool {
         match std::env::var("IRONMEM_MULTI_HOP_ENABLED") {
-            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+            Ok(v) => matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ),
             Err(_) => self.multi_hop.enabled,
         }
     }
@@ -574,5 +678,18 @@ mod tests {
         let back = serde_json::to_string(&cfg).unwrap();
         let cfg2: Config = serde_json::from_str(&back).unwrap();
         assert_eq!(cfg2.embedding.provider, "none");
+    }
+
+    #[test]
+    fn missing_sleep_cycle_keys_yield_defaults() {
+        let cfg: Config = serde_json::from_str(BASE).unwrap();
+        assert!(!cfg.auto_compress.enabled);
+        assert_eq!(cfg.auto_compress.idle_minutes, 30);
+        assert_eq!(cfg.auto_compress.min_observations, 50);
+        assert_eq!(cfg.auto_compress.limit, 20);
+        assert_eq!(cfg.auto_compress.provider_backoff_minutes, 30);
+        assert_eq!(cfg.scheduler.sweep_interval_minutes, 15);
+        assert_eq!(cfg.scheduler.dream_interval_hours, 24);
+        assert_eq!(cfg.scheduler.launchd_label, "com.execlayer.ironmem.sleep");
     }
 }

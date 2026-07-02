@@ -47,22 +47,63 @@
 
 ## What's New in v0.4.0
 
-> IronMem is now a full durable memory stack: reversible originals, typed memories, temporal graph recall, procedural memory, adaptive skim/expand context, and 21 MCP tools.
+> IronMem is now a full durable memory stack: reversible originals, typed memories,
+> temporal graph recall, source-backed retrieval, adaptive skim/expand context,
+> sleep-cycle compression, and 21 MCP tools.
 
-- **CCR — losslessly reversible memory** (Headroom pattern) — every truncated tool output and the verbatim pre-LLM session transcript is preserved in a content-addressed, deduplicated, byte-exact compressed blob store inside the DB. **`retrieve_original`** pulls the exact original back by `observation_id`, `memory_id`, raw blob `hash`, or the new `chunk_id` expansion handle.
-- **Memory scoping & typed memories** (Supermemory patterns) — memories carry a **scope** (`project` vs. `user`/cross-project) and a **kind** (`session`, `fact`, `error_solution`, `preference`, `procedural`, `architecture`, `learned_pattern`, `project_config`, `profile`). Session-start injection ranks **project ∪ user** memories and boosts durable kinds.
-- **Dual-output compression** — session compression writes both a narrative memory and separate searchable `kind=fact` memories, so dates, names, quantities, and direct answers survive summarization.
-- **Temporal recall + graph recall** — dated facts and `event_time` metadata power timestamp lookup, while `memory_edges` stores structured `source | relation | target` edges with valid-time filters and provenance. Temporal questions route toward date-bearing facts; relationship questions route toward graph edges.
-- **Adaptive working-memory skim** — every compressed or explicit memory gets durable `memory_chunks` with density (`high`, `medium`, `low`), kind, title, token estimate, and optional exact transcript offsets. Agents can skim broadly with **`memory_skim`**, then expand exact evidence with **`retrieve_original(chunk_id=...)`**.
-- **Governed recall** — memories now carry a durable governance envelope: namespace, source type, trust tier, writer/source provenance, classification, consent state, residency, retention metadata, legal hold, tombstone state, record hash, and append-only ledger hash chain. Reads are namespace-scoped and active-only by default; PHI/PII writes fail closed unless consent is granted.
-- **Closed-loop memory quality** — injection events and explicit feedback now reinforce useful memories and decay repeatedly ignored or corrected memories, reducing stale context without deleting provenance.
-- **AST-bound Rust anchors** — `ironmem code-relink` uses Tree-sitter to hash Rust symbols and relink memories when code moves across files.
-- **Reflection, snapshots, and sync** — dry-run-first consolidation proposals, CCR-backed project brain snapshots, and an idempotent Lamport-clock sync event log support long-lived and multi-agent memory workflows.
-- **`remember` tool** — store an explicit, typed memory in one call (`scope`, `kind`, `text`, `tags`). User-scope facts follow you into every project and also enter the skim layer.
-- **User profile** — cross-project memories are distilled into a single always-injected profile (LLM summary, or deterministic local rollup when offline). Read/regenerate with **`get_profile`** / **`refresh_profile`**.
-- **Correction miner** — error→fix loops in a session (a failing command, edits, then the same command passing) are mined into `error_solution` memories and surfaced via **`list_corrections`**, so past fixes resurface when the work recurs.
-- **21 MCP tools** now — including `memory_skim`, `retrieve_original`, `remember`, `get_profile`, `refresh_profile`, `list_corrections`, `memory_graph`, and `reconcile_memory_graph`.
-- **Current verification:** `cargo test --bin ironmem` passes **160 tests** with **1 ignored benchmark**, `cargo test --test mcp_stdio_clean` passes, and `cargo clippy --bin ironmem -- -D warnings` is clean.
+- **CCR — losslessly reversible memory** (Headroom pattern) — every truncated tool
+  output and the verbatim pre-LLM session transcript is preserved in a
+  content-addressed, deduplicated, byte-exact compressed blob store inside the DB.
+  **`retrieve_original`** pulls the exact original back by `observation_id`,
+  `memory_id`, raw blob `hash`, or `chunk_id`.
+- **Memory scoping & typed memories** (Supermemory patterns) — memories carry a
+  **scope** (`project` vs. `user`/cross-project) and a **kind** (`session`, `fact`,
+  `error_solution`, `preference`, `procedural`, `architecture`, `learned_pattern`,
+  `project_config`, `profile`). Session-start injection ranks **project ∪ user**
+  memories and boosts durable kinds.
+- **Dual-output compression** — session compression writes both a narrative memory
+  and separate searchable `kind=fact` memories, so dates, names, quantities, and
+  direct answers survive summarization.
+- **Record-run retrieval stack** — hybrid FTS/vector/graph recall now includes
+  source-fact retention, temporal event boosts, multi-hop query expansion, rerank
+  re-anchoring, and optional cross-encoder reranking.
+- **Adaptive working-memory skim** — every compressed or explicit memory gets
+  durable `memory_chunks` with density, kind, title, token estimate, and optional
+  exact transcript offsets. Agents can skim broadly with **`memory_skim`**, then
+  expand exact evidence with **`retrieve_original(chunk_id=...)`**.
+- **Governed recall** — memories carry namespace, source type, trust tier,
+  writer/source provenance, classification, consent state, residency, retention
+  metadata, legal hold, tombstone state, record hash, and an append-only ledger
+  hash chain. Reads are namespace-scoped and active-only by default; PHI/PII
+  writes fail closed unless consent is granted.
+- **Closed-loop memory quality** — injection events and explicit feedback reinforce
+  useful memories and decay repeatedly ignored or corrected memories without
+  deleting provenance.
+- **Sleep-cycle auto-compression** — `ironmem sweep` and `ironmem scheduler run`
+  compact idle or high-volume sessions without manual `session_end`, with DB
+  leases, dry-run mode, audit events, and slower dream/reflection passes.
+- **GPU-ready cross-encoder reranking** — `rerank.backend = "cross_encoder"` uses
+  the local ONNX reranker when available, with a `gpu` feature for CUDA-backed
+  benchmark-scale runs and a safe fallback when the model is unavailable.
+- **AST-bound Rust anchors** — `ironmem code-relink` uses Tree-sitter to hash Rust
+  symbols and relink memories when code moves across files.
+- **Reflection, snapshots, and sync** — dry-run-first consolidation proposals,
+  CCR-backed project brain snapshots, and an idempotent Lamport-clock sync event
+  log support long-lived and multi-agent memory workflows.
+- **`remember` tool** — store an explicit, typed memory in one call (`scope`, `kind`,
+  `text`, `tags`). User-scope facts follow you into every project and also enter
+  the skim layer.
+- **User profile** — cross-project memories are distilled into a single
+  always-injected profile. Read/regenerate with **`get_profile`** /
+  **`refresh_profile`**.
+- **Correction miner** — error→fix loops are mined into `error_solution` memories
+  and surfaced via **`list_corrections`**, so past fixes resurface when work recurs.
+- **21 MCP tools** now — including `memory_skim`, `retrieve_original`, `remember`,
+  `get_profile`, `refresh_profile`, `list_corrections`, `memory_graph`, and
+  `reconcile_memory_graph`.
+- **Current verification:** `cargo test --bin ironmem` passes **192 tests** with
+  **1 ignored benchmark**, MCP stdio cleanliness passes, and the strict
+  `local-onnx` clippy gate is clean.
 - **Still zero telemetry. Still local-first. Your data stays yours.**
 
 <details>
@@ -79,7 +120,9 @@
 <details>
 <summary>v0.2.0</summary>
 
-- **13 MCP tools** — session_start, session_end, record_event, compress_session, get_context, get_status, list_memories, search_memories, search_global, list_projects, list_sessions, inject_context, wipe_project
+- **Initial 13 MCP tools** — session_start, session_end, record_event,
+  compress_session, get_context, get_status, list_memories, search_memories,
+  search_global, list_projects, list_sessions, inject_context, wipe_project
 - **Dual database** — SQLite (local, FTS5 full-text search) + Postgres (self-hosted, tsvector) via `DATABASE_URL`
 - **Every MCP client** — Claude Desktop, Claude Code, Cursor, Windsurf, ChatGPT Desktop, Zed, and more
 - **Docker deployment** — `docker-compose up` for remote/team setups with Postgres
@@ -98,9 +141,11 @@ No "remember when we refactored auth yesterday?"
 
 **Works with every major AI coding tool** — Claude Code, Claude Desktop, Cursor, Windsurf, ChatGPT Desktop, GitHub Copilot, Zed, VS Code, and any MCP-compatible client.
 
-**Compress with the LLM you already pay for** — Anthropic Claude, OpenAI GPT-4o, or Google Gemini. Switch providers with one config change.
+**Compress with the LLM you already pay for** — Anthropic Claude, OpenAI GPT-4o,
+Google Gemini, or Vertex AI Gemini. Switch providers with one config change.
 
-**Free and open source.** Runs locally or on your own infrastructure. No telemetry. No cloud dependency. No subscription. SQLite or Postgres storage. Plain markdown output. Single Rust binary.
+**Free and open source.** Runs locally or on your own infrastructure. No telemetry.
+No cloud dependency. No subscription. SQLite or Postgres storage. Single Rust binary.
 
 <p align="center">
   <img src="assets/demo.gif" alt="IronMem in action" width="640"/>
@@ -135,7 +180,10 @@ With IronMem:
    ```bash
    echo "your-key-here" > ~/.ironmem/api_key && chmod 600 ~/.ironmem/api_key
    ```
-   > **Prefer the key file over `export ANTHROPIC_API_KEY`.** Claude Code (and some other tools) bill against `ANTHROPIC_API_KEY` whenever it's set in your shell — using pay-as-you-go API credit instead of your Claude subscription. The key file keeps IronMem's key out of your environment so it can't change how other tools bill. (IronMem still honors `ANTHROPIC_API_KEY` if you prefer the env var.)
+   > **Prefer the key file over `export ANTHROPIC_API_KEY`.** Claude Code and
+   > some other tools bill against `ANTHROPIC_API_KEY` whenever it is set in your
+   > shell. The key file keeps IronMem's key out of your environment so it cannot
+   > change how other tools bill. IronMem still honors the env var if you prefer it.
 3. **Start coding!** IronMem handles the rest silently in the background.
 
 ---
@@ -171,13 +219,17 @@ With IronMem:
 
 ## The Problem
 
-Every time you start a new session with Claude Code, Cursor, Copilot, or any AI coding assistant — it starts from zero. It doesn't know what you built yesterday. It doesn't know what broke. It doesn't know what you decided.
+Every time you start a new session with Claude Code, Cursor, Copilot, or any AI
+coding assistant, it starts from zero. It does not know what you built yesterday,
+what broke, or what you decided.
 
 **You end up re-explaining context every single session.**
 
 ## The Fix
 
-IronMem silently records what happens during your coding session, compresses it into a concise memory using your LLM provider of choice (Anthropic, OpenAI, or Gemini), and injects that context into your next session automatically.
+IronMem silently records what happens during your coding session, compresses it
+with your configured provider, and injects that context into your next session
+automatically.
 
 No setup per session. No copy-pasting. No "remember when we..."
 
@@ -225,27 +277,35 @@ Everything runs locally. Your data stays on your machine.
 
 ## Current Memory Stack
 
-IronMem now stores memory in several cooperating layers rather than one flat summary:
+IronMem now stores memory in several cooperating layers rather than one flat
+summary:
 
-| Layer | What it stores | Why it matters |
-| ----- | -------------- | -------------- |
-| **Session transcript CCR** | Verbatim pre-LLM session transcripts and large/truncated tool outputs in content-addressed compressed blobs | Exact originals are recoverable; summaries are never the only copy |
-| **Narrative memories** | Concise session summaries in the `memories` FTS table | Fast project history and ordinary session recall |
-| **Typed facts** | Separate `kind=fact` memories extracted from compression | Direct answers, dates, names, quantities, and benchmark-style lookup survive summarization |
-| **Procedural memories** | Reusable workflow rules as `kind=procedural` | Future agents can recall “how we work” without mixing procedures into narrative memory |
-| **Error solutions** | Mined fail→edit→pass loops as `kind=error_solution` | Past fixes come back when the same failure pattern appears |
-| **User profile** | Global `scope=user`, `kind=profile` memory | Stable cross-project facts are always injected |
-| **Temporal graph** | `source | relation | target` edges with valid-time fields, confidence, and memory provenance | Relationship questions and Operator OS entity state can use graph traversal instead of only vector similarity |
-| **Adaptive skim chunks** | `memory_chunks` rows with `chunk_id`, density, kind, title, summary, token estimate, and optional exact transcript byte offsets | Agents can scan broad compressed history, then expand exact evidence on demand |
+- **Session transcript CCR:** verbatim pre-LLM transcripts and large/truncated
+  tool outputs in content-addressed compressed blobs.
+- **Narrative memories:** concise session summaries in the `memories` FTS table.
+- **Typed facts:** separate `kind=fact` memories extracted from compression, so
+  dates, names, quantities, and direct answers survive summarization.
+- **Procedural memories:** reusable workflow rules as `kind=procedural`.
+- **Error solutions:** mined fail→edit→pass loops as `kind=error_solution`.
+- **User profile:** global `scope=user`, `kind=profile` memory injected across
+  projects.
+- **Temporal graph:** `source | relation | target` edges with valid-time fields,
+  confidence, and memory provenance.
+- **Adaptive skim chunks:** `memory_chunks` rows with `chunk_id`, density, kind,
+  title, token estimate, and optional exact transcript byte offsets.
 
 Retrieval is routed by query shape:
 
-- **Temporal lookup queries** (`when`, `what date`, `which year`, `before`, `after`, etc.) prioritize date-bearing `kind=fact` memories and suppress graph-only hits that would otherwise promote relationship memories over timestamp answers.
+- **Temporal lookup queries** prioritize date-bearing `kind=fact` memories and
+  suppress graph-only hits that would otherwise promote relationship memories
+  over timestamp answers.
 - **Relationship queries** keep graph fusion enabled and rank edges by relation/source/target overlap.
 - **General project recall** blends FTS, vectors when available, event-time boosts, graph signals, kind boosts, importance, and recency.
 - **Skim/expand workflows** use `memory_skim` or `/skim` first, then `retrieve_original` with a `chunk_id` for exact transcript evidence.
 
-This is intentionally model-agnostic. The durable store is hard-token, structured, and auditable, so Claude, Codex, Operator OS, desktop clients, and remote MCP clients can share the same backing memory.
+This is intentionally model-agnostic. The durable store is hard-token,
+structured, and auditable, so Claude, Codex, Operator OS, desktop clients, and
+remote MCP clients can share the same backing memory.
 
 ---
 
@@ -272,14 +332,16 @@ cd Iron-mem
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-Add IronMem to your `PATH` (in `~/.zshrc` or `~/.bashrc`) and write your API key to IronMem's key file:
+Add IronMem to your `PATH` and write your API key to IronMem's key file:
 
 ```bash
 export PATH="$HOME/.ironmem/bin:$PATH"          # in ~/.zshrc / ~/.bashrc
 echo "your-key-here" > ~/.ironmem/api_key && chmod 600 ~/.ironmem/api_key
 ```
 
-> Use the key file, not `export ANTHROPIC_API_KEY` — a global `ANTHROPIC_API_KEY` makes Claude Code (and similar tools) bill against pay-as-you-go API credit instead of your subscription. IronMem reads `~/.ironmem/api_key` automatically.
+> Use the key file, not `export ANTHROPIC_API_KEY`. A global
+> `ANTHROPIC_API_KEY` can change how other tools bill. IronMem reads
+> `~/.ironmem/api_key` automatically.
 
 Restart your terminal and Claude Code. That's it.
 
@@ -319,6 +381,10 @@ ironmem snapshot create --label before-refactor # CCR-backed project brain snaps
 ironmem sync publish --node ci --op error_solution --payload '{"memory_id":1}' # Multi-agent event log
 ironmem eval                # Run deterministic memory-quality evals into docs/evals
 ironmem compress <id>       # Manually compress a session
+ironmem sweep --compress-idle 30m --min-observations 50 --dry-run # Preview auto-compression
+ironmem sweep --dream-due --apply # Run due sleep/dream consolidation
+ironmem scheduler run       # Long-lived unattended sleep-cycle worker
+ironmem scheduler install-launchd # Install/start the macOS sleep-cycle agent
 ironmem embed               # Backfill semantic embeddings for existing memories
 ironmem gc                  # Reclaim unreferenced CCR blobs (after wipes)
 ironmem wipe                # Delete all memories for current project
@@ -358,7 +424,9 @@ IronMem works as an **MCP server** (native integration) or via **IRONMEM.md** (p
 IronMem supports two MCP transports:
 
 - **stdio** — for local clients that launch the server themselves (Claude Code, Claude Desktop, Cursor)
-- **Streamable HTTP** — for remote/cloud clients that connect over HTTP. Uses standard request/response and bearer-token auth, so it works through tunnels and reverse proxies for clients that support static bearer tokens.
+- **Streamable HTTP** — for remote/cloud clients that connect over HTTP. Uses
+  request/response and bearer-token auth, so it works through tunnels and reverse
+  proxies for clients that support static bearer tokens.
 
 Once connected over MCP, clients can record sessions, retrieve memories, inspect graph state, scan adaptive skims, and expand exact originals directly.
 
@@ -390,7 +458,8 @@ Create `.mcp.json` in your project root:
 }
 ```
 
-> **Note:** Claude Code hooks (installed by `install.sh`) and MCP can coexist. The hooks use the REST API for automatic observation recording; MCP gives you direct tool access. You can use both, or just one.
+> **Note:** Claude Code hooks and MCP can coexist. Hooks use the REST API for
+> automatic observation recording; MCP gives you direct tool access.
 
 ### Claude Desktop MCP Setup
 
@@ -423,7 +492,10 @@ claude.ai runs in the cloud, so it **cannot** reach `localhost`.
 
 IronMem is a local-first tool. The recommended setup for full MCP access is **Claude Code** or **Claude Desktop** using stdio.
 
-Anthropic's current `claude.ai` custom connector UI supports **authless** and **OAuth-based** remote MCP servers, but not a manual static bearer-token field. For personal use, the honest compatibility path is an **authless ephemeral tunnel**:
+Anthropic's current `claude.ai` custom connector UI supports **authless** and
+**OAuth-based** remote MCP servers, but not a manual static bearer-token field.
+For personal use, the honest compatibility path is an **authless ephemeral
+tunnel**:
 
 ```bash
 ironmem serve --public --no-auth
@@ -461,11 +533,14 @@ The `trycloudflare.com` URL is ephemeral and changes whenever you restart the pu
 
 **This is no longer local-only.** The tunnel exposes your MCP endpoint over the internet for as long as it is running.
 
-For a personal local tool, this tradeoff is often acceptable because the URL is short-lived and changes on each restart. Still, use `--no-auth` deliberately and only when you understand that you are trading security for compatibility.
+For a personal local tool, this tradeoff is often acceptable because the URL is
+short-lived and changes on each restart. Still, use `--no-auth` deliberately.
 
 **Without `--no-auth`:** `ironmem serve` and `ironmem serve --public` use bearer-token auth for clients that support static bearer tokens.
 
-**Requirements:** Install [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) for best results (`brew install cloudflared` on macOS, `winget install Cloudflare.cloudflared` on Windows). Falls back to `npx cloudflared` if not installed.
+**Requirements:** Install
+[cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
+for best results. IronMem falls back to `npx cloudflared` if it is not installed.
 
 ### Cursor / Windsurf MCP Setup
 
@@ -600,7 +675,11 @@ The REST server runs on `http://localhost:37778` by default. Current high-signal
 
 ## Governed Memory
 
-IronMem is still independent of SovereignClaw, but it now has its own governance envelope for durable recall. The default namespace is `local`, so existing single-user installs continue to work without new flags. Multi-tenant or control-plane callers can set `namespace` to isolate reads, search, skim, list, context injection, and explicit memory writes.
+IronMem is still independent of SovereignClaw, but it now has its own governance
+envelope for durable recall. The default namespace is `local`, so existing
+single-user installs continue to work without new flags. Multi-tenant or
+control-plane callers can set `namespace` to isolate reads, search, skim, list,
+context injection, and explicit memory writes.
 
 Governance fields accepted by CLI, REST `/remember`, and MCP `remember` include:
 
@@ -616,7 +695,12 @@ Governance fields accepted by CLI, REST `/remember`, and MCP `remember` include:
 | `residency`, `retention_policy_id`, `expires_at` | Policy metadata; `expires_at` is enforced by active recall filters. |
 | `legal_hold` | Prevents governed deletion while true. |
 
-Every governed write stores a canonical record hash and appends to `memory_ledger`, linking each entry to the previous namespace hash. Deletion uses `ironmem forget` or the existing project wipe paths, which now call governed deletion per memory: legal holds block deletion, active recall is tombstoned first, the ledger records the forget event, vectors are purged, and CCR blobs are garbage-collected when no references remain.
+Every governed write stores a canonical record hash and appends to
+`memory_ledger`, linking each entry to the previous namespace hash. Deletion uses
+`ironmem forget` or the existing project wipe paths, which now call governed
+deletion per memory: legal holds block deletion, active recall is tombstoned
+first, the ledger records the forget event, vectors are purged, and CCR blobs are
+garbage-collected when no references remain.
 
 Example:
 
@@ -666,18 +750,48 @@ ironmem forget 42 --actor privacy-admin --reason "retention window expired"
   "rerank": {
     "enabled": false,
     "model": "",
-    "pool": 20
+    "pool": 20,
+    "backend": "llm",
+    "cross_encoder_model": "bge-reranker-v2-m3",
+    "cross_encoder_max_candidates": 64
+  },
+  "auto_compress": {
+    "enabled": false,
+    "idle_minutes": 30,
+    "min_observations": 50,
+    "limit": 20,
+    "provider_backoff_minutes": 30,
+    "lease_minutes": 30
+  },
+  "scheduler": {
+    "enabled": false,
+    "sweep_interval_minutes": 15,
+    "dream_interval_hours": 24,
+    "launchd_label": "com.execlayer.ironmem.sleep"
   }
 }
 ```
 
-All fields optional. Sensible defaults provided. `auth_token` is generated automatically the first time you run `ironmem serve` without `--no-auth`. The `embedding` block is optional — omit it entirely and IronMem behaves exactly as before (keyword-only search, recency injection). The `rerank` block is off by default because it makes one LLM call per reranked query.
+All fields optional. Sensible defaults provided. `auth_token` is generated
+automatically the first time you run `ironmem serve` without `--no-auth`.
+The `embedding` block is optional; omit it and IronMem behaves exactly as before.
+The `rerank` block is off by default because it adds rerank work per query.
+The `auto_compress`/`scheduler` blocks are inert until you run `ironmem sweep`,
+`ironmem scheduler run`, or install the launchd agent. See
+[Sleep Cycle Auto-Compression](docs/sleep-cycle-autocompress.md).
 
 ### Semantic Search & Embeddings
 
-IronMem can blend **keyword (FTS)** and **semantic (vector)** retrieval using [Reciprocal Rank Fusion](https://en.wikipedia.org/wiki/Reciprocal_rank_fusion), and rank session-start injection by a blend of **relevance + recency + importance**. Embeddings are stored locally in SQLite via [`sqlite-vec`](https://github.com/asg017/sqlite-vec) (or pgvector on Postgres); nothing is sent anywhere unless you explicitly choose an API provider.
+IronMem can blend **keyword (FTS)** and **semantic (vector)** retrieval using
+[Reciprocal Rank Fusion](https://en.wikipedia.org/wiki/Reciprocal_rank_fusion),
+and rank session-start injection by **relevance + recency + importance**.
+Embeddings are stored locally in SQLite via
+[`sqlite-vec`](https://github.com/asg017/sqlite-vec) or pgvector on Postgres.
+Nothing is sent anywhere unless you explicitly choose an API provider.
 
-**Privacy posture:** this is a governance tool, so the default is **local-first / no data egress**. The `auto` provider prefers a local embedder and silently degrades to keyword-only search if none is available — it never phones home and never hard-fails a command.
+**Privacy posture:** this is a governance tool, so the default is
+**local-first / no data egress**. The `auto` provider prefers a local embedder
+and silently degrades to keyword-only search if none is available.
 
 | `embedding.provider` | Behavior | Data egress |
 |----------------------|----------|-------------|
@@ -702,9 +816,35 @@ ollama pull nomic-embed-text
 cargo install --path . --features local-onnx
 ```
 
-**Blend weights** (`embedding.weights`) control session-start injection ranking: `relevance` (semantic match to your current git context), `recency` (true half-life decay set by `recency_half_life_days`), and `importance` (an LLM-assigned 1–10 score per memory). They need not sum to 1.
+**Blend weights** (`embedding.weights`) control session-start injection ranking:
+`relevance` (semantic match to current git context), `recency` (true half-life
+decay set by `recency_half_life_days`), and `importance` (an LLM-assigned 1–10
+score per memory). They need not sum to 1.
 
-**Reranking** (`rerank.enabled`) is optional and disabled by default. When enabled, IronMem pulls a wider candidate pool, asks the configured LLM to rerank compact snippets, then re-anchors results so strong base temporal answers are not lost. Per-request REST callers can override with `?rerank=true` or `?rerank=false`.
+**Reranking** (`rerank.enabled`) is optional and disabled by default. When enabled,
+IronMem pulls a wider candidate pool and re-anchors results so strong base
+temporal/source-fact answers are not lost. `rerank.backend = "llm"` asks the
+configured model to reorder compact snippets. `rerank.backend = "cross_encoder"`
+uses the local ONNX cross-encoder when the binary is built with `local-onnx`
+(and can use CUDA with the `gpu` feature). Per-request REST callers can override
+with `?rerank=true` or `?rerank=false`.
+
+**Source-fact retention and multi-hop expansion** are part of the base retrieval
+stack. Exact source facts can be retained through fusion so route weights do not
+bury direct evidence, and multi-hop-looking questions get bridge queries instead
+of relying on one flat search.
+
+### Sleep Cycle Auto-Compression
+
+`ironmem sweep` compacts idle or high-volume sessions without waiting for a client
+to call `session_end`. `ironmem scheduler run` loops that sweep on a conservative
+cadence and runs dream/reflection less often. Both paths use DB leases and audit
+events, and provider failures leave sessions uncompressed for retry.
+
+Cloud deployments should prefer attached service accounts for Vertex AI. Local
+macOS unattended mode can use `GOOGLE_APPLICATION_CREDENTIALS` explicitly, stored
+outside the repo. Full setup details:
+[Sleep Cycle Auto-Compression](docs/sleep-cycle-autocompress.md).
 
 **Backfill existing memories** — after enabling embeddings, index memories created before:
 
@@ -716,15 +856,18 @@ ironmem embed --force      # rebuild the whole index from scratch
 
 ### Provider
 
-IronMem supports three LLM providers for session compression:
+IronMem supports four LLM providers for session compression:
 
 | Provider | `provider` value | Default model | API key env var |
 |----------|-----------------|---------------|-----------------|
 | **Anthropic** | `"anthropic"` | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` |
 | **OpenAI** | `"openai"` | `gpt-4o` | `OPENAI_API_KEY` |
 | **Google Gemini** | `"google"` | `gemini-2.0-flash` | `GOOGLE_API_KEY` |
+| **Vertex AI Gemini** | `"vertex"` | `gemini-2.5-flash` | ADC / attached service account |
 
-To switch providers, set `"provider"` in `~/.ironmem/settings.json` and ensure the corresponding API key is set. The `model` field overrides the provider's default model.
+To switch providers, set `"provider"` in `~/.ironmem/settings.json` and ensure
+the corresponding API key or ADC auth path is available. The `model` field
+overrides the provider's default model.
 
 ### Environment Variables
 
@@ -735,14 +878,29 @@ To switch providers, set `"provider"` in `~/.ironmem/settings.json` and ensure t
 | `ANTHROPIC_API_KEY` | _(none)_ | Required when provider is `anthropic` (default) |
 | `OPENAI_API_KEY` | _(none)_ | Required when provider is `openai` |
 | `GOOGLE_API_KEY` | _(none)_ | Required when provider is `google` |
+| `IRONMEM_VERTEX_PROJECT` | _(none)_ | Vertex AI project when provider is `vertex` and settings omit `vertex_project` |
+| `IRONMEM_VERTEX_LOCATION` | `global` | Vertex AI region/location override |
+| `GOOGLE_APPLICATION_CREDENTIALS` | _(ADC)_ | Optional local service-account key path for Vertex; prefer attached service accounts in cloud |
+| `IRONMEM_RERANK_BACKEND` | settings value | Runtime override for `llm` vs `cross_encoder` reranking |
 
 ### API Key
 
 IronMem needs an LLM API key to compress session observations into memories.
 
-**Recommended (Anthropic):** write the key to `~/.ironmem/api_key` (`echo "your-key" > ~/.ironmem/api_key && chmod 600 ~/.ironmem/api_key`). Keeping it in this file rather than a global `ANTHROPIC_API_KEY` export avoids changing how other tools bill — Claude Code, for instance, charges pay-as-you-go API credit whenever `ANTHROPIC_API_KEY` is set in the environment, instead of using your subscription. IronMem reads the file automatically (it also works when the background server is spawned via `nohup`, where some shells strip env vars from child processes).
+**Recommended (Anthropic):** write the key to `~/.ironmem/api_key`:
 
-IronMem still honors the per-provider environment variable if you prefer it — `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GOOGLE_API_KEY`. The file fallback applies to the default Anthropic provider.
+```bash
+echo "your-key" > ~/.ironmem/api_key
+chmod 600 ~/.ironmem/api_key
+```
+
+Keeping it in this file rather than a global `ANTHROPIC_API_KEY` export avoids
+changing how other tools bill. Claude Code, for instance, charges pay-as-you-go
+API credit whenever `ANTHROPIC_API_KEY` is set in the environment instead of
+using your subscription. IronMem reads the file automatically.
+
+IronMem still honors per-provider environment variables if you prefer them:
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or Vertex ADC.
 
 ---
 
@@ -751,18 +909,25 @@ IronMem still honors the per-provider environment variable if you prefer it — 
 Current local verification for this README state:
 
 ```bash
-CARGO_TARGET_DIR=/tmp/ironmem-codex-target cargo test --bin ironmem -- --nocapture
-CARGO_TARGET_DIR=/tmp/ironmem-codex-target cargo clippy --bin ironmem -- -D warnings
+cargo test --bin ironmem
+cargo test --test mcp_stdio_clean
+cargo clippy --bin ironmem --features local-onnx -- -D warnings
 ```
 
 Result:
 
-- **157 tests passed**
+- **192 tests passed**
+- **MCP stdio cleanliness passed**
 - **1 benchmark intentionally ignored** (`bench_ccr_dict_vs_floor`)
 - **0 failed**
-- **Clippy clean with `-D warnings`**
+- **Clippy clean with `local-onnx` enabled and `-D warnings`**
 
-Coverage includes CCR round trips and corruption checks, UTF-8-safe truncation, typed/scoped memories, user profile regeneration, correction mining, semantic retrieval, temporal lookup routing, graph reconciliation, chunk skim/expand flows, MCP auth/tools, REST-facing behavior through shared handlers, vector backfill/purge, provider parsing, and the end-to-end semantic pipeline.
+Coverage includes CCR round trips and corruption checks, UTF-8-safe truncation,
+typed/scoped memories, user profile regeneration, correction mining, semantic
+retrieval, temporal lookup routing, graph reconciliation, chunk skim/expand
+flows, sweep leases/dry-run/idempotency/failure behavior, MCP auth/tools,
+REST-facing behavior through shared handlers, vector backfill/purge, provider
+parsing, and the end-to-end semantic pipeline.
 
 ---
 
@@ -867,7 +1032,9 @@ It solves one narrow problem well: session memory for AI coding workflows.
 
 ## Why not just use CLAUDE.md?
 
-`CLAUDE.md` is great for static project context — things like "use tabs not spaces" or "we use Axum for routing." But it's manual. You write it, you maintain it, and it doesn't know what happened last session.
+`CLAUDE.md` is great for static project context like "use tabs not spaces" or
+"we use Axum for routing." But it is manual, and it does not know what happened
+last session.
 
 IronMem is **automatic and session-aware:**
 
@@ -916,25 +1083,52 @@ This starts IronMem with Streamable HTTP on `http://localhost:37779/mcp` and Pos
 
 ### Shipped in v0.4.0
 
-- [x] **Semantic foundation** — hybrid FTS + vector + temporal graph (RRF) retrieval, local-first embeddings, and relevance-ranked session-start injection
-- [x] **Reliability & security hardening** — stdio MCP stream is no longer corrupted by log output, UTF-8-safe truncation prevents a crash on multibyte tool output, and 7 dependency advisories were patched
-- [x] **CCR — losslessly reversible memory** (Headroom pattern): a content-addressed, deduplicated blob store + byte-exact per-content-type compression (zstd + per-type dictionaries) + a `retrieve_original` tool, so the verbatim original behind any compressed memory is always recoverable — no more lossy truncation. Refcount GC (`ironmem gc`) + storage stats in `get_status`. [Design »](docs/superpowers/plans/2026-06-07-ironmem-ccr-supermemory.md)
-- [x] **Memory scoping & types** (Supermemory patterns): project vs. user (cross-project) scope, typed memories (`error_solution` / `preference` / `procedural` / `architecture` / `learned_pattern` / …), scope-aware injection with per-kind boosts, and a `remember` tool
-- [x] **Dual-output compression** — every compressed session can persist a narrative memory plus separate `kind=fact` memories; facts inherit event-time metadata when available and are indexed for direct retrieval.
-- [x] **Always-injected user profile** — cross-project facts distilled into one profile memory (LLM summary or deterministic local rollup); `get_profile` / `refresh_profile`
+- [x] **Semantic foundation** — hybrid FTS + vector + temporal graph retrieval,
+  local-first embeddings, and relevance-ranked session-start injection.
+- [x] **Reliability & security hardening** — stdio MCP stream is no longer
+  corrupted by log output, UTF-8-safe truncation prevents multibyte crashes, and
+  7 dependency advisories were patched.
+- [x] **CCR — losslessly reversible memory** — content-addressed, deduplicated,
+  byte-exact compressed blobs plus `retrieve_original`, refcount GC, and storage
+  stats in `get_status`.
+- [x] **Memory scoping & types** — project vs. user scope, typed memories,
+  scope-aware injection with per-kind boosts, and a `remember` tool.
+- [x] **Dual-output compression** — compressed sessions can persist a narrative
+  memory plus separate `kind=fact` memories with event-time metadata.
+- [x] **Always-injected user profile** — cross-project facts distilled into one
+  profile memory; `get_profile` / `refresh_profile`.
 - [x] **Correction miner** — error→fix loops become `error_solution` memories, surfaced via `list_corrections`
-- [x] **Temporal graph lite** — compression now extracts structured `source | relation | target` edges with dates, confidence, memory provenance, and reconciliation. Exact duplicates and superseded current-state edges are marked in history rather than deleted. Query with `ironmem graph`, REST `/graph`, or MCP `memory_graph`; active edges also feed hybrid search as a relation-ranked retrieval signal.
-- [x] **Graph operations** — `ironmem reconcile` / MCP `reconcile_memory_graph` repair legacy duplicate/current-state edges with dry-run counts, and `ironmem graph-backfill` extracts graph relations for older memories without mutating summaries.
-- [x] **Temporal and procedural recall** — graph queries support valid-time filters (`--at`, `at_time`, REST `at`), compression validates dates, reusable workflow rules are extracted/stored as `kind=procedural`, and temporal lookup queries route toward date-bearing facts instead of graph-only relationship hits.
-- [x] **Adaptive working-memory skim** — `memory_chunks` store model-agnostic compressed chunk maps with density, kind, title, token estimate, source offsets, and `chunk_id` expansion handles. Use MCP `memory_skim`, REST `/skim`, or `get_context` expansions, then expand exact evidence with `retrieve_original`.
-- [x] **Operator OS adapter + eval harness** — `docs/operator-os-memory-adapter.md` defines tenant/worker/work-item memory mapping, and `ironmem eval` writes repeatable graph/temporal/procedural eval reports with command, model, and commit metadata.
+- [x] **Temporal graph lite** — compression extracts structured relation edges
+  with dates, confidence, provenance, reconciliation, and graph-aware retrieval.
+- [x] **Graph operations** — `ironmem reconcile`, `reconcile_memory_graph`, and
+  `ironmem graph-backfill` repair or backfill graph edges without rewriting
+  summaries.
+- [x] **Temporal and procedural recall** — valid-time graph filters, date-bearing
+  fact routing, reusable `kind=procedural` memories, and temporal lookup routing.
+- [x] **Adaptive working-memory skim** — model-agnostic `memory_chunks` with
+  density, kind, title, source offsets, and `chunk_id` expansion handles.
+- [x] **Record-run retrieval hardening** — source-fact retention, multi-hop query
+  expansion, and rerank re-anchoring keep exact temporal/source hits from being
+  lost.
+- [x] **Cross-encoder reranking** — local ONNX reranking with a bounded candidate
+  cap, plus a `gpu` Cargo feature for CUDA-backed benchmark-scale throughput.
+- [x] **Sleep-cycle auto-compression** — `ironmem sweep`, `ironmem scheduler run`,
+  and launchd install/uninstall compact idle sessions with DB leases, dry-run
+  output, audit events, provider backoff, and slower dream/reflection passes.
+- [x] **Operator OS adapter + eval harness** — tenant/worker/work-item memory
+  mapping plus repeatable graph/temporal/procedural eval reports.
 - [x] **Closed-loop quality + curation** — usage feedback and injection events adjust ranking; the Web UI can inspect graph edges and mark hallucinated links as user-deleted.
-- [x] **AST-bound memory + reflection + time travel + sync** — Tree-sitter Rust code anchors, dry-run/apply reflection proposals, CCR-backed snapshots, and an idempotent sync event log are implemented.
-- [x] **Current verification** — 160 Rust tests pass, 1 benchmark is intentionally ignored, standalone MCP stdio cleanliness passes, and clippy is clean with `-D warnings`.
+- [x] **AST-bound memory + reflection + time travel + sync** — Tree-sitter Rust
+  code anchors, dry-run/apply reflection proposals, CCR-backed snapshots, and an
+  idempotent sync event log.
+- [x] **Current verification** — 192 Rust tests pass, 1 benchmark is intentionally
+  ignored, MCP stdio cleanliness passes, the release `local-onnx` build passes,
+  and clippy is clean with `local-onnx` enabled.
 
 ### Next
 
-- [ ] **Bespoke per-content-type transforms** — invertible log timestamp-delta / diff-token / AST-aware code normalization on top of the dictionary codecs (currently documented-future; the byte-exact contract is the gate)
+- [ ] **Bespoke per-content-type transforms** — invertible log timestamp-delta,
+  diff-token, and AST-aware code normalization on top of the dictionary codecs.
 - [ ] **Observation-blob lifecycle GC** — reclaim CCR blobs behind deleted observations (memory-session blobs are already GC'd)
 
 ---
