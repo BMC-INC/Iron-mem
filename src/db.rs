@@ -3389,6 +3389,37 @@ pub async fn memory_edges_for_memory(db: &Database, memory_id: i64) -> Result<Ve
     Ok(rows.into_iter().map(memory_edge_from_row).collect())
 }
 
+/// Batch-fetch active/current graph edges for candidate memories. Used by
+/// structured reranking so the scorer sees relationship evidence, not just the
+/// leading memory summary. Ids are DB-generated integers and safe to inline.
+pub async fn memory_edges_for_memories(
+    db: &Database,
+    memory_ids: &[i64],
+) -> Result<HashMap<i64, Vec<MemoryEdge>>> {
+    let mut out: HashMap<i64, Vec<MemoryEdge>> = HashMap::new();
+    if memory_ids.is_empty() {
+        return Ok(out);
+    }
+    let in_list = memory_ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, project, memory_id, source, relation, target, valid_from, valid_until,
+                observed_at, confidence, superseded_by, superseded_reason, created_at
+         FROM memory_edges
+         WHERE superseded_by IS NULL AND memory_id IN ({in_list})
+         ORDER BY memory_id ASC, confidence DESC, observed_at DESC, id DESC"
+    );
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql).fetch_all(&db.pool).await?;
+    for row in rows {
+        let edge = memory_edge_from_row(row);
+        out.entry(edge.memory_id).or_default().push(edge);
+    }
+    Ok(out)
+}
+
 pub async fn delete_memory_edges(db: &Database, memory_id: i64) -> Result<()> {
     sqlx::query("DELETE FROM memory_edges WHERE memory_id = $1")
         .bind(memory_id)

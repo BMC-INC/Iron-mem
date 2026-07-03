@@ -1164,19 +1164,43 @@ struct RerankEvidence {
     kind: String,
     event_time: Option<String>,
     source_ref: Option<String>,
+    chunks: Vec<db::MemoryChunk>,
+    graph_edges: Vec<db::MemoryEdge>,
+    query_route: QueryRoute,
+    temporal_proximity: Option<f64>,
 }
 
-async fn enrich_rerank_evidence(db: &Database, candidates: Vec<Memory>) -> Vec<RerankEvidence> {
+async fn enrich_rerank_evidence(
+    db: &Database,
+    query: &str,
+    candidates: Vec<Memory>,
+) -> Vec<RerankEvidence> {
     let mut out = Vec::with_capacity(candidates.len());
+    let ids: Vec<i64> = candidates.iter().map(|m| m.id).collect();
+    let chunks = db::chunks_for_memories(db, &ids).await.unwrap_or_default();
+    let graph_edges = db::memory_edges_for_memories(db, &ids)
+        .await
+        .unwrap_or_default();
+    let query_route = classify_query_route(query);
+    let query_anchor = query_date_anchor(query);
     for memory in candidates {
+        let memory_id = memory.id;
         let meta = db::get_memory_meta_full(db, memory.id)
             .await
             .unwrap_or_default();
+        let temporal_proximity = meta
+            .event_time
+            .as_deref()
+            .map(|event_time| temporal_proximity_score(query_anchor, event_time));
         out.push(RerankEvidence {
             memory,
             kind: meta.kind,
             event_time: meta.event_time,
             source_ref: meta.source_ref,
+            chunks: chunks.get(&memory_id).cloned().unwrap_or_default(),
+            graph_edges: graph_edges.get(&memory_id).cloned().unwrap_or_default(),
+            query_route,
+            temporal_proximity,
         });
     }
     out
@@ -1191,17 +1215,101 @@ fn compact_text(text: &str, cap: usize) -> String {
         .join(" ")
 }
 
+fn query_route_label(route: QueryRoute) -> &'static str {
+    match route {
+        QueryRoute::SingleHop => "single_hop",
+        QueryRoute::MultiHop => "multi_hop",
+        QueryRoute::Temporal => "temporal",
+        QueryRoute::OpenDomain => "open_domain",
+    }
+}
+
+fn temporal_proximity_label(score: f64) -> &'static str {
+    if score >= 0.99 {
+        "exact"
+    } else if score >= 0.80 {
+        "near"
+    } else if score >= 0.35 {
+        "related_date"
+    } else {
+        "weak_or_missing"
+    }
+}
+
+fn chunk_evidence_text(chunks: &[db::MemoryChunk]) -> Option<String> {
+    let mut parts = Vec::new();
+    for chunk in chunks.iter().take(3) {
+        let mut piece = format!(
+            "{}:{}",
+            compact_text(&chunk.title, 80),
+            compact_text(&chunk.summary, 220)
+        );
+        if let (Some(start), Some(end)) = (chunk.source_start, chunk.source_end) {
+            piece.push_str(&format!(" source_span={start}..{end}"));
+        }
+        if !chunk.chunk_id.trim().is_empty() {
+            piece.push_str(&format!(" chunk_id={}", compact_text(&chunk.chunk_id, 80)));
+        }
+        parts.push(piece);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" ; "))
+    }
+}
+
+fn graph_edge_evidence_text(edges: &[db::MemoryEdge]) -> Option<String> {
+    let mut parts = Vec::new();
+    for edge in edges.iter().take(4) {
+        let mut piece = format!(
+            "{} --{}--> {}",
+            compact_text(&edge.source, 80),
+            compact_text(&edge.relation, 60),
+            compact_text(&edge.target, 80)
+        );
+        if edge.valid_from.is_some() || edge.valid_until.is_some() {
+            piece.push_str(&format!(
+                " valid={}..{}",
+                edge.valid_from.as_deref().unwrap_or(""),
+                edge.valid_until.as_deref().unwrap_or("")
+            ));
+        }
+        piece.push_str(&format!(" confidence={:.2}", edge.confidence));
+        parts.push(piece);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" ; "))
+    }
+}
+
 fn structured_rerank_text(e: &RerankEvidence) -> String {
     let mut parts = Vec::new();
+    parts.push(format!("route={}", query_route_label(e.query_route)));
     parts.push(format!("kind={}", e.kind));
     if let Some(event_time) = e.event_time.as_deref().filter(|s| !s.trim().is_empty()) {
         parts.push(format!("event_time={event_time}"));
+    }
+    if let Some(score) = e.temporal_proximity {
+        parts.push(format!(
+            "date_proximity={:.2}:{}",
+            score,
+            temporal_proximity_label(score)
+        ));
     }
     if let Some(tags) = e.memory.tags.as_deref().filter(|s| !s.trim().is_empty()) {
         parts.push(format!("tags={}", compact_text(tags, 120)));
     }
     if let Some(source_ref) = e.source_ref.as_deref().filter(|s| !s.trim().is_empty()) {
         parts.push(format!("source_ref={}", compact_text(source_ref, 120)));
+    }
+    if let Some(chunks) = chunk_evidence_text(&e.chunks) {
+        parts.push(format!("chunk_evidence={chunks}"));
+    }
+    if let Some(edges) = graph_edge_evidence_text(&e.graph_edges) {
+        parts.push(format!("graph_edges={edges}"));
     }
     parts.push(format!(
         "evidence={}",
@@ -1217,7 +1325,8 @@ fn build_rerank_prompt(query: &str, candidates: &[RerankEvidence]) -> String {
     s.push_str(
         "You are selecting which structured memory evidence best helps answer a question.\n\
          Read the QUESTION, then the numbered CANDIDATES. Each candidate may include \
-         kind, event_time, tags, source_ref, and evidence text.\n\n",
+         route, kind, event_time, date_proximity, tags, source_ref, chunk_evidence, \
+         graph_edges, and evidence text.\n\n",
     );
     s.push_str("QUESTION: ");
     s.push_str(query);
@@ -1230,8 +1339,11 @@ fn build_rerank_prompt(query: &str, candidates: &[RerankEvidence]) -> String {
          answering the question, as a comma-separated list (e.g. \"4,1,9\"). Rank a \
          candidate that contains the SPECIFIC answer the question asks for — the exact \
          date, name, number, event, relationship, source, or temporal fact — above one \
-         that is merely on the same topic. Prefer candidates whose event_time/source_ref \
-         directly support the answer. \
+         that is merely on the same topic. For multi-hop questions, prefer candidates \
+         whose graph_edges or chunk_evidence bridge the named people, places, events, \
+         or dates. For temporal questions, prefer exact or near date_proximity and \
+         event_time over broad recency. Prefer source_ref/chunk evidence that can be \
+         traced back to the original session. \
          Include only genuinely relevant numbers; omit the rest. Output ONLY the list.",
     );
     s
@@ -1309,7 +1421,7 @@ pub async fn llm_rerank(
     } else {
         config.rerank.model.as_str()
     };
-    let evidence = enrich_rerank_evidence(db, candidates.clone()).await;
+    let evidence = enrich_rerank_evidence(db, query, candidates.clone()).await;
     let prompt = build_rerank_prompt(query, &evidence);
     match crate::provider::complete_with(&prompt, model, config).await {
         Ok(reply) => {
@@ -1321,6 +1433,25 @@ pub async fn llm_rerank(
             candidates.into_iter().take(limit).collect()
         }
     }
+}
+
+async fn rerank_candidates(
+    db: &Database,
+    config: &Config,
+    query: &str,
+    candidates: Vec<Memory>,
+    limit: usize,
+) -> Vec<Memory> {
+    if config.rerank.backend.eq_ignore_ascii_case("cross_encoder") {
+        let cap = config.rerank.cross_encoder_max_candidates.max(limit);
+        let head = candidates.len().min(cap);
+        let evidence = enrich_rerank_evidence(db, query, candidates[..head].to_vec()).await;
+        let docs: Vec<String> = evidence.iter().map(rerank_doc).collect();
+        if let Some(order) = crate::reranker::rerank_order(query, &docs) {
+            return fuse_rerank(&candidates, &order, limit);
+        }
+    }
+    llm_rerank(db, config, query, candidates, limit).await
 }
 
 /// Merge the narrow (`limit`-sized) retrieval with the wider pool: narrow items
@@ -1405,24 +1536,7 @@ pub async fn rerank_search_in_namespace_with_pool(
     let wide =
         hybrid_search_in_namespace(db, embedder, store, namespace, project, query, pool).await?;
     let candidates = reanchor(narrow, wide);
-    // (Wave 4) Cross-encoder rerank when selected and its model is loaded. On any
-    // unavailability `rerank_order` returns None and we keep the LLM reranker, so
-    // selecting the cross-encoder can only help. `fuse_rerank` preserves recall
-    // (a base candidate omitted by the order is still appended), identical to the
-    // LLM path's guarantee.
-    if config.rerank.backend.eq_ignore_ascii_case("cross_encoder") {
-        // Score only the top-N of the reanchored pool (CPU cost is linear in N);
-        // `fuse_rerank` keeps the un-scored tail in base order, so recall is
-        // preserved even though the cross-encoder never saw it.
-        let cap = config.rerank.cross_encoder_max_candidates.max(limit);
-        let head = candidates.len().min(cap);
-        let evidence = enrich_rerank_evidence(db, candidates[..head].to_vec()).await;
-        let docs: Vec<String> = evidence.iter().map(rerank_doc).collect();
-        if let Some(order) = crate::reranker::rerank_order(query, &docs) {
-            return Ok(fuse_rerank(&candidates, &order, limit));
-        }
-    }
-    Ok(llm_rerank(db, config, query, candidates, limit).await)
+    Ok(rerank_candidates(db, config, query, candidates, limit).await)
 }
 
 /// (W3.1) Heuristic gate for the iterative multi-hop loop: a question that chains
@@ -1594,7 +1708,7 @@ pub async fn iterative_rerank_search_in_namespace(
     }
 
     // Final precision pass over the union, scored against the original question.
-    Ok(llm_rerank(db, config, query, pool, limit).await)
+    Ok(rerank_candidates(db, config, query, pool, limit).await)
 }
 
 // ── Blended injection ranking ───────────────────────────────────────
@@ -2242,11 +2356,54 @@ mod tests {
     }
 
     fn ev(memory: Memory, kind: &str, event_time: Option<&str>) -> RerankEvidence {
+        let temporal_proximity = event_time.map(|_| 1.0);
         RerankEvidence {
             memory,
             kind: kind.to_string(),
             event_time: event_time.map(|s| s.to_string()),
             source_ref: Some("mem:source:fact:1".to_string()),
+            chunks: Vec::new(),
+            graph_edges: Vec::new(),
+            query_route: QueryRoute::Temporal,
+            temporal_proximity,
+        }
+    }
+
+    fn test_chunk(memory_id: i64, title: &str, summary: &str) -> db::MemoryChunk {
+        db::MemoryChunk {
+            id: 1,
+            chunk_id: format!("mem:{memory_id}:chunk:0"),
+            project: "/p".to_string(),
+            memory_id,
+            session_id: "s".to_string(),
+            ordinal: 0,
+            density: "high".to_string(),
+            kind: "fact".to_string(),
+            title: title.to_string(),
+            summary: summary.to_string(),
+            source_hash: Some("hash".to_string()),
+            source_start: Some(10),
+            source_end: Some(42),
+            token_estimate: 12,
+            created_at: 0,
+        }
+    }
+
+    fn test_edge(memory_id: i64, source: &str, relation: &str, target: &str) -> db::MemoryEdge {
+        db::MemoryEdge {
+            id: 1,
+            project: "/p".to_string(),
+            memory_id,
+            source: source.to_string(),
+            relation: relation.to_string(),
+            target: target.to_string(),
+            valid_from: Some("2023-05-01".to_string()),
+            valid_until: None,
+            observed_at: 0,
+            confidence: 0.91,
+            superseded_by: None,
+            superseded_reason: None,
+            created_at: 0,
         }
     }
 
@@ -2370,12 +2527,37 @@ mod tests {
         ];
         let p = build_rerank_prompt("when did it happen?", &cands);
         assert!(p.contains("QUESTION: when did it happen?"));
-        assert!(p.contains("1. kind=fact"));
+        assert!(p.contains("route=temporal"));
+        assert!(p.contains("kind=fact"));
         assert!(p.contains("event_time=2023-05-07"));
+        assert!(p.contains("date_proximity=1.00:exact"));
         assert!(p.contains("source_ref=mem:source:fact:1"));
         assert!(p.contains("evidence=short fact"));
         // The 900-char candidate is capped — its raw text never appears in full.
         assert!(!p.contains(&"x".repeat(RERANK_SNIPPET_CHARS + 1)));
+    }
+
+    #[test]
+    fn structured_rerank_text_includes_chunks_and_graph_edges() {
+        let mut evidence = ev(
+            mk(7, "Caroline moved after the Operator OS assignment."),
+            "fact",
+            Some("2023-05-07"),
+        );
+        evidence.query_route = QueryRoute::MultiHop;
+        evidence.chunks = vec![test_chunk(
+            7,
+            "source turn",
+            "Caroline was assigned to Operator OS, then moved to Austin.",
+        )];
+        evidence.graph_edges = vec![test_edge(7, "Caroline", "assigned_to", "Operator OS")];
+
+        let text = structured_rerank_text(&evidence);
+        assert!(text.contains("route=multi_hop"));
+        assert!(text.contains("chunk_evidence=source turn"));
+        assert!(text.contains("source_span=10..42"));
+        assert!(text.contains("graph_edges=Caroline --assigned_to--> Operator OS"));
+        assert!(text.contains("confidence=0.91"));
     }
 
     #[test]
