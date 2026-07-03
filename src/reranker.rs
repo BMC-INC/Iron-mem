@@ -42,11 +42,21 @@ mod onnx {
             // Reuse the embedder's writable cache (a launchd agent runs from "/",
             // where fastembed's default ./.fastembed_cache is unwritable).
             let cache_dir = crate::config::ironmem_dir().join("fastembed_cache");
-            let model = fastembed::TextRerank::try_new(
-                fastembed::RerankInitOptions::new(model_for(name))
-                    .with_cache_dir(cache_dir)
-                    .with_show_download_progress(false),
-            )?;
+            let opts = fastembed::RerankInitOptions::new(model_for(name))
+                .with_cache_dir(cache_dir)
+                .with_show_download_progress(false);
+            #[cfg(feature = "gpu")]
+            let opts = {
+                let opts = opts.with_execution_providers(vec![
+                    ort::execution_providers::CUDAExecutionProvider::default().build(),
+                ]);
+                // CUDA execution provider for benchmark-scale throughput; ort appends
+                // a CPU fallback automatically, so a `gpu` build still runs (slower) on
+                // a CPU-only box rather than hard-failing.
+                tracing::info!("cross-encoder: requesting CUDA execution provider");
+                opts
+            };
+            let model = fastembed::TextRerank::try_new(opts)?;
             Ok(Self { model })
         }
 

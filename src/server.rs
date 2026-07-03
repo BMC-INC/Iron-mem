@@ -59,7 +59,7 @@ pub fn router(state: AppState) -> Router {
             .and_then(|v| v.trim().parse::<f64>().ok())
             .unwrap_or(fallback)
     };
-    crate::retrieval::set_retrieval_tuning(crate::retrieval::RetrievalTuning {
+    let retrieval_tuning = crate::retrieval::RetrievalTuning {
         temporal_fusion_weight: state.config.temporal_trust.temporal_event_fusion_weight,
         trust_weight: env_f64(
             "IRONMEM_TEMPORAL_TRUST_WEIGHT",
@@ -71,7 +71,16 @@ pub fn router(state: AppState) -> Router {
             "IRONMEM_GOVERNANCE_ROUTER_WEIGHT",
             state.config.governance_router.weight,
         ),
-    });
+    };
+    // Log the resolved weights so a run can be audited for which retrieval levers
+    // were actually live (env override vs settings default) — no more silent config.
+    tracing::info!(
+        "retrieval tuning: tier_weight={} trust_weight={} temporal_fusion_weight={}",
+        retrieval_tuning.tier_weight,
+        retrieval_tuning.trust_weight,
+        retrieval_tuning.temporal_fusion_weight,
+    );
+    crate::retrieval::set_retrieval_tuning(retrieval_tuning);
     Router::new()
         .route("/session/start", post(session_start))
         .route("/session/end", post(session_end))
