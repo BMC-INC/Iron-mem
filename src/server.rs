@@ -837,6 +837,8 @@ fn truthy(v: &Option<String>) -> Option<bool> {
 pub struct ContextResponse {
     pub memories: Vec<db::Memory>,
     pub expansions: Vec<ContextExpansion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_chains: Vec<ContextEvidenceChain>,
     /// (W3.3) Event date per memory id (ISO-ish, from `event_time`), so the
     /// answerer reads the date as a field instead of inferring it from prose.
     /// Only memories that carry a date appear here.
@@ -882,6 +884,41 @@ pub struct ContextExpansion {
     pub chunks: Vec<db::MemoryChunk>,
 }
 
+#[derive(Serialize)]
+pub struct ContextEvidenceChain {
+    pub memory_id: i64,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chunks: Vec<db::MemoryChunk>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graph_edges: Vec<db::MemoryEdge>,
+}
+
+async fn context_evidence_chains(
+    db: &db::Database,
+    memory_ids: &[i64],
+    chunks: &std::collections::HashMap<i64, Vec<db::MemoryChunk>>,
+) -> Result<Vec<ContextEvidenceChain>, anyhow::Error> {
+    let graph_edges = db::memory_edges_for_memories(db, memory_ids).await?;
+    let mut chains = Vec::with_capacity(memory_ids.len());
+    for &memory_id in memory_ids {
+        let meta = db::get_memory_meta_full(db, memory_id).await?;
+        chains.push(ContextEvidenceChain {
+            memory_id,
+            kind: meta.kind,
+            event_time: meta.event_time,
+            source_ref: meta.source_ref,
+            chunks: chunks.get(&memory_id).cloned().unwrap_or_default(),
+            graph_edges: graph_edges.get(&memory_id).cloned().unwrap_or_default(),
+        });
+    }
+    Ok(chains)
+}
+
 async fn get_context(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ContextQuery>,
@@ -898,10 +935,7 @@ async fn get_context(
     let ranked_query = matches!(&params.query, Some(q) if !q.is_empty());
     let memories = match &params.query {
         Some(q) if !q.is_empty() => {
-            if rerank_on
-                && state.config.multi_hop_enabled()
-                && retrieval::is_multi_hop_query(q)
-            {
+            if rerank_on && state.config.multi_hop_enabled() && retrieval::is_multi_hop_query(q) {
                 // (W3.1) Multi-hop question → iterative retrieve→reason→re-query.
                 // Gated to multi-hop-looking queries so single-hop pays no extra
                 // latency; degrades to a single reranked pass on any failure. An
@@ -967,8 +1001,12 @@ async fn get_context(
     let event_times = db::event_times_for(&state.db, &memory_ids)
         .await
         .unwrap_or_default();
+    let evidence_chains = context_evidence_chains(&state.db, &memory_ids, &chunks)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let expansions = memory_ids
-        .into_iter()
+        .iter()
+        .copied()
         .map(|memory_id| ContextExpansion {
             memory_id,
             chunks: chunks.get(&memory_id).cloned().unwrap_or_default(),
@@ -978,6 +1016,7 @@ async fn get_context(
     Ok(Json(ContextResponse {
         memories,
         expansions,
+        evidence_chains,
         event_times,
     }))
 }

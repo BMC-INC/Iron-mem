@@ -30,6 +30,7 @@ const FUSE_ENTITY_SIGNAL: bool = false;
 const MAX_GRAPH_ENTITIES: usize = 8;
 const GRAPH_EDGES_PER_ENTITY: usize = 12;
 const GRAPH_CHAIN_EDGES_PER_BRIDGE: usize = 6;
+const MAX_DECOMPOSED_QUERIES: usize = 6;
 const TEMPORAL_EVENT_POOL: usize = 512;
 const SOURCE_FACT_FLOOR_MAX_SLOTS: usize = 5;
 
@@ -45,6 +46,7 @@ enum QueryRoute {
 struct FusionWeights {
     fts: usize,
     vector: usize,
+    query_variant: usize,
     event_year: usize,
     temporal_event: usize,
     graph: usize,
@@ -57,6 +59,7 @@ impl FusionWeights {
             QueryRoute::Temporal => Self {
                 fts: 1,
                 vector: 1,
+                query_variant: 1,
                 event_year: 2,
                 temporal_event: temporal_weight.max(1) + 2,
                 graph: 0,
@@ -65,6 +68,7 @@ impl FusionWeights {
             QueryRoute::MultiHop => Self {
                 fts: 1,
                 vector: 2,
+                query_variant: 2,
                 event_year: 1,
                 temporal_event: temporal_weight.max(1),
                 graph: 3,
@@ -73,6 +77,7 @@ impl FusionWeights {
             QueryRoute::SingleHop => Self {
                 fts: 2,
                 vector: 1,
+                query_variant: 0,
                 event_year: 1,
                 temporal_event: temporal_weight.max(1),
                 graph: 1,
@@ -81,6 +86,7 @@ impl FusionWeights {
             QueryRoute::OpenDomain => Self {
                 fts: 1,
                 vector: 2,
+                query_variant: 0,
                 event_year: 1,
                 temporal_event: temporal_weight.max(1),
                 graph: 1,
@@ -327,27 +333,83 @@ fn is_graph_entity_token(token: &str) -> bool {
     first.is_uppercase() && (len >= 3 || token.chars().all(|c| c.is_uppercase()))
 }
 
+fn push_unique_text(out: &mut Vec<String>, seen: &mut HashSet<String>, value: impl Into<String>) {
+    let value = value
+        .into()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if value.is_empty() {
+        return;
+    }
+    if seen.insert(value.to_ascii_lowercase()) {
+        out.push(value);
+    }
+}
+
+fn entity_aliases(entity: &str) -> Vec<String> {
+    let clean = entity.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.is_empty() {
+        return Vec::new();
+    }
+    let mut aliases = Vec::new();
+    let mut seen = HashSet::new();
+    push_unique_text(&mut aliases, &mut seen, clean.clone());
+
+    let mut words: Vec<String> = clean
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_string())
+        .collect();
+    while words
+        .first()
+        .is_some_and(|w| matches!(w.to_ascii_lowercase().as_str(), "mr" | "mrs" | "ms" | "dr"))
+    {
+        words.remove(0);
+    }
+
+    if words.len() > 1 {
+        push_unique_text(&mut aliases, &mut seen, words.join(" "));
+        let useful_short = |w: &String| {
+            w.chars().count() >= 3
+                || (w.chars().count() >= 2 && w.chars().all(|c| c.is_uppercase()))
+        };
+        if let Some(first) = words.first().filter(|w| useful_short(w)) {
+            push_unique_text(&mut aliases, &mut seen, first.clone());
+        }
+        if let Some(last) = words.last().filter(|w| useful_short(w)) {
+            push_unique_text(&mut aliases, &mut seen, last.clone());
+        }
+        let acronym: String = words
+            .iter()
+            .filter_map(|w| w.chars().next())
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        if acronym.len() >= 2 && acronym.len() <= 8 {
+            push_unique_text(&mut aliases, &mut seen, acronym);
+        }
+    }
+
+    aliases
+}
+
 /// Capitalized entity phrases for graph lookup. This keeps multi-word names like
 /// "Operator OS" intact while also trying useful single-token names like
 /// "Caroline". Common question words are dropped so the graph signal stays
 /// narrow and does not become the disabled broad entity signal in disguise.
 fn query_graph_entities(query: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
+    let mut primaries = Vec::new();
+    let mut primary_seen = HashSet::new();
     let mut phrase: Vec<String> = Vec::new();
 
     let flush_phrase =
         |phrase: &mut Vec<String>, out: &mut Vec<String>, seen: &mut HashSet<String>| {
             if phrase.len() > 1 {
                 let joined = phrase.join(" ");
-                if seen.insert(joined.to_lowercase()) {
-                    out.push(joined);
-                }
+                push_unique_text(out, seen, joined);
             }
             for token in phrase.drain(..) {
-                if seen.insert(token.to_lowercase()) {
-                    out.push(token);
-                }
+                push_unique_text(out, seen, token);
             }
         };
 
@@ -355,11 +417,75 @@ fn query_graph_entities(query: &str) -> Vec<String> {
         if is_graph_entity_token(token) {
             phrase.push(token.to_string());
         } else {
-            flush_phrase(&mut phrase, &mut out, &mut seen);
+            flush_phrase(&mut phrase, &mut primaries, &mut primary_seen);
         }
     }
-    flush_phrase(&mut phrase, &mut out, &mut seen);
+    flush_phrase(&mut phrase, &mut primaries, &mut primary_seen);
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for entity in primaries {
+        for alias in entity_aliases(&entity) {
+            push_unique_text(&mut out, &mut seen, alias);
+            if out.len() >= MAX_GRAPH_ENTITIES {
+                return out;
+            }
+        }
+    }
     out.truncate(MAX_GRAPH_ENTITIES);
+    out
+}
+
+fn salient_query_terms(query: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    query
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|t| t.chars().count() >= 3)
+        .map(normalize_event_token)
+        .filter(|t| !is_temporal_stopword(t))
+        .filter(|t| seen.insert(t.clone()))
+        .collect()
+}
+
+fn decomposed_queries(query: &str) -> Vec<String> {
+    let entities = query_graph_entities(query);
+    let terms = salient_query_terms(query);
+    if entities.is_empty() || terms.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let top_terms = terms
+        .iter()
+        .filter(|term| {
+            !entities
+                .iter()
+                .any(|entity| entity.eq_ignore_ascii_case(term.as_str()))
+        })
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for entity in entities.iter().take(4) {
+        if !top_terms.is_empty() {
+            push_unique_text(
+                &mut out,
+                &mut seen,
+                format!("{entity} {}", top_terms.join(" ")),
+            );
+        }
+        for other in entities.iter().filter(|other| *other != entity).take(2) {
+            push_unique_text(&mut out, &mut seen, format!("{entity} {other}"));
+            if out.len() >= MAX_DECOMPOSED_QUERIES {
+                return out;
+            }
+        }
+        if out.len() >= MAX_DECOMPOSED_QUERIES {
+            return out;
+        }
+    }
+    out.truncate(MAX_DECOMPOSED_QUERIES);
     out
 }
 
@@ -743,6 +869,15 @@ async fn temporal_event_ids_for_query(
     }
     let date_anchor = query_date_anchor(query);
 
+    #[derive(Debug)]
+    struct TemporalCandidate {
+        id: i64,
+        score: f64,
+        evidence_quality: f64,
+        created_at: i64,
+        date_key: Option<String>,
+    }
+
     let mut scored = Vec::new();
     for candidate in backend
         .dated_memories(project, TEMPORAL_EVENT_POOL.max(limit))
@@ -758,6 +893,11 @@ async fn temporal_event_ids_for_query(
         }
 
         let kind_bonus = if candidate.kind == "fact" { 4.0 } else { 1.0 };
+        let source_bonus = if is_source_linked(&candidate.memory) {
+            2.0
+        } else {
+            0.0
+        };
         let date_specificity_bonus = if candidate
             .event_time
             .chars()
@@ -771,24 +911,53 @@ async fn temporal_event_ids_for_query(
         };
         let specificity = overlap as f64 / query_terms.len().max(1) as f64;
         let proximity = temporal_proximity_score(date_anchor, &candidate.event_time);
+        let evidence_quality = overlap as f64 * 2.0 + specificity * 2.0 + kind_bonus + source_bonus;
         let score = overlap as f64 * 10.0
             + specificity * 3.0
             + kind_bonus
+            + source_bonus
             + date_specificity_bonus
             + proximity;
-        scored.push((candidate.memory.id, score, candidate.memory.created_at));
+        scored.push(TemporalCandidate {
+            id: candidate.memory.id,
+            score,
+            evidence_quality,
+            created_at: candidate.memory.created_at,
+            date_key: event_date_anchor(&candidate.event_time)
+                .map(|anchor| anchor.date.to_string()),
+        });
+    }
+
+    // Conflict handling: when several date-bearing facts match the same temporal
+    // question but disagree on the date, favor candidates with stronger source/
+    // fact/term evidence before recency. That keeps a newer broad mention from
+    // winning over an older source-backed fact solely because it was stored last.
+    let distinct_dates: HashSet<String> = scored
+        .iter()
+        .filter_map(|candidate| candidate.date_key.clone())
+        .collect();
+    if distinct_dates.len() > 1 {
+        for candidate in &mut scored {
+            candidate.score += candidate.evidence_quality * 2.0;
+        }
     }
 
     scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
+        b.score
+            .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.2.cmp(&a.2))
-            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| {
+                b.evidence_quality
+                    .partial_cmp(&a.evidence_quality)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| a.id.cmp(&b.id))
     });
     Ok(scored
         .into_iter()
         .take(limit)
-        .map(|(id, _, _)| id)
+        .map(|candidate| candidate.id)
         .collect())
 }
 
@@ -921,6 +1090,62 @@ pub async fn hybrid_search_in_namespace(
     };
 
     let route = classify_query_route(query);
+    let query_variants = match route {
+        QueryRoute::MultiHop | QueryRoute::Temporal => decomposed_queries(query),
+        QueryRoute::SingleHop | QueryRoute::OpenDomain => Vec::new(),
+    };
+
+    // Query decomposition side: split a compound question into entity+relation
+    // probes that can retrieve bridge facts even when the full question does not
+    // lexically match either side of the evidence chain. Bounded and additive:
+    // variants enter RRF as weak signals, while the original query remains the
+    // anchor for final ranking/reranking.
+    let variant_fts_ids: Vec<i64> = if query_variants.is_empty() {
+        Vec::new()
+    } else {
+        let mut seen = HashSet::new();
+        let mut ids = Vec::new();
+        for variant in &query_variants {
+            for candidate in backend
+                .fulltext_search(namespace, project, variant, pool / 2)
+                .await
+                .unwrap_or_default()
+            {
+                if let Some(memory) = candidate.memory {
+                    if seen.insert(memory.id) {
+                        ids.push(memory.id);
+                    }
+                }
+            }
+        }
+        ids
+    };
+
+    let variant_vec_ids: Vec<i64> = if let Some(emb) = embedder {
+        if query_variants.is_empty() {
+            Vec::new()
+        } else {
+            let mut seen = HashSet::new();
+            let mut ids = Vec::new();
+            for variant in &query_variants {
+                let Some(qvec) = embed_one(emb, variant).await else {
+                    continue;
+                };
+                for candidate in backend
+                    .vector_search(project, &qvec, emb.id(), pool / 2)
+                    .await
+                    .unwrap_or_default()
+                {
+                    if seen.insert(candidate.id) {
+                        ids.push(candidate.id);
+                    }
+                }
+            }
+            ids
+        }
+    } else {
+        Vec::new()
+    };
 
     // Graph side: active temporal graph edges contribute their provenance memory
     // ids when the query names an entity present as an edge source or target.
@@ -943,6 +1168,8 @@ pub async fn hybrid_search_in_namespace(
     let mut lists: Vec<Vec<i64>> = Vec::new();
     push_weighted_signal(&mut lists, &fts_ids, weights.fts);
     push_weighted_signal(&mut lists, &vec_ids, weights.vector);
+    push_weighted_signal(&mut lists, &variant_fts_ids, weights.query_variant);
+    push_weighted_signal(&mut lists, &variant_vec_ids, weights.query_variant);
     push_weighted_signal(&mut lists, &time_ids, weights.event_year);
     push_weighted_signal(&mut lists, &temporal_event_ids, weights.temporal_event);
     push_weighted_signal(&mut lists, &graph_ids, weights.graph);
@@ -1168,6 +1395,7 @@ struct RerankEvidence {
     graph_edges: Vec<db::MemoryEdge>,
     query_route: QueryRoute,
     temporal_proximity: Option<f64>,
+    temporal_conflict: bool,
 }
 
 async fn enrich_rerank_evidence(
@@ -1183,6 +1411,15 @@ async fn enrich_rerank_evidence(
         .unwrap_or_default();
     let query_route = classify_query_route(query);
     let query_anchor = query_date_anchor(query);
+    let event_times = db::event_times_for(db, &ids).await.unwrap_or_default();
+    let candidate_event_dates: HashSet<String> = event_times
+        .values()
+        .filter_map(|event_time| {
+            event_date_anchor(event_time).map(|anchor| anchor.date.to_string())
+        })
+        .collect();
+    let has_temporal_conflict =
+        query_route == QueryRoute::Temporal && candidate_event_dates.len() > 1;
     for memory in candidates {
         let memory_id = memory.id;
         let meta = db::get_memory_meta_full(db, memory.id)
@@ -1192,6 +1429,7 @@ async fn enrich_rerank_evidence(
             .event_time
             .as_deref()
             .map(|event_time| temporal_proximity_score(query_anchor, event_time));
+        let has_event_time = meta.event_time.is_some();
         out.push(RerankEvidence {
             memory,
             kind: meta.kind,
@@ -1201,6 +1439,7 @@ async fn enrich_rerank_evidence(
             graph_edges: graph_edges.get(&memory_id).cloned().unwrap_or_default(),
             query_route,
             temporal_proximity,
+            temporal_conflict: has_temporal_conflict && has_event_time,
         });
     }
     out
@@ -1299,6 +1538,9 @@ fn structured_rerank_text(e: &RerankEvidence) -> String {
             temporal_proximity_label(score)
         ));
     }
+    if e.temporal_conflict {
+        parts.push("temporal_conflict=conflicting_candidate_dates".to_string());
+    }
     if let Some(tags) = e.memory.tags.as_deref().filter(|s| !s.trim().is_empty()) {
         parts.push(format!("tags={}", compact_text(tags, 120)));
     }
@@ -1325,8 +1567,8 @@ fn build_rerank_prompt(query: &str, candidates: &[RerankEvidence]) -> String {
     s.push_str(
         "You are selecting which structured memory evidence best helps answer a question.\n\
          Read the QUESTION, then the numbered CANDIDATES. Each candidate may include \
-         route, kind, event_time, date_proximity, tags, source_ref, chunk_evidence, \
-         graph_edges, and evidence text.\n\n",
+         route, kind, event_time, date_proximity, temporal_conflict, tags, source_ref, \
+         chunk_evidence, graph_edges, and evidence text.\n\n",
     );
     s.push_str("QUESTION: ");
     s.push_str(query);
@@ -1342,8 +1584,9 @@ fn build_rerank_prompt(query: &str, candidates: &[RerankEvidence]) -> String {
          that is merely on the same topic. For multi-hop questions, prefer candidates \
          whose graph_edges or chunk_evidence bridge the named people, places, events, \
          or dates. For temporal questions, prefer exact or near date_proximity and \
-         event_time over broad recency. Prefer source_ref/chunk evidence that can be \
-         traced back to the original session. \
+         event_time over broad recency. When temporal_conflict is present, prefer \
+         source_ref/chunk-backed fact evidence over newer broad mentions. Prefer \
+         source_ref/chunk evidence that can be traced back to the original session. \
          Include only genuinely relevant numbers; omit the rest. Output ONLY the list.",
     );
     s
@@ -1905,7 +2148,61 @@ mod tests {
                 "Operator OS".to_string(),
                 "Operator".to_string(),
                 "OS".to_string(),
+                "OO".to_string(),
                 "Caroline".to_string()
+            ]
+        );
+        assert_eq!(
+            query_graph_entities("When did Dr Alice Morgan tell Melanie?"),
+            vec![
+                "Alice Morgan".to_string(),
+                "Alice".to_string(),
+                "Morgan".to_string(),
+                "AM".to_string(),
+                "Melanie".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn decomposed_queries_build_bounded_bridge_queries() {
+        let queries = decomposed_queries(
+            "Which service does Caroline's Project Atlas depend on after launch?",
+        );
+        assert!(
+            queries
+                .iter()
+                .any(|q| q.contains("Caroline") && q.contains("depend")),
+            "{queries:?}"
+        );
+        assert!(
+            queries
+                .iter()
+                .any(|q| q.contains("Project Atlas") || q.contains("Atlas")),
+            "{queries:?}"
+        );
+        assert!(queries.len() <= MAX_DECOMPOSED_QUERIES);
+    }
+
+    #[test]
+    fn query_graph_entities_keeps_alias_cap() {
+        let entities = query_graph_entities(
+            "What did Alexander Hamilton tell Benjamin Franklin about Continental Congress?",
+        );
+        assert!(entities.len() <= MAX_GRAPH_ENTITIES);
+        assert!(entities.contains(&"Alexander Hamilton".to_string()));
+        assert!(entities.contains(&"Hamilton".to_string()));
+    }
+
+    #[test]
+    fn query_graph_entities_keeps_old_operator_shape_prefix() {
+        assert_eq!(
+            &query_graph_entities("What memory does Operator OS share with Caroline?")[..4],
+            [
+                "Operator OS".to_string(),
+                "Operator".to_string(),
+                "OS".to_string(),
+                "OO".to_string(),
             ]
         );
         assert_eq!(
@@ -2231,9 +2528,11 @@ mod tests {
         let multi = FusionWeights::for_query("Which project does Caroline depend on?", 1);
         assert!(multi.graph > multi.fts);
         assert!(multi.vector > multi.fts);
+        assert!(multi.query_variant > 0);
 
         let single = FusionWeights::for_query("What camera did Dave buy?", 1);
         assert!(single.fts > single.vector);
+        assert_eq!(single.query_variant, 0);
     }
 
     #[test]
@@ -2302,6 +2601,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn temporal_conflict_prefers_source_backed_fact_over_newer_conflict() {
+        let (db, path) = seeded_db().await;
+        let s = create_session(&db, "/tmp/p").await.unwrap();
+
+        let sourced = insert_memory(
+            &db,
+            "/tmp/p",
+            &s,
+            "Dave started his car maintenance shop on May 1, 2023",
+            Some("locomo source fact car maintenance shop"),
+        )
+        .await
+        .unwrap();
+        db::set_memory_scope_kind(&db, sourced, "project", "fact")
+            .await
+            .unwrap();
+        db::set_memory_event_time(&db, sourced, "2023-05-01")
+            .await
+            .unwrap();
+
+        let conflicting = insert_memory(
+            &db,
+            "/tmp/p",
+            &s,
+            "Dave mentioned car maintenance shop planning around June 2024",
+            Some("car maintenance shop"),
+        )
+        .await
+        .unwrap();
+        db::set_memory_scope_kind(&db, conflicting, "project", "session")
+            .await
+            .unwrap();
+        db::set_memory_event_time(&db, conflicting, "2024-06-01")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE memories SET created_at = $1 WHERE rowid = $2")
+            .bind(9_999_999_i64)
+            .bind(conflicting)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE memories SET created_at = $1 WHERE rowid = $2")
+            .bind(1_i64)
+            .bind(sourced)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let res = hybrid_search(
+            &db,
+            None,
+            &crate::vectorstore::BruteForceStore,
+            Some("/tmp/p"),
+            "When did Dave start his car maintenance shop?",
+            5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.first().map(|m| m.id), Some(sourced), "{res:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn temporal_lookup_suppresses_graph_only_hits() {
         let (db, path) = seeded_db().await;
         let s = create_session(&db, "/tmp/p").await.unwrap();
@@ -2366,6 +2728,7 @@ mod tests {
             graph_edges: Vec::new(),
             query_route: QueryRoute::Temporal,
             temporal_proximity,
+            temporal_conflict: false,
         }
     }
 
@@ -2545,6 +2908,7 @@ mod tests {
             Some("2023-05-07"),
         );
         evidence.query_route = QueryRoute::MultiHop;
+        evidence.temporal_conflict = true;
         evidence.chunks = vec![test_chunk(
             7,
             "source turn",
@@ -2554,6 +2918,7 @@ mod tests {
 
         let text = structured_rerank_text(&evidence);
         assert!(text.contains("route=multi_hop"));
+        assert!(text.contains("temporal_conflict=conflicting_candidate_dates"));
         assert!(text.contains("chunk_evidence=source turn"));
         assert!(text.contains("source_span=10..42"));
         assert!(text.contains("graph_edges=Caroline --assigned_to--> Operator OS"));
