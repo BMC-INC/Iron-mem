@@ -511,6 +511,31 @@ impl IronMemServer {
         serde_json::to_value(map).unwrap_or_else(|_| serde_json::json!({}))
     }
 
+    async fn evidence_chains_json(
+        &self,
+        memory_ids: &[i64],
+        chunks: &std::collections::HashMap<i64, Vec<db::MemoryChunk>>,
+    ) -> serde_json::Value {
+        let graph_edges = db::memory_edges_for_memories(&self.db, memory_ids)
+            .await
+            .unwrap_or_default();
+        let mut chains = Vec::with_capacity(memory_ids.len());
+        for &memory_id in memory_ids {
+            let meta = db::get_memory_meta_full(&self.db, memory_id)
+                .await
+                .unwrap_or_default();
+            chains.push(serde_json::json!({
+                "memory_id": memory_id,
+                "kind": meta.kind,
+                "event_time": meta.event_time,
+                "source_ref": meta.source_ref,
+                "chunks": chunks.get(&memory_id).cloned().unwrap_or_default(),
+                "graph_edges": graph_edges.get(&memory_id).cloned().unwrap_or_default(),
+            }));
+        }
+        serde_json::Value::Array(chains)
+    }
+
     async fn handle_get_context(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
         let project = args
             .get("project")
@@ -539,7 +564,8 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let expansions: Vec<_> = memory_ids
-            .into_iter()
+            .iter()
+            .copied()
             .map(|memory_id| {
                 serde_json::json!({
                     "memory_id": memory_id,
@@ -549,8 +575,8 @@ impl IronMemServer {
             .collect();
 
         let event_times = self.event_times_map(&memories).await;
-        let json =
-            serde_json::json!({ "memories": memories, "expansions": expansions, "event_times": event_times });
+        let evidence_chains = self.evidence_chains_json(&memory_ids, &chunks).await;
+        let json = serde_json::json!({ "memories": memories, "expansions": expansions, "event_times": event_times, "evidence_chains": evidence_chains });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -1445,9 +1471,10 @@ mod tests {
         // Surfaced back through a read tool as the event_times side map.
         let mut q = JsonObject::new();
         q.insert("project".into(), serde_json::json!("/tmp/projE"));
-        let read: serde_json::Value =
-            serde_json::from_str(&result_text(&server.handle_list_memories(&q).await.unwrap()))
-                .unwrap();
+        let read: serde_json::Value = serde_json::from_str(&result_text(
+            &server.handle_list_memories(&q).await.unwrap(),
+        ))
+        .unwrap();
         assert_eq!(
             read["event_times"][mid.to_string().as_str()],
             "2023-05-07",
@@ -1500,9 +1527,10 @@ mod tests {
         let mut q = JsonObject::new();
         q.insert("project".into(), serde_json::json!(proj));
         q.insert("query".into(), serde_json::json!("zorptamine"));
-        let res: serde_json::Value =
-            serde_json::from_str(&result_text(&server.handle_search_memories(&q).await.unwrap()))
-                .unwrap();
+        let res: serde_json::Value = serde_json::from_str(&result_text(
+            &server.handle_search_memories(&q).await.unwrap(),
+        ))
+        .unwrap();
         let ids: Vec<i64> = res["memories"]
             .as_array()
             .unwrap()
@@ -1750,6 +1778,27 @@ mod tests {
         let mem_id = db::insert_memory(&server.db, "/tmp/p", &s, "alpha summary", Some("t"))
             .await
             .unwrap();
+        db::set_memory_scope_kind(&server.db, mem_id, "project", "fact")
+            .await
+            .unwrap();
+        db::set_memory_event_time(&server.db, mem_id, "2024-03-10")
+            .await
+            .unwrap();
+        db::insert_memory_edge(
+            &server.db,
+            &db::NewMemoryEdge {
+                project: "/tmp/p".to_string(),
+                memory_id: mem_id,
+                source: "Alice".to_string(),
+                relation: "visited".to_string(),
+                target: "Austin".to_string(),
+                valid_from: Some("2024-03-10".to_string()),
+                valid_until: None,
+                confidence: 0.92,
+            },
+        )
+        .await
+        .unwrap();
         db::replace_memory_chunks(
             &server.db,
             mem_id,
@@ -1783,6 +1832,25 @@ mod tests {
                 .as_str()
                 .unwrap(),
             format!("mem:{mem_id}:overview")
+        );
+        assert_eq!(
+            context["evidence_chains"][0]["memory_id"].as_i64(),
+            Some(mem_id)
+        );
+        assert_eq!(context["evidence_chains"][0]["kind"].as_str(), Some("fact"));
+        assert_eq!(
+            context["evidence_chains"][0]["event_time"].as_str(),
+            Some("2024-03-10")
+        );
+        assert_eq!(
+            context["evidence_chains"][0]["chunks"][0]["chunk_id"]
+                .as_str()
+                .unwrap(),
+            format!("mem:{mem_id}:overview")
+        );
+        assert_eq!(
+            context["evidence_chains"][0]["graph_edges"][0]["relation"].as_str(),
+            Some("visited")
         );
 
         let mut skim_args = JsonObject::new();
