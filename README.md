@@ -55,7 +55,7 @@
   output and the verbatim pre-LLM session transcript is preserved in a
   content-addressed, deduplicated, byte-exact compressed blob store inside the DB.
   **`retrieve_original`** pulls the exact original back by `observation_id`,
-  `memory_id`, raw blob `hash`, or `chunk_id`.
+  `memory_id`, raw blob `hash`, or the `chunk_id` expansion handle.
 - **Memory scoping & typed memories** (Supermemory patterns) — memories carry a
   **scope** (`project` vs. `user`/cross-project) and a **kind** (`session`, `fact`,
   `error_solution`, `preference`, `procedural`, `architecture`, `learned_pattern`,
@@ -65,8 +65,8 @@
   and separate searchable `kind=fact` memories, so dates, names, quantities, and
   direct answers survive summarization.
 - **Record-run retrieval stack** — hybrid FTS/vector/graph recall now includes
-  source-fact retention, temporal event boosts, multi-hop query expansion, rerank
-  re-anchoring, and optional cross-encoder reranking.
+  routed weighted fusion, source-fact retention, temporal event boosts, multi-hop
+  query expansion, rerank re-anchoring, and optional cross-encoder reranking.
 - **Adaptive working-memory skim** — every compressed or explicit memory gets
   durable `memory_chunks` with density, kind, title, token estimate, and optional
   exact transcript offsets. Agents can skim broadly with **`memory_skim`**, then
@@ -101,7 +101,14 @@
 - **21 MCP tools** now — including `memory_skim`, `retrieve_original`, `remember`,
   `get_profile`, `refresh_profile`, `list_corrections`, `memory_graph`, and
   `reconcile_memory_graph`.
-- **Current verification:** `cargo test --bin ironmem` passes **192 tests** with
+- **Temporal recall + graph recall** — dated facts and `event_time` metadata power timestamp lookup, while `memory_edges` stores structured `source | relation | target` edges with valid-time filters and provenance. Temporal questions route toward date-bearing facts; relationship questions route toward graph edges.
+- **Benchmarked on LoCoMo:** 68.4% overall (Gemini 2.5 Pro answerer + Pro judge, 1,540 scored questions, 0 errors) with governance-off retrieval, +2.1 points over the governed baseline. Full harness, result files, and reproduction: **[ironmem-locomo-benchmark](https://github.com/BMC-INC/ironmem-locomo-benchmark)**. See [Benchmarks](#benchmarks).
+- **External storage adapters:** a `StorageBackend` trait with a HYBRID mode lets vector and graph layers run on real external backends (Qdrant over HTTP for vectors, Neo4j for the graph) instead of only the embedded SQLite store, while keeping the native path the default.
+- **Retrieval + governance instrumentation:** governance-cost timings in `/status`, a temporal-trust trajectory signal, a compression coverage pass, and the path-to-70 retrieval batch (routed fusion, pool/context tuning, multi-hop and date handling).
+- **Valid-time temporal recall:** `remember` accepts an optional `event_at` (an ISO `YYYY-MM-DD` date or a `YYYY-MM-DD..YYYY-MM-DD` range) for when an event actually occurred, distinct from the storage time (`created_at`). Valid-time dates are surfaced through an `event_times` side map on search, list, context, and skim results, powering time-aware retrieval.
+- **Derived (inferred) memories:** reflection can derive new memories from existing ones, governed as `source_type=derived` / `kind=inference` with a `derives` provenance edge and a ledger entry per inference. Derived memories are quarantined from default retrieval until a caller explicitly asks for them, so inferences never silently pollute primary recall.
+- **Opt-in auto-dream trigger:** a thin background watcher (`auto_dream.enabled`, default off, with a `gap_minutes` idle threshold) fires a consolidation and synthesis pass on projects that have gone idle. Every auto-triggered pass is recorded in the governance ledger with a `trigger_reason`, so it stays auditable instead of a black box.
+- **Current verification:** `cargo test --bin ironmem` passes **195 tests** with
   **1 ignored benchmark**, MCP stdio cleanliness passes, and the strict
   `local-onnx` clippy gate is clean.
 - **Still zero telemetry. Still local-first. Your data stays yours.**
@@ -306,6 +313,21 @@ Retrieval is routed by query shape:
 This is intentionally model-agnostic. The durable store is hard-token,
 structured, and auditable, so Claude, Codex, Operator OS, desktop clients, and
 remote MCP clients can share the same backing memory.
+
+---
+
+## Benchmarks
+
+IronMem is evaluated on [LoCoMo](https://github.com/snap-research/locomo) (Maharana et al., ACL 2024), a long-term conversational memory benchmark. The full harness, result files, and reproduction steps live in a dedicated repo: **[ironmem-locomo-benchmark](https://github.com/BMC-INC/ironmem-locomo-benchmark)**.
+
+Headline (Gemini 2.5 Pro answerer + Pro judge, hybrid retrieval, pool 100, retrieve-limit 25, v2 answer prompt, 1,986 questions of which 1,540 are scored, 0 errors):
+
+| Configuration | Overall | single_hop | multi_hop | temporal | open_domain |
+|---|---|---|---|---|---|
+| Governed (trust-tier ranking on) | 66.3% | 69.0% | 50.0% | 77.9% | 52.1% |
+| **Governance-off (pure relevance ranking)** | **68.4%** | 72.1% | 52.5% | 78.2% | 50.0% |
+
+Setting the writer-tier and temporal-trust retrieval weights to 0 (ranking on pure relevance) scores **68.4%**, **+2.1 points** over the governed configuration. Governance metadata (writer identity, trust tier, provenance, ledger) is still recorded and queryable on every memory; the finding is only that letting trust tier tilt retrieval ranking was net-negative on this benchmark. The benchmark repo has the per-category analysis, second-judge agreement (Cohen's kappa 0.88), and the documented path past 70%.
 
 ---
 
@@ -1121,14 +1143,22 @@ This starts IronMem with Streamable HTTP on `http://localhost:37779/mcp` and Pos
 - [x] **AST-bound memory + reflection + time travel + sync** — Tree-sitter Rust
   code anchors, dry-run/apply reflection proposals, CCR-backed snapshots, and an
   idempotent sync event log.
-- [x] **Current verification** — 192 Rust tests pass, 1 benchmark is intentionally
+- [x] **External storage adapters (#4):** a `StorageBackend` trait with native / vector / graph backends and a HYBRID mode; real Qdrant (vector) and Neo4j (graph) adapters over HTTP, with the native SQLite path remaining the default.
+- [x] **Governance cost instrumentation + temporal-trust trajectory:** per-operation governance timings in `/status`, a temporal-trust ranking signal, and a compression coverage pass that roughly doubles retained facts per session.
+- [x] **Path-to-70 retrieval batch:** routed weighted fusion (#1 router), pool and context-window tuning, multi-hop follow-up, per-fact date handling, and transitive synthesis (Track B).
+- [x] **LoCoMo benchmark:** public reproduction harness scoring 68.4% governance-off (Pro-judged); see [Benchmarks](#benchmarks) and [ironmem-locomo-benchmark](https://github.com/BMC-INC/ironmem-locomo-benchmark).
+- [x] **Experimental on-device cross-encoder reranker:** ONNX cross-encoder backend (off by default; on LoCoMo it currently trails the LLM reranker, see the benchmark repo).
+- [x] **Valid-time temporal dual-naming:** optional `event_at` (event/valid time) on writes, distinct from `created_at`, surfaced via an `event_times` side map across search/list/context/skim.
+- [x] **Derived (inferred) memories:** reflection-derived memories with `derives` provenance edges and per-inference ledger entries, governed as `kind=inference` and quarantined from default retrieval until explicitly requested.
+- [x] **Opt-in auto-dream trigger:** a background idle-gap watcher that fires an auditable consolidation and synthesis pass (`auto_dream.enabled`, default off, `gap_minutes` threshold).
+- [x] **Current verification** — 195 Rust tests pass, 1 benchmark is intentionally
   ignored, MCP stdio cleanliness passes, the release `local-onnx` build passes,
   and clippy is clean with `local-onnx` enabled.
 
 ### Next
 
-- [ ] **Bespoke per-content-type transforms** — invertible log timestamp-delta,
-  diff-token, and AST-aware code normalization on top of the dictionary codecs.
+- [ ] **Structured-evidence reranking:** rerank atomic facts, event dates, speakers, and source turn ids instead of truncated document text (the LoCoMo path past 70%)
+- [ ] **Bespoke per-content-type transforms** — invertible log timestamp-delta / diff-token / AST-aware code normalization on top of the dictionary codecs (currently documented-future; the byte-exact contract is the gate)
 - [ ] **Observation-blob lifecycle GC** — reclaim CCR blobs behind deleted observations (memory-session blobs are already GC'd)
 
 ---

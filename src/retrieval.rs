@@ -4,7 +4,7 @@
 //! entry points compose them with the db + vector store.
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Datelike, NaiveDate, Utc};
 use std::collections::{HashMap, HashSet};
 
 use crate::config::{Config, Weights};
@@ -32,6 +32,63 @@ const GRAPH_EDGES_PER_ENTITY: usize = 12;
 const GRAPH_CHAIN_EDGES_PER_BRIDGE: usize = 6;
 const TEMPORAL_EVENT_POOL: usize = 512;
 const SOURCE_FACT_FLOOR_MAX_SLOTS: usize = 5;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueryRoute {
+    SingleHop,
+    MultiHop,
+    Temporal,
+    OpenDomain,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FusionWeights {
+    fts: usize,
+    vector: usize,
+    event_year: usize,
+    temporal_event: usize,
+    graph: usize,
+    entity: usize,
+}
+
+impl FusionWeights {
+    fn for_query(query: &str, temporal_weight: usize) -> Self {
+        match classify_query_route(query) {
+            QueryRoute::Temporal => Self {
+                fts: 1,
+                vector: 1,
+                event_year: 2,
+                temporal_event: temporal_weight.max(1) + 2,
+                graph: 0,
+                entity: 0,
+            },
+            QueryRoute::MultiHop => Self {
+                fts: 1,
+                vector: 2,
+                event_year: 1,
+                temporal_event: temporal_weight.max(1),
+                graph: 3,
+                entity: 0,
+            },
+            QueryRoute::SingleHop => Self {
+                fts: 2,
+                vector: 1,
+                event_year: 1,
+                temporal_event: temporal_weight.max(1),
+                graph: 1,
+                entity: 0,
+            },
+            QueryRoute::OpenDomain => Self {
+                fts: 1,
+                vector: 2,
+                event_year: 1,
+                temporal_event: temporal_weight.max(1),
+                graph: 1,
+                entity: 0,
+            },
+        }
+    }
+}
 
 /// Process-wide retrieval tuning, installed once at server startup from `Config`
 /// (config is fixed for the process lifetime). Lets the gated temporal-event
@@ -101,6 +158,15 @@ pub fn rrf_fuse(lists: &[Vec<i64>], k: i64) -> Vec<i64> {
     order
 }
 
+fn push_weighted_signal(lists: &mut Vec<Vec<i64>>, signal: &[i64], weight: usize) {
+    if signal.is_empty() || weight == 0 {
+        return;
+    }
+    for _ in 0..weight {
+        lists.push(signal.to_vec());
+    }
+}
+
 /// (#5) Temporal-trust re-rank of an already-fused candidate ordering. When
 /// `trust_weight > 0`, each candidate's reciprocal-rank base score is nudged by
 /// its trust trajectory (referenced + recently validated — see
@@ -113,7 +179,9 @@ async fn apply_trust_boost(db: &Database, candidates: Vec<i64>) -> Result<Vec<i6
     if t.trust_weight <= 0.0 || candidates.len() < 2 {
         return Ok(candidates);
     }
-    let trust = db::trust_meta_for(db, &candidates).await.unwrap_or_default();
+    let trust = db::trust_meta_for(db, &candidates)
+        .await
+        .unwrap_or_default();
     if trust.is_empty() {
         return Ok(candidates);
     }
@@ -159,7 +227,9 @@ async fn apply_tier_boost(db: &Database, candidates: Vec<i64>) -> Result<Vec<i64
     if t.tier_weight <= 0.0 || candidates.len() < 2 {
         return Ok(candidates);
     }
-    let tiers = db::trust_tiers_for(db, &candidates).await.unwrap_or_default();
+    let tiers = db::trust_tiers_for(db, &candidates)
+        .await
+        .unwrap_or_default();
     if tiers.is_empty() {
         return Ok(candidates);
     }
@@ -209,6 +279,13 @@ fn query_entities(query: &str) -> Vec<String> {
         .filter(|t| t.chars().next().is_some_and(|c| c.is_uppercase()))
         .filter(|t| seen.insert(t.to_lowercase()))
         .map(|s| s.to_string())
+        .collect()
+}
+
+fn query_named_entities(query: &str) -> Vec<String> {
+    query_entities(query)
+        .into_iter()
+        .filter(|t| !is_question_word(t))
         .collect()
 }
 
@@ -423,6 +500,22 @@ fn is_temporal_lookup_query(query: &str) -> bool {
         || q.contains(" following ")
 }
 
+fn classify_query_route(query: &str) -> QueryRoute {
+    if is_temporal_lookup_query(query) {
+        return QueryRoute::Temporal;
+    }
+    if is_multi_hop_query(query) {
+        return QueryRoute::MultiHop;
+    }
+    let entities = query_named_entities(query);
+    let terms = temporal_event_terms(query);
+    if entities.is_empty() && terms.len() <= 3 {
+        QueryRoute::OpenDomain
+    } else {
+        QueryRoute::SingleHop
+    }
+}
+
 fn is_temporal_stopword(token: &str) -> bool {
     matches!(
         token,
@@ -500,6 +593,135 @@ fn temporal_event_terms(query: &str) -> HashSet<String> {
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DatePrecision {
+    Day,
+    Month,
+    Year,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DateAnchor {
+    date: NaiveDate,
+    precision: DatePrecision,
+}
+
+fn month_number(token: &str) -> Option<u32> {
+    match token.to_ascii_lowercase().as_str() {
+        "jan" | "january" => Some(1),
+        "feb" | "february" => Some(2),
+        "mar" | "march" => Some(3),
+        "apr" | "april" => Some(4),
+        "may" => Some(5),
+        "jun" | "june" => Some(6),
+        "jul" | "july" => Some(7),
+        "aug" | "august" => Some(8),
+        "sep" | "sept" | "september" => Some(9),
+        "oct" | "october" => Some(10),
+        "nov" | "november" => Some(11),
+        "dec" | "december" => Some(12),
+        _ => None,
+    }
+}
+
+fn parse_year(token: &str) -> Option<i32> {
+    if token.len() == 4 {
+        token
+            .parse::<i32>()
+            .ok()
+            .filter(|y| (1900..=2099).contains(y))
+    } else {
+        None
+    }
+}
+
+fn first_ymd(text: &str) -> Option<NaiveDate> {
+    for token in text.split(|c: char| !(c.is_ascii_digit() || c == '-')) {
+        if token.len() == 10 {
+            if let Ok(date) = NaiveDate::parse_from_str(token, "%Y-%m-%d") {
+                return Some(date);
+            }
+        }
+    }
+    None
+}
+
+fn query_date_anchor(query: &str) -> Option<DateAnchor> {
+    if let Some(date) = first_ymd(query) {
+        return Some(DateAnchor {
+            date,
+            precision: DatePrecision::Day,
+        });
+    }
+
+    let tokens: Vec<&str> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    for window in tokens.windows(2) {
+        if let (Some(month), Some(year)) = (month_number(window[0]), parse_year(window[1])) {
+            if let Some(date) = NaiveDate::from_ymd_opt(year, month, 1) {
+                return Some(DateAnchor {
+                    date,
+                    precision: DatePrecision::Month,
+                });
+            }
+        }
+        if let (Some(year), Some(month)) = (parse_year(window[0]), month_number(window[1])) {
+            if let Some(date) = NaiveDate::from_ymd_opt(year, month, 1) {
+                return Some(DateAnchor {
+                    date,
+                    precision: DatePrecision::Month,
+                });
+            }
+        }
+    }
+
+    query_years(query).first().and_then(|year| {
+        let year = year.parse::<i32>().ok()?;
+        Some(DateAnchor {
+            date: NaiveDate::from_ymd_opt(year, 1, 1)?,
+            precision: DatePrecision::Year,
+        })
+    })
+}
+
+fn event_date_anchor(event_time: &str) -> Option<DateAnchor> {
+    if let Some(date) = first_ymd(event_time) {
+        return Some(DateAnchor {
+            date,
+            precision: DatePrecision::Day,
+        });
+    }
+    let year = query_years(event_time).first()?.parse::<i32>().ok()?;
+    Some(DateAnchor {
+        date: NaiveDate::from_ymd_opt(year, 1, 1)?,
+        precision: DatePrecision::Year,
+    })
+}
+
+fn temporal_proximity_score(query_anchor: Option<DateAnchor>, event_time: &str) -> f64 {
+    let Some(q) = query_anchor else {
+        return 0.0;
+    };
+    let Some(e) = event_date_anchor(event_time) else {
+        return 0.0;
+    };
+    let days = (q.date - e.date).num_days().unsigned_abs() as f64;
+    match q.precision {
+        DatePrecision::Day => (8.0 - days / 7.0).max(0.0),
+        DatePrecision::Month => {
+            let months = ((q.date.year() - e.date.year()).abs() * 12) as f64
+                + (q.date.month() as i32 - e.date.month() as i32).abs() as f64;
+            (6.0 - months).max(0.0)
+        }
+        DatePrecision::Year => {
+            let years = (q.date.year() - e.date.year()).abs() as f64;
+            (4.0 - years).max(0.0)
+        }
+    }
+}
+
 fn event_text_terms(memory: &Memory) -> HashSet<String> {
     let mut text = memory.summary.clone();
     if let Some(tags) = &memory.tags {
@@ -519,6 +741,7 @@ async fn temporal_event_ids_for_query(
     if query_terms.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
+    let date_anchor = query_date_anchor(query);
 
     let mut scored = Vec::new();
     for candidate in backend
@@ -547,7 +770,12 @@ async fn temporal_event_ids_for_query(
             0.0
         };
         let specificity = overlap as f64 / query_terms.len().max(1) as f64;
-        let score = overlap as f64 * 10.0 + specificity * 3.0 + kind_bonus + date_specificity_bonus;
+        let proximity = temporal_proximity_score(date_anchor, &candidate.event_time);
+        let score = overlap as f64 * 10.0
+            + specificity * 3.0
+            + kind_bonus
+            + date_specificity_bonus
+            + proximity;
         scored.push((candidate.memory.id, score, candidate.memory.created_at));
     }
 
@@ -692,60 +920,37 @@ pub async fn hybrid_search_in_namespace(
         Vec::new()
     };
 
+    let route = classify_query_route(query);
+
     // Graph side: active temporal graph edges contribute their provenance memory
     // ids when the query names an entity present as an edge source or target.
     // Unlike the disabled entity signal, graph ids are relation-ranked before
     // fusion so specific relationship questions beat generic recency.
-    let graph_ids = if is_temporal_lookup_query(query) {
+    let graph_ids = if route == QueryRoute::Temporal {
         Vec::new()
     } else {
         graph_ids_for_query(&backend, project, query, pool).await?
     };
 
-    // Candidate ordering: RRF over keyword + any auxiliary signals (semantic,
-    // temporal, graph, entity). With no auxiliary signal this is the FTS order.
+    // Candidate ordering: route-weighted RRF over keyword + auxiliary signals.
+    // This keeps single-hop lexical, multi-hop graph/vector, temporal date-heavy,
+    // and open-domain semantic-biased without paying a classify-LLM call.
     let fts_ids: Vec<i64> = fts.iter().map(|m| m.id).collect();
     let lexical_floor_ids = lexical_source_fact_floor_ids(db, query, &fts, limit).await?;
     let by_id: HashMap<i64, Memory> = fts.into_iter().map(|m| (m.id, m)).collect();
 
-    let mut aux: Vec<Vec<i64>> = Vec::new();
-    if !vec_ids.is_empty() {
-        aux.push(vec_ids);
-    }
-    if !time_ids.is_empty() {
-        aux.push(time_ids);
-    }
-    if !graph_ids.is_empty() {
-        aux.push(graph_ids);
-    }
-    if !entity_ids.is_empty() {
-        aux.push(entity_ids);
-    }
-    // (B) Temporal-event fusion weight: push the date-bearing event list into RRF
-    // `temporal_fusion_weight` times (>=1). 1 = unchanged; higher lifts exact
-    // dated facts that semantic/keyword channels rank low (LoCoMo temporal).
-    let tw = tuning().temporal_fusion_weight.max(1);
-    let candidates: Vec<i64> = if aux.is_empty() {
-        if temporal_event_ids.is_empty() {
-            fts_ids
-        } else {
-            let mut lists: Vec<Vec<i64>> = Vec::with_capacity(tw + 1);
-            for _ in 0..tw {
-                lists.push(temporal_event_ids.clone());
-            }
-            lists.push(fts_ids);
-            rrf_fuse(&lists, RRF_K)
-        }
-    } else {
-        let mut lists: Vec<Vec<i64>> = Vec::with_capacity(aux.len() + tw + 1);
-        if !temporal_event_ids.is_empty() {
-            for _ in 0..tw {
-                lists.push(temporal_event_ids.clone());
-            }
-        }
-        lists.push(fts_ids);
-        lists.append(&mut aux);
-        rrf_fuse(&lists, RRF_K)
+    let weights = FusionWeights::for_query(query, tuning().temporal_fusion_weight);
+    let mut lists: Vec<Vec<i64>> = Vec::new();
+    push_weighted_signal(&mut lists, &fts_ids, weights.fts);
+    push_weighted_signal(&mut lists, &vec_ids, weights.vector);
+    push_weighted_signal(&mut lists, &time_ids, weights.event_year);
+    push_weighted_signal(&mut lists, &temporal_event_ids, weights.temporal_event);
+    push_weighted_signal(&mut lists, &graph_ids, weights.graph);
+    push_weighted_signal(&mut lists, &entity_ids, weights.entity);
+    let candidates: Vec<i64> = match lists.len() {
+        0 => Vec::new(),
+        1 => lists.pop().unwrap_or_default(),
+        _ => rrf_fuse(&lists, RRF_K),
     };
 
     // (#5) Temporal-trust re-rank: nudge the fused order by each candidate's trust
@@ -953,31 +1158,80 @@ async fn exclude_derived(db: &Database, candidates: Vec<i64>) -> Result<Vec<i64>
 /// are trimmed to their leading content (enough to judge relevance).
 const RERANK_SNIPPET_CHARS: usize = 400;
 
+#[derive(Clone, Debug)]
+struct RerankEvidence {
+    memory: Memory,
+    kind: String,
+    event_time: Option<String>,
+    source_ref: Option<String>,
+}
+
+async fn enrich_rerank_evidence(db: &Database, candidates: Vec<Memory>) -> Vec<RerankEvidence> {
+    let mut out = Vec::with_capacity(candidates.len());
+    for memory in candidates {
+        let meta = db::get_memory_meta_full(db, memory.id)
+            .await
+            .unwrap_or_default();
+        out.push(RerankEvidence {
+            memory,
+            kind: meta.kind,
+            event_time: meta.event_time,
+            source_ref: meta.source_ref,
+        });
+    }
+    out
+}
+
+fn compact_text(text: &str, cap: usize) -> String {
+    text.chars()
+        .take(cap)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn structured_rerank_text(e: &RerankEvidence) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!("kind={}", e.kind));
+    if let Some(event_time) = e.event_time.as_deref().filter(|s| !s.trim().is_empty()) {
+        parts.push(format!("event_time={event_time}"));
+    }
+    if let Some(tags) = e.memory.tags.as_deref().filter(|s| !s.trim().is_empty()) {
+        parts.push(format!("tags={}", compact_text(tags, 120)));
+    }
+    if let Some(source_ref) = e.source_ref.as_deref().filter(|s| !s.trim().is_empty()) {
+        parts.push(format!("source_ref={}", compact_text(source_ref, 120)));
+    }
+    parts.push(format!(
+        "evidence={}",
+        compact_text(&e.memory.summary, RERANK_SNIPPET_CHARS)
+    ));
+    parts.join(" | ")
+}
+
 /// Build the rerank prompt: the question, then the numbered candidate snippets,
 /// then an instruction to return the useful candidate numbers most-useful-first.
-fn build_rerank_prompt(query: &str, candidates: &[Memory]) -> String {
+fn build_rerank_prompt(query: &str, candidates: &[RerankEvidence]) -> String {
     let mut s = String::with_capacity(256 + candidates.len() * RERANK_SNIPPET_CHARS);
     s.push_str(
-        "You are selecting which memory snippets best help answer a question.\n\
-         Read the QUESTION, then the numbered CANDIDATES.\n\n",
+        "You are selecting which structured memory evidence best helps answer a question.\n\
+         Read the QUESTION, then the numbered CANDIDATES. Each candidate may include \
+         kind, event_time, tags, source_ref, and evidence text.\n\n",
     );
     s.push_str("QUESTION: ");
     s.push_str(query);
     s.push_str("\n\nCANDIDATES:\n");
     for (i, m) in candidates.iter().enumerate() {
-        let snippet: String = m
-            .summary
-            .chars()
-            .take(RERANK_SNIPPET_CHARS)
-            .collect::<String>()
-            .replace('\n', " ");
-        s.push_str(&format!("{}. {}\n", i + 1, snippet));
+        s.push_str(&format!("{}. {}\n", i + 1, structured_rerank_text(m)));
     }
     s.push_str(
         "\nReturn the candidate numbers ordered from MOST to LEAST useful for \
          answering the question, as a comma-separated list (e.g. \"4,1,9\"). Rank a \
-         snippet that contains the SPECIFIC answer the question asks for — the exact \
-         date, name, number, or event — above one that is merely on the same topic. \
+         candidate that contains the SPECIFIC answer the question asks for — the exact \
+         date, name, number, event, relationship, source, or temporal fact — above one \
+         that is merely on the same topic. Prefer candidates whose event_time/source_ref \
+         directly support the answer. \
          Include only genuinely relevant numbers; omit the rest. Output ONLY the list.",
     );
     s
@@ -986,15 +1240,8 @@ fn build_rerank_prompt(query: &str, candidates: &[Memory]) -> String {
 /// Candidate text for the cross-encoder: the leading content of the summary
 /// (plus tags), trimmed to the same budget the LLM reranker's snippet uses so
 /// the two backends judge the same evidence.
-fn rerank_doc(m: &Memory) -> String {
-    let mut doc: String = m.summary.chars().take(RERANK_SNIPPET_CHARS).collect();
-    if let Some(tags) = m.tags.as_deref() {
-        if !tags.is_empty() {
-            doc.push(' ');
-            doc.push_str(tags);
-        }
-    }
-    doc.replace('\n', " ")
+fn rerank_doc(e: &RerankEvidence) -> String {
+    structured_rerank_text(e)
 }
 
 /// Parse a rerank reply into 0-based candidate positions. Pulls integer runs in
@@ -1047,6 +1294,7 @@ fn fuse_rerank(base: &[Memory], order: &[usize], limit: usize) -> Vec<Memory> {
 /// the base retrieval order (truncated), so reranking can only improve precision,
 /// never reduce recall below what `hybrid_search` already produced.
 pub async fn llm_rerank(
+    db: &Database,
     config: &Config,
     query: &str,
     candidates: Vec<Memory>,
@@ -1061,7 +1309,8 @@ pub async fn llm_rerank(
     } else {
         config.rerank.model.as_str()
     };
-    let prompt = build_rerank_prompt(query, &candidates);
+    let evidence = enrich_rerank_evidence(db, candidates.clone()).await;
+    let prompt = build_rerank_prompt(query, &evidence);
     match crate::provider::complete_with(&prompt, model, config).await {
         Ok(reply) => {
             let order = parse_rerank_order(&reply, candidates.len());
@@ -1167,12 +1416,13 @@ pub async fn rerank_search_in_namespace_with_pool(
         // preserved even though the cross-encoder never saw it.
         let cap = config.rerank.cross_encoder_max_candidates.max(limit);
         let head = candidates.len().min(cap);
-        let docs: Vec<String> = candidates[..head].iter().map(rerank_doc).collect();
+        let evidence = enrich_rerank_evidence(db, candidates[..head].to_vec()).await;
+        let docs: Vec<String> = evidence.iter().map(rerank_doc).collect();
         if let Some(order) = crate::reranker::rerank_order(query, &docs) {
             return Ok(fuse_rerank(&candidates, &order, limit));
         }
     }
-    Ok(llm_rerank(config, query, candidates, limit).await)
+    Ok(llm_rerank(db, config, query, candidates, limit).await)
 }
 
 /// (W3.1) Heuristic gate for the iterative multi-hop loop: a question that chains
@@ -1183,14 +1433,31 @@ pub async fn rerank_search_in_namespace_with_pool(
 pub fn is_multi_hop_query(query: &str) -> bool {
     let q = format!(" {} ", query.to_lowercase());
     const CUES: &[&str] = &[
-        " after ", " before ", " then ", " same ", " also ", " both ",
-        " who else", " what else", " where did ", " how did ", " because ",
-        " led to ", " compared ", " related to ", " connected ", " between ",
+        " after ",
+        " before ",
+        " then ",
+        " same ",
+        " also ",
+        " both ",
+        " depend ",
+        " depends ",
+        " dependent ",
+        " dependency ",
+        " who else",
+        " what else",
+        " where did ",
+        " how did ",
+        " because ",
+        " led to ",
+        " compared ",
+        " related to ",
+        " connected ",
+        " between ",
     ];
     if CUES.iter().any(|c| q.contains(c)) {
         return true;
     }
-    query_entities(query).len() >= 2
+    query_named_entities(query).len() >= 2
 }
 
 /// Prompt the rerank model for the single missing bridge fact (or DONE) given the
@@ -1218,9 +1485,9 @@ fn build_followup_prompt(question: &str, retrieved: &[Memory]) -> String {
 fn parse_followup_query(reply: &str) -> Option<String> {
     // DONE on any line → stop (models sometimes wrap it in punctuation/markdown).
     for l in reply.lines() {
-        let t = l.trim().trim_matches(|c: char| {
-            c == '"' || c == '`' || c == '.' || c == '*' || c == '#'
-        });
+        let t = l
+            .trim()
+            .trim_matches(|c: char| c == '"' || c == '`' || c == '.' || c == '*' || c == '#');
         if t.eq_ignore_ascii_case("DONE") {
             return None;
         }
@@ -1233,7 +1500,9 @@ fn parse_followup_query(reply: &str) -> Option<String> {
         .map(|l| l.trim())
         .rfind(|l| !l.is_empty())
         .unwrap_or("");
-    let q = last.trim_matches(|c: char| c == '"' || c == '`' || c == '.').trim();
+    let q = last
+        .trim_matches(|c: char| c == '"' || c == '`' || c == '.')
+        .trim();
     if q.is_empty() || q.len() > 200 || q.to_ascii_uppercase().starts_with("DONE") {
         return None;
     }
@@ -1260,7 +1529,15 @@ pub async fn iterative_rerank_search_in_namespace(
     pool_override: Option<usize>,
 ) -> Result<Vec<Memory>> {
     let mut pool = rerank_search_in_namespace_with_pool(
-        db, embedder, store, config, namespace, project, query, limit, pool_override,
+        db,
+        embedder,
+        store,
+        config,
+        namespace,
+        project,
+        query,
+        limit,
+        pool_override,
     )
     .await?;
     let hops = max_hops.max(1);
@@ -1292,7 +1569,15 @@ pub async fn iterative_rerank_search_in_namespace(
         last_query = fq.clone();
 
         let next = rerank_search_in_namespace_with_pool(
-            db, embedder, store, config, namespace, project, &fq, limit, pool_override,
+            db,
+            embedder,
+            store,
+            config,
+            namespace,
+            project,
+            &fq,
+            limit,
+            pool_override,
         )
         .await
         .unwrap_or_default();
@@ -1309,7 +1594,7 @@ pub async fn iterative_rerank_search_in_namespace(
     }
 
     // Final precision pass over the union, scored against the original question.
-    Ok(llm_rerank(config, query, pool, limit).await)
+    Ok(llm_rerank(db, config, query, pool, limit).await)
 }
 
 // ── Blended injection ranking ───────────────────────────────────────
@@ -1611,7 +1896,10 @@ mod tests {
 
         let promoted = promote_source_fact_floor(&candidates, &floor, 3);
         let chosen = reserve_narrative_slots(&db, &promoted, 3).await.unwrap();
-        assert!(chosen.contains(&fact), "source fact floor missing: {chosen:?}");
+        assert!(
+            chosen.contains(&fact),
+            "source fact floor missing: {chosen:?}"
+        );
         assert!(
             narratives.iter().any(|id| chosen.contains(id)),
             "narrative quota should still keep a bridge/narrative slot: {chosen:?}"
@@ -1800,6 +2088,49 @@ mod tests {
         assert!(!terms.contains("did"));
     }
 
+    #[test]
+    fn query_route_classifier_stays_local_and_predictable() {
+        assert_eq!(
+            classify_query_route("When did Dave start his shop?"),
+            QueryRoute::Temporal
+        );
+        assert_eq!(
+            classify_query_route("Which service does Caroline's project depend on?"),
+            QueryRoute::MultiHop
+        );
+        assert_eq!(
+            classify_query_route("What camera did Dave buy?"),
+            QueryRoute::SingleHop
+        );
+        assert_eq!(
+            classify_query_route("What was the favorite hobby?"),
+            QueryRoute::OpenDomain
+        );
+    }
+
+    #[test]
+    fn routed_fusion_weights_emphasize_the_right_signals() {
+        let temporal = FusionWeights::for_query("When did Dave buy it?", 1);
+        assert!(temporal.temporal_event > temporal.fts);
+        assert_eq!(temporal.graph, 0);
+
+        let multi = FusionWeights::for_query("Which project does Caroline depend on?", 1);
+        assert!(multi.graph > multi.fts);
+        assert!(multi.vector > multi.fts);
+
+        let single = FusionWeights::for_query("What camera did Dave buy?", 1);
+        assert!(single.fts > single.vector);
+    }
+
+    #[test]
+    fn temporal_proximity_scores_near_dates_highest() {
+        let anchor = query_date_anchor("What happened after May 2023?").unwrap();
+        let near = temporal_proximity_score(Some(anchor), "2023-05-17");
+        let far = temporal_proximity_score(Some(anchor), "2021-05-17");
+        assert!(near > far, "near={near}, far={far}");
+        assert!(near > 0.0);
+    }
+
     #[tokio::test]
     async fn temporal_lookup_prefers_dated_event_fact_over_newer_broad_match() {
         let (db, path) = seeded_db().await;
@@ -1910,6 +2241,15 @@ mod tests {
         }
     }
 
+    fn ev(memory: Memory, kind: &str, event_time: Option<&str>) -> RerankEvidence {
+        RerankEvidence {
+            memory,
+            kind: kind.to_string(),
+            event_time: event_time.map(|s| s.to_string()),
+            source_ref: Some("mem:source:fact:1".to_string()),
+        }
+    }
+
     #[test]
     fn parse_rerank_order_maps_filters_and_dedupes() {
         // 1-based → 0-based, order preserved.
@@ -1967,7 +2307,9 @@ mod tests {
     #[test]
     fn multi_hop_gate_triggers_on_cues_and_multi_entity_only() {
         // Relational/bridge cues → multi-hop.
-        assert!(is_multi_hop_query("what city did Alice move to after the job"));
+        assert!(is_multi_hop_query(
+            "what city did Alice move to after the job"
+        ));
         assert!(is_multi_hop_query("the place connected to the trip"));
         // Two named entities → multi-hop (a relation between proper nouns).
         assert!(is_multi_hop_query("how do Alice and Bob know each other"));
@@ -2022,10 +2364,16 @@ mod tests {
     #[test]
     fn build_rerank_prompt_numbers_and_caps_snippets() {
         let long = "x".repeat(900);
-        let cands = vec![mk(1, "short fact"), mk(2, &long)];
+        let cands = vec![
+            ev(mk(1, "short fact"), "fact", Some("2023-05-07")),
+            ev(mk(2, &long), "session", None),
+        ];
         let p = build_rerank_prompt("when did it happen?", &cands);
         assert!(p.contains("QUESTION: when did it happen?"));
-        assert!(p.contains("1. short fact"));
+        assert!(p.contains("1. kind=fact"));
+        assert!(p.contains("event_time=2023-05-07"));
+        assert!(p.contains("source_ref=mem:source:fact:1"));
+        assert!(p.contains("evidence=short fact"));
         // The 900-char candidate is capped — its raw text never appears in full.
         assert!(!p.contains(&"x".repeat(RERANK_SNIPPET_CHARS + 1)));
     }
