@@ -3153,6 +3153,75 @@ pub async fn memory_edges_for_entity_at(
     Ok(rows.into_iter().map(memory_edge_from_row).collect())
 }
 
+/// Return a bounded, newest-first graph window for interactive exploration.
+/// Unlike entity lookup, this can browse recent edges globally and optionally
+/// filter across source, relation, and target text.
+pub async fn memory_graph_window(
+    db: &Database,
+    project: Option<&str>,
+    query: Option<&str>,
+    include_superseded: bool,
+    at_time: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MemoryEdge>> {
+    let query_pattern = query
+        .map(normalize_graph_text)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("%{value}%"));
+    let mut sql =
+        "SELECT id, project, memory_id, source, relation, target, valid_from, valid_until,
+                observed_at, confidence, superseded_by, superseded_reason, created_at
+         FROM memory_edges
+         WHERE 1 = 1"
+            .to_string();
+    if !include_superseded {
+        sql.push_str(" AND superseded_by IS NULL");
+    }
+
+    let mut next = 1;
+    if query_pattern.is_some() {
+        let ph = format!("${next}");
+        next += 1;
+        sql.push_str(&format!(
+            " AND (source_norm LIKE {ph}
+                   OR target_norm LIKE {ph}
+                   OR REPLACE(relation_norm, '_', ' ') LIKE {ph})"
+        ));
+    }
+    if at_time.is_some() {
+        let ph = format!("${next}");
+        next += 1;
+        sql.push_str(&format!(
+            " AND (valid_from IS NULL OR valid_from <= {ph})
+              AND (valid_until IS NULL OR {ph} < valid_until)"
+        ));
+    }
+    if project.is_some() {
+        let ph = format!("${next}");
+        next += 1;
+        sql.push_str(&format!(" AND project = {ph}"));
+    }
+    sql.push_str(&format!(
+        " ORDER BY observed_at DESC, id DESC LIMIT ${next}"
+    ));
+
+    let mut statement = sqlx::query(&sql);
+    if let Some(pattern) = query_pattern {
+        statement = statement.bind(pattern);
+    }
+    if let Some(at) = at_time {
+        statement = statement.bind(at);
+    }
+    if let Some(project) = project {
+        statement = statement.bind(project);
+    }
+    let rows: Vec<sqlx::any::AnyRow> = statement
+        .bind(limit.max(1) as i64)
+        .fetch_all(&db.pool)
+        .await?;
+    Ok(rows.into_iter().map(memory_edge_from_row).collect())
+}
+
 pub async fn all_memory_edges(db: &Database, project: Option<&str>) -> Result<Vec<MemoryEdge>> {
     let mut sql =
         "SELECT id, project, memory_id, source, relation, target, valid_from, valid_until,
@@ -5478,6 +5547,108 @@ mod tests {
         let by_memory = memory_edges_for_memory(&db, mid).await?;
         assert_eq!(by_memory.len(), 1);
         assert_eq!(by_memory[0].id, edge_id);
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_graph_window_filters_query_project_history_time_and_limit() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let alpha = "/tmp/graph-alpha";
+        let beta = "/tmp/graph-beta";
+        let alpha_session = create_session(&db, alpha).await?;
+        let beta_session = create_session(&db, beta).await?;
+
+        let draft = insert_memory(&db, alpha, &alpha_session, "Atlas was draft", None).await?;
+        let approved = insert_memory(&db, alpha, &alpha_session, "Atlas is approved", None).await?;
+        let historical =
+            insert_memory(&db, alpha, &alpha_session, "Sol managed Atlas", None).await?;
+        let other = insert_memory(&db, beta, &beta_session, "Sol manages Orion", None).await?;
+
+        let draft_edge = insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: alpha.into(),
+                memory_id: draft,
+                source: "Atlas".into(),
+                relation: "status".into(),
+                target: "Draft".into(),
+                valid_from: Some("2026-01-01".into()),
+                valid_until: None,
+                confidence: 0.8,
+            },
+        )
+        .await?;
+        let approved_edge = insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: alpha.into(),
+                memory_id: approved,
+                source: "Atlas".into(),
+                relation: "status".into(),
+                target: "Approved".into(),
+                valid_from: Some("2026-02-01".into()),
+                valid_until: None,
+                confidence: 0.96,
+            },
+        )
+        .await?;
+        let historical_edge = insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: alpha.into(),
+                memory_id: historical,
+                source: "Sol".into(),
+                relation: "managed project".into(),
+                target: "Atlas".into(),
+                valid_from: Some("2025-01-01".into()),
+                valid_until: Some("2025-12-31".into()),
+                confidence: 0.91,
+            },
+        )
+        .await?;
+        let other_edge = insert_memory_edge(
+            &db,
+            &NewMemoryEdge {
+                project: beta.into(),
+                memory_id: other,
+                source: "Sol".into(),
+                relation: "manages project".into(),
+                target: "Orion".into(),
+                valid_from: None,
+                valid_until: None,
+                confidence: 0.88,
+            },
+        )
+        .await?;
+
+        let bounded = memory_graph_window(&db, None, None, false, None, 2).await?;
+        assert_eq!(bounded.len(), 2);
+        assert!(bounded.iter().all(|edge| edge.superseded_by.is_none()));
+        assert!(bounded[0].id > bounded[1].id, "newest edges come first");
+
+        let project_query =
+            memory_graph_window(&db, Some(alpha), Some("MANAGED PROJECT"), true, None, 20).await?;
+        assert_eq!(project_query.len(), 1);
+        assert_eq!(project_query[0].id, historical_edge);
+
+        let active_alpha = memory_graph_window(&db, Some(alpha), None, false, None, 20).await?;
+        assert!(active_alpha.iter().any(|edge| edge.id == approved_edge));
+        assert!(!active_alpha.iter().any(|edge| edge.id == draft_edge));
+        assert!(!active_alpha.iter().any(|edge| edge.id == other_edge));
+
+        let atlas_in_june = memory_graph_window(
+            &db,
+            Some(alpha),
+            Some("atlas"),
+            true,
+            Some("2025-06-01"),
+            20,
+        )
+        .await?;
+        assert_eq!(atlas_in_june.len(), 1);
+        assert_eq!(atlas_in_june[0].id, historical_edge);
 
         let _ = std::fs::remove_file(path);
         Ok(())
