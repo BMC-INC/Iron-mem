@@ -113,7 +113,9 @@ pub fn router(state: AppState) -> Router {
         // Web UI routes
         .route("/ui", get(web_ui))
         .route("/api/projects", get(api_list_projects))
+        .route("/api/graph/window", get(api_graph_window))
         .route("/api/memories", get(api_list_memories))
+        .route("/api/memories/{id}/evidence", get(api_memory_evidence))
         .route("/api/memories/{id}", delete(api_delete_memory))
         .route("/api/sessions", get(api_list_sessions))
         .with_state(Arc::new(state))
@@ -1117,6 +1119,187 @@ async fn web_ui() -> Html<&'static str> {
 }
 
 #[derive(Deserialize)]
+pub struct GraphWindowQuery {
+    pub project: Option<String>,
+    pub query: Option<String>,
+    pub history: Option<bool>,
+    pub at: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug)]
+struct GraphWindowOptions {
+    project: Option<String>,
+    query: Option<String>,
+    include_superseded: bool,
+    at: Option<String>,
+    limit: usize,
+}
+
+fn trimmed_filter(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn graph_window_options(
+    query: &GraphWindowQuery,
+) -> Result<GraphWindowOptions, (StatusCode, String)> {
+    let at = trimmed_filter(&query.at);
+    if let Some(value) = &at {
+        if !crate::provider::is_valid_memory_date(value) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "'at' must be a valid YYYY-MM-DD date".to_string(),
+            ));
+        }
+    }
+    Ok(GraphWindowOptions {
+        project: trimmed_filter(&query.project),
+        query: trimmed_filter(&query.query),
+        include_superseded: query.history.unwrap_or(false),
+        at,
+        limit: query.limit.unwrap_or(180).clamp(1, 500),
+    })
+}
+
+#[derive(Serialize)]
+pub struct GraphWindowResponse {
+    pub edges: Vec<db::MemoryEdge>,
+    pub node_count: usize,
+    pub active_edge_count: usize,
+    pub superseded_edge_count: usize,
+    pub capped: bool,
+}
+
+async fn api_graph_window(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<GraphWindowQuery>,
+) -> Result<Json<GraphWindowResponse>, (StatusCode, String)> {
+    let options = graph_window_options(&query)?;
+    let edges = db::memory_graph_window(
+        &state.db,
+        options.project.as_deref(),
+        options.query.as_deref(),
+        options.include_superseded,
+        options.at.as_deref(),
+        options.limit,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut nodes = std::collections::HashSet::new();
+    for edge in &edges {
+        nodes.insert(edge.source.trim().to_ascii_lowercase());
+        nodes.insert(edge.target.trim().to_ascii_lowercase());
+    }
+    let active_edge_count = edges
+        .iter()
+        .filter(|edge| edge.superseded_by.is_none())
+        .count();
+    let superseded_edge_count = edges.len().saturating_sub(active_edge_count);
+    let capped = edges.len() == options.limit;
+    Ok(Json(GraphWindowResponse {
+        edges,
+        node_count: nodes.len(),
+        active_edge_count,
+        superseded_edge_count,
+        capped,
+    }))
+}
+
+#[derive(Serialize)]
+pub struct EvidenceMetadata {
+    pub importance: f64,
+    pub scope: String,
+    pub kind: String,
+    pub event_time: Option<String>,
+    pub namespace: String,
+    pub source_type: String,
+    pub trust_tier: String,
+    pub writer_identity: Option<String>,
+    pub source_ref: Option<String>,
+    pub parent_memory_id: Option<i64>,
+    pub classification: String,
+    pub consent_state: Option<String>,
+    pub residency: Option<String>,
+    pub retention_policy_id: Option<String>,
+    pub expires_at: Option<i64>,
+    pub legal_hold: bool,
+}
+
+impl From<db::MemoryMetaInfo> for EvidenceMetadata {
+    fn from(meta: db::MemoryMetaInfo) -> Self {
+        Self {
+            importance: meta.importance,
+            scope: meta.scope,
+            kind: meta.kind,
+            event_time: meta.event_time,
+            namespace: meta.namespace,
+            source_type: meta.source_type,
+            trust_tier: meta.trust_tier,
+            writer_identity: meta.writer_identity,
+            source_ref: meta.source_ref,
+            parent_memory_id: meta.parent_memory_id,
+            classification: meta.classification,
+            consent_state: meta.consent_state,
+            residency: meta.residency,
+            retention_policy_id: meta.retention_policy_id,
+            expires_at: meta.expires_at,
+            legal_hold: meta.legal_hold,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct EvidenceQuery {
+    pub namespace: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct MemoryEvidenceResponse {
+    pub memory: db::Memory,
+    pub metadata: EvidenceMetadata,
+    pub chunks: Vec<db::MemoryChunk>,
+    pub graph_edges: Vec<db::MemoryEdge>,
+}
+
+async fn api_memory_evidence(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(query): Query<EvidenceQuery>,
+) -> Result<Json<MemoryEvidenceResponse>, (StatusCode, String)> {
+    let namespace = crate::governance::normalize_namespace(
+        query
+            .namespace
+            .as_deref()
+            .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+    );
+    let memory = db::get_memory_by_id_in_namespace(&state.db, id, &namespace)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("memory {id} not found")))?;
+    let metadata = EvidenceMetadata::from(
+        db::get_memory_meta_full(&state.db, id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+    );
+    let mut chunks = db::chunks_for_memories(&state.db, &[id])
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut graph_edges = db::memory_edges_for_memories(&state.db, &[id])
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(MemoryEvidenceResponse {
+        memory,
+        metadata,
+        chunks: chunks.remove(&id).unwrap_or_default(),
+        graph_edges: graph_edges.remove(&id).unwrap_or_default(),
+    }))
+}
+
+#[derive(Deserialize)]
 pub struct MemoriesQuery {
     pub project: Option<String>,
     pub query: Option<String>,
@@ -1211,5 +1394,59 @@ async fn api_list_sessions(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         Ok(Json(serde_json::json!(sessions)))
+    }
+}
+
+#[cfg(test)]
+mod workbench_tests {
+    use super::*;
+
+    #[test]
+    fn graph_window_options_validate_dates_trim_filters_and_cap_limits() {
+        let options = graph_window_options(&GraphWindowQuery {
+            project: Some("  /tmp/ironmem  ".into()),
+            query: Some("  Sol managed Atlas  ".into()),
+            history: Some(true),
+            at: Some("2026-07-09".into()),
+            limit: Some(9_000),
+        })
+        .expect("valid workbench query");
+
+        assert_eq!(options.project.as_deref(), Some("/tmp/ironmem"));
+        assert_eq!(options.query.as_deref(), Some("Sol managed Atlas"));
+        assert!(options.include_superseded);
+        assert_eq!(options.at.as_deref(), Some("2026-07-09"));
+        assert_eq!(options.limit, 500);
+
+        let error = graph_window_options(&GraphWindowQuery {
+            project: None,
+            query: None,
+            history: None,
+            at: Some("July 9".into()),
+            limit: None,
+        })
+        .expect_err("invalid dates must be rejected");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn evidence_metadata_exposes_governance_without_internal_hashes() {
+        let meta = db::MemoryMetaInfo {
+            kind: "fact".into(),
+            event_time: Some("2026-07-09".into()),
+            source_ref: Some("session:abc".into()),
+            trust_tier: "high".into(),
+            classification: "internal".into(),
+            legal_hold: true,
+            record_hash: Some("must-not-leak".into()),
+            ..db::MemoryMetaInfo::default()
+        };
+
+        let json = serde_json::to_value(EvidenceMetadata::from(meta)).unwrap();
+        assert_eq!(json["kind"], "fact");
+        assert_eq!(json["trust_tier"], "high");
+        assert_eq!(json["legal_hold"], true);
+        assert!(json.get("record_hash").is_none());
+        assert!(json.get("tombstoned_at").is_none());
     }
 }

@@ -104,13 +104,17 @@
   `get_profile`, `refresh_profile`, `list_corrections`, `memory_graph`, and
   `reconcile_memory_graph`.
 - **Temporal recall + graph recall** — dated facts and `event_time` metadata power timestamp lookup, while `memory_edges` stores structured `source | relation | target` edges with valid-time filters and provenance. Temporal questions route toward date-bearing facts; relationship questions route toward graph edges.
+- **Memory Graph Workbench** — the built-in local UI is now a temporal graph
+  investigation surface with project/query/date/history filters, an interactive
+  canvas, retrieval-trace highlighting, governed memory metadata, structured
+  chunks, graph provenance, and one-click expansion to exact original source.
 - **Benchmarked on LoCoMo:** 68.4% overall (Gemini 2.5 Pro answerer + Pro judge, 1,540 scored questions, 0 errors) with governance-off retrieval, +2.1 points over the governed baseline. Full harness, result files, and reproduction: **[ironmem-locomo-benchmark](https://github.com/BMC-INC/ironmem-locomo-benchmark)**. See [Benchmarks](#benchmarks).
 - **External storage adapters:** a `StorageBackend` trait with a HYBRID mode lets vector and graph layers run on real external backends (Qdrant over HTTP for vectors, Neo4j for the graph) instead of only the embedded SQLite store, while keeping the native path the default.
 - **Retrieval + governance instrumentation:** governance-cost timings in `/status`, a temporal-trust trajectory signal, a compression coverage pass, and the path-to-70 retrieval batch (routed fusion, structured evidence, pool/context tuning, multi-hop decomposition, entity aliases, temporal conflict handling, and source-backed evidence chains).
 - **Valid-time temporal recall:** `remember` accepts an optional `event_at` (an ISO `YYYY-MM-DD` date or a `YYYY-MM-DD..YYYY-MM-DD` range) for when an event actually occurred, distinct from the storage time (`created_at`). Valid-time dates are surfaced through an `event_times` side map on search, list, context, and skim results, powering time-aware retrieval.
 - **Derived (inferred) memories:** reflection can derive new memories from existing ones, governed as `source_type=derived` / `kind=inference` with a `derives` provenance edge and a ledger entry per inference. Derived memories are quarantined from default retrieval until a caller explicitly asks for them, so inferences never silently pollute primary recall.
 - **Opt-in auto-dream trigger:** a thin background watcher (`auto_dream.enabled`, default off, with a `gap_minutes` idle threshold) fires a consolidation and synthesis pass on projects that have gone idle. Every auto-triggered pass is recorded in the governance ledger with a `trigger_reason`, so it stays auditable instead of a black box.
-- **Current verification:** `cargo test --bin ironmem` passes **200 tests** with
+- **Current verification:** `cargo test --bin ironmem` passes **203 tests** with
   **1 ignored benchmark**, MCP stdio cleanliness passes, and the strict
   `local-onnx` clippy gate is clean.
 - **Still zero telemetry. Still local-first. Your data stays yours.**
@@ -665,15 +669,21 @@ IronMem includes a native Neovim plugin that communicates via MCP stdio.
 
 ---
 
-## Web UI
+## Memory Graph Workbench
 
-When the REST server is running, a built-in memory browser is available at:
+When the REST server is running, the built-in workbench is available at:
 
 ```
 http://localhost:37778/ui
 ```
 
-The UI shows sessions, memories, and database stats. You can browse, search, and delete memories directly from the browser.
+The Graph view explores a bounded temporal relationship window across one project
+or the full local store. Filter by entity/relation text, valid date, superseded
+history, and graph size; then select any node or relationship to inspect the
+backing memory, governance metadata, structured chunks, graph edges, and exact
+CCR source. Retrieval Trace runs the configured retrieval stack for a project and
+highlights the evidence chains it would return to an agent. Memories, Sessions,
+and Maintenance remain available as dedicated views.
 
 ### REST API
 
@@ -693,6 +703,8 @@ The REST server runs on `http://localhost:37778` by default. Current high-signal
 | `GET /profile` / `POST /refresh_profile` | Read or regenerate the user profile |
 | `GET /corrections` | List mined error-solution memories |
 | `GET /graph?entity=&project=&history=&at=&limit=` | Query temporal graph edges |
+| `GET /api/graph/window?project=&query=&history=&at=&limit=` | Browse a bounded workbench graph window |
+| `GET /api/memories/{id}/evidence` | Inspect memory metadata, chunks, and graph provenance |
 | `GET /status` | Health, DB stats, CCR stats, graph edge count, and memory chunk count |
 
 ---
@@ -1103,7 +1115,9 @@ This starts IronMem with Streamable HTTP on `http://localhost:37779/mcp` and Pos
 - [x] Multi-provider compression — OpenAI, Google Gemini, or Anthropic (configurable via `provider` in settings)
 - [x] Neovim plugin (`nvim/lua/ironmem/`) — auto session lifecycle, `:IronMemSearch`, `:IronMemStatus`
 - [x] Windows native support — `install.ps1`, platform-aware install messages, robust home dir detection
-- [x] Web UI memory browser — `http://localhost:37778/ui` when REST server is running
+- [x] Memory Graph Workbench — interactive temporal graph, evidence inspector,
+  retrieval trace, exact-source expansion, and library/maintenance views at
+  `http://localhost:37778/ui`
 
 ### Shipped in v0.4.0
 
