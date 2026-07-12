@@ -42,6 +42,8 @@ pub struct Config {
     #[serde(default)]
     pub multi_hop: MultiHopConfig,
     #[serde(default)]
+    pub ranking: RankingLeversConfig,
+    #[serde(default)]
     pub auto_dream: AutoDreamConfig,
     #[serde(default)]
     pub auto_compress: AutoCompressConfig,
@@ -230,6 +232,59 @@ impl Default for GovernanceRouterConfig {
 
 fn default_router_weight() -> f64 {
     0.05
+}
+
+/// Phase 1 ranking levers (memory-leadership roadmap): each defaults to the
+/// pre-lever behavior so a deploy is a no-op until a weight is raised, and each
+/// can be A/B-tuned via env at startup (see `server::router`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankingLeversConfig {
+    /// Times the chunk-parent (skim layer) id-list is fused for open-domain
+    /// queries. 0 disables chunk recall; 1 (default) gives it FTS footing.
+    #[serde(default = "default_chunk_fusion_weight")]
+    pub chunk_fusion_weight: usize,
+    /// Graph evidence-chain bridge depth. 1 (default) = historical single hop.
+    #[serde(default = "default_graph_chain_depth")]
+    pub graph_chain_depth: usize,
+    /// Demotion weight for candidates whose only edge support was superseded
+    /// by another candidate's live edge. 0.0 (default) = off.
+    #[serde(default)]
+    pub stale_demotion_weight: f64,
+    /// Activation boost weight (importance × maturity × recency). 0.0 = off.
+    #[serde(default)]
+    pub activation_weight: f64,
+    /// Recency half-life (days) for the activation boost.
+    #[serde(default = "default_activation_halflife_days")]
+    pub activation_halflife_days: f64,
+    /// Abstention guard: drop results sharing less than this fraction of the
+    /// query's salient terms. 0.0 (default) = off.
+    #[serde(default)]
+    pub abstention_min_overlap: f64,
+}
+
+impl Default for RankingLeversConfig {
+    fn default() -> Self {
+        Self {
+            chunk_fusion_weight: default_chunk_fusion_weight(),
+            graph_chain_depth: default_graph_chain_depth(),
+            stale_demotion_weight: 0.0,
+            activation_weight: 0.0,
+            activation_halflife_days: default_activation_halflife_days(),
+            abstention_min_overlap: 0.0,
+        }
+    }
+}
+
+fn default_chunk_fusion_weight() -> usize {
+    1
+}
+
+fn default_graph_chain_depth() -> usize {
+    1
+}
+
+fn default_activation_halflife_days() -> f64 {
+    30.0
 }
 
 /// Temporal trust trajectory as a retrieval signal (paper Finding 4: "standard
@@ -520,6 +575,7 @@ impl Default for Config {
             temporal_trust: TemporalTrustConfig::default(),
             governance_router: GovernanceRouterConfig::default(),
             multi_hop: MultiHopConfig::default(),
+            ranking: RankingLeversConfig::default(),
             auto_dream: AutoDreamConfig::default(),
             auto_compress: AutoCompressConfig::default(),
             scheduler: SchedulerConfig::default(),

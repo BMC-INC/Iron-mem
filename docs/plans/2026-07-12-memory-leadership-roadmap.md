@@ -102,6 +102,14 @@
 
 **Exit criteria:** LoCoMo overall ≥78, multi-hop ≥65, open-domain ≥62; LongMemEval knowledge-update/abstention +10pp each; p50 latency on T0/T1 exits <100ms.
 
+**Status (2026-07-12):** ranking levers landed behind `Config.ranking` (env-overridable at deploy: `IRONMEM_CHUNK_FUSION_WEIGHT`, `IRONMEM_GRAPH_CHAIN_DEPTH`, `IRONMEM_STALE_DEMOTION_WEIGHT`, `IRONMEM_ACTIVATION_WEIGHT`, `IRONMEM_ABSTENTION_MIN_OVERLAP`):
+- **Chunk fusion (item 3, ON by default):** `db::search_memory_chunk_parents_in_namespace` ranks skim-layer chunks by term overlap; parents fuse as a first-class RRF signal for OpenDomain queries only.
+- **Graph chain depth (item 2, deterministic variant):** the evidence-chain hop in `graph_ids_for_query` is now depth-parameterized with geometric decay + per-level frontier caps (default 1 = historical behavior). The LLM-driven iterative loop (`iterative_rerank_search_in_namespace`) already existed and is unchanged.
+- **Supersession-aware ranking (item 5, off by default):** `apply_supersession_demotion` demotes candidates whose entire edge support is superseded while another candidate holds the live edge for the same (source, relation).
+- **Activation scoring (item 4, off by default):** `maturity` column on memory_meta (draft→stable→core, promoted idempotently by the dream sweep from injection/feedback counts) + `apply_activation_boost` (importance × maturity × recency half-life).
+- **Abstention (item 6, off by default):** salient-term-overlap guard drops low-affinity results so callers can answer "I don't know".
+Eval suite grew to 46 cases (chunk recall, maturity clamp/promotion/multiplier). Remaining Phase 1: the explicit T0–T3 early-exit tier restructure with tier-exit metrics (item 1) — note the cross-encoder is already the default rerank backend — and benchmark-driven tuning of the new lever weights (LoCoMo/LongMemEval A/B, which needs API keys).
+
 ### Phase 2 — Observation-log extraction (~2–3 weeks) — *raises the ceiling every retrieval gain is capped by*
 
 1. **Observer pass** (new `src/observer.rs`, invoked from the compression sweep): produce an append-only, timestamped, priority-tagged observation/decision log (target 3–6× compression, never destructive) instead of summary-first storage. Each line: timestamp, priority, type (decision/fact/preference/error-fix), text. Persist as `kind='observation'` memories through `remember_with_governance` so embeddings, chunking, FTS, and governance apply automatically. Narrative summary becomes a secondary artifact.

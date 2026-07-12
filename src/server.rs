@@ -59,6 +59,12 @@ pub fn router(state: AppState) -> Router {
             .and_then(|v| v.trim().parse::<f64>().ok())
             .unwrap_or(fallback)
     };
+    let env_usize = |key: &str, fallback: usize| {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(fallback)
+    };
     let retrieval_tuning = crate::retrieval::RetrievalTuning {
         temporal_fusion_weight: state.config.temporal_trust.temporal_event_fusion_weight,
         trust_weight: env_f64(
@@ -71,14 +77,42 @@ pub fn router(state: AppState) -> Router {
             "IRONMEM_GOVERNANCE_ROUTER_WEIGHT",
             state.config.governance_router.weight,
         ),
+        chunk_fusion_weight: env_usize(
+            "IRONMEM_CHUNK_FUSION_WEIGHT",
+            state.config.ranking.chunk_fusion_weight,
+        ),
+        graph_chain_depth: env_usize(
+            "IRONMEM_GRAPH_CHAIN_DEPTH",
+            state.config.ranking.graph_chain_depth,
+        ),
+        stale_demotion_weight: env_f64(
+            "IRONMEM_STALE_DEMOTION_WEIGHT",
+            state.config.ranking.stale_demotion_weight,
+        ),
+        activation_weight: env_f64(
+            "IRONMEM_ACTIVATION_WEIGHT",
+            state.config.ranking.activation_weight,
+        ),
+        activation_halflife_days: state.config.ranking.activation_halflife_days,
+        abstention_min_overlap: env_f64(
+            "IRONMEM_ABSTENTION_MIN_OVERLAP",
+            state.config.ranking.abstention_min_overlap,
+        ),
     };
     // Log the resolved weights so a run can be audited for which retrieval levers
     // were actually live (env override vs settings default) — no more silent config.
     tracing::info!(
-        "retrieval tuning: tier_weight={} trust_weight={} temporal_fusion_weight={}",
+        "retrieval tuning: tier_weight={} trust_weight={} temporal_fusion_weight={} \
+         chunk_fusion_weight={} graph_chain_depth={} stale_demotion_weight={} \
+         activation_weight={} abstention_min_overlap={}",
         retrieval_tuning.tier_weight,
         retrieval_tuning.trust_weight,
         retrieval_tuning.temporal_fusion_weight,
+        retrieval_tuning.chunk_fusion_weight,
+        retrieval_tuning.graph_chain_depth,
+        retrieval_tuning.stale_demotion_weight,
+        retrieval_tuning.activation_weight,
+        retrieval_tuning.abstention_min_overlap,
     );
     crate::retrieval::set_retrieval_tuning(retrieval_tuning);
     Router::new()

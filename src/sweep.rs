@@ -295,6 +295,20 @@ pub async fn run_dream_sweep(
         ..Default::default()
     };
 
+    // Maturity promotion rides the dream cycle: memories that keep earning
+    // injections/feedback graduate draft → stable → core, feeding the
+    // activation ranking lever. Idempotent and cheap, so it runs even when no
+    // project is due for a full dream pass.
+    if !options.dry_run {
+        match db::promote_memories_maturity(db).await {
+            Ok(promoted) if promoted > 0 => {
+                tracing::info!("dream sweep promoted {promoted} memory(ies) in maturity");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("maturity promotion failed: {e}"),
+        }
+    }
+
     for candidate in candidates {
         let idle_secs = now.saturating_sub(candidate.last_activity);
         let action = if options.dry_run {

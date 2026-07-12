@@ -97,6 +97,7 @@ pub async fn run(cfg: &Config, out_dir: &Path) -> Result<EvalReport> {
     cases.extend(eval_governance_cluster(&db).await?);
     cases.extend(eval_entity_cluster(&db).await?);
     cases.extend(eval_chunk_cluster(&db).await?);
+    cases.extend(eval_ranking_lever_cluster(&db).await?);
 
     let mut report = EvalReport {
         command,
@@ -1156,6 +1157,106 @@ async fn eval_chunk_cluster(db: &Database) -> Result<Vec<EvalCase>> {
         format!(
             "chunks after replace: {:?}",
             chunk_map.get(&id).map(|c| c.len())
+        ),
+    ));
+
+    Ok(cases)
+}
+
+// --- ranking-lever cluster (Phase 1) ------------------------------------------
+// Chunk fusion is on by default; maturity promotion is a dream-sweep dependency
+// of the activation lever. Both must behave deterministically.
+
+async fn eval_ranking_lever_cluster(db: &Database) -> Result<Vec<EvalCase>> {
+    let mut cases = Vec::new();
+    let project = "/tmp/ironmem-eval-levers";
+
+    // A detail that lives only in the skim layer: the memory summary misses
+    // the query vocabulary, its chunk carries it. Open-domain fusion must
+    // surface the parent memory anyway.
+    let parent = store(db, project, "Weekly planning notes were archived").await?;
+    db::replace_memory_chunks(
+        db,
+        parent,
+        &[NewMemoryChunk {
+            chunk_id: format!("eval-lever-chunk-{parent}"),
+            project: project.to_string(),
+            memory_id: parent,
+            session_id: "eval".to_string(),
+            ordinal: 0,
+            density: "skim".to_string(),
+            kind: "fact".to_string(),
+            title: "forecast".to_string(),
+            summary: "Reviewed the quarterly forecast spreadsheet totals".to_string(),
+            source_hash: None,
+            source_start: None,
+            source_end: None,
+            token_estimate: 8,
+        }],
+    )
+    .await?;
+    let hits = search(db, project, "quarterly forecast spreadsheet", 3).await?;
+    cases.push(EvalCase::new(
+        "lever_chunk_recall_surfaces_parent",
+        hits.contains(&parent),
+        format!("expected chunk parent {parent} in top-3, got {hits:?}"),
+    ));
+
+    // Maturity: explicit set clamps to the known tiers.
+    let m = store(db, project, "Maturity clamp subject memory").await?;
+    db::upsert_memory_meta(db, m, 0.6).await?;
+    db::set_memory_maturity(db, m, "CORE").await?;
+    let meta = db::activation_meta_for(db, &[m]).await?;
+    let clamped_core = meta.get(&m).and_then(|a| a.maturity.clone()) == Some("core".to_string());
+    db::set_memory_maturity(db, m, "not-a-tier").await?;
+    let meta = db::activation_meta_for(db, &[m]).await?;
+    let clamped_draft = meta.get(&m).and_then(|a| a.maturity.clone()) == Some("draft".to_string());
+    cases.push(EvalCase::new(
+        "lever_maturity_set_clamps_tiers",
+        clamped_core && clamped_draft,
+        format!("clamped_core={clamped_core} clamped_draft={clamped_draft}"),
+    ));
+
+    // Promotion flow: 3 injections graduate draft -> stable; net feedback >= 2
+    // graduates stable -> core. Idempotent across repeat sweeps.
+    let promoted = store(db, project, "Promotion subject memory").await?;
+    db::upsert_memory_meta(db, promoted, 0.6).await?;
+    if let Some(memory) = db::get_memory_by_id_any_namespace(db, promoted).await? {
+        for _ in 0..3 {
+            db::record_injection_events(
+                db,
+                project,
+                None,
+                Some("eval"),
+                std::slice::from_ref(&memory),
+            )
+            .await?;
+        }
+    }
+    db::promote_memories_maturity(db).await?;
+    let meta = db::activation_meta_for(db, &[promoted]).await?;
+    let stable = meta.get(&promoted).and_then(|a| a.maturity.clone()) == Some("stable".to_string());
+    db::record_memory_feedback(db, promoted, project, "useful", 2.0, None).await?;
+    db::promote_memories_maturity(db).await?;
+    let meta = db::activation_meta_for(db, &[promoted]).await?;
+    let core = meta.get(&promoted).and_then(|a| a.maturity.clone()) == Some("core".to_string());
+    cases.push(EvalCase::new(
+        "lever_maturity_promotion_flow",
+        stable && core,
+        format!("after_injections_stable={stable} after_feedback_core={core}"),
+    ));
+
+    // The maturity multiplier feeding activation scoring is monotone.
+    let monotone = db::maturity_multiplier(Some("core")) > db::maturity_multiplier(Some("stable"))
+        && db::maturity_multiplier(Some("stable")) > db::maturity_multiplier(None);
+    cases.push(EvalCase::new(
+        "lever_maturity_multiplier_monotone",
+        monotone,
+        format!(
+            "core={} stable={} draft={}",
+            db::maturity_multiplier(Some("core")),
+            db::maturity_multiplier(Some("stable")),
+            db::maturity_multiplier(None)
         ),
     ));
 
