@@ -153,10 +153,18 @@ mod tests {
     async fn seed_user_prefs(db: &Database, n: usize) {
         let s = create_session(db, "/tmp/p").await.unwrap();
         for i in 0..n {
-            let id = db::insert_memory(db, "/tmp/p", &s, &format!("user fact number {i}"), Some("pref"))
+            let id = db::insert_memory(
+                db,
+                "/tmp/p",
+                &s,
+                &format!("user fact number {i}"),
+                Some("pref"),
+            )
+            .await
+            .unwrap();
+            db::set_memory_scope_kind(db, id, "user", "preference")
                 .await
                 .unwrap();
-            db::set_memory_scope_kind(db, id, "user", "preference").await.unwrap();
         }
     }
 
@@ -167,11 +175,20 @@ mod tests {
         seed_user_prefs(&db, 3).await;
 
         // Local (deterministic) regeneration — no network.
-        let id = regenerate(&db, None, &store, None).await.unwrap().expect("profile created");
+        let id = regenerate(&db, None, &store, None)
+            .await
+            .unwrap()
+            .expect("profile created");
         let info = db::get_memory_meta_full(&db, id).await.unwrap();
-        assert_eq!((info.scope.as_str(), info.kind.as_str()), ("user", "profile"));
+        assert_eq!(
+            (info.scope.as_str(), info.kind.as_str()),
+            ("user", "profile")
+        );
 
-        let prof = db::get_profile_memory(&db).await.unwrap().expect("profile retrievable");
+        let prof = db::get_profile_memory(&db)
+            .await
+            .unwrap()
+            .expect("profile retrievable");
         assert_eq!(prof.id, id);
         assert!(prof.summary.contains("user fact number"));
 
@@ -183,8 +200,9 @@ mod tests {
             id2,
             "the live profile is the freshly regenerated one"
         );
-        let all_profiles =
-            db::get_recent_memories_scoped(&db, "user", None, 100).await.unwrap();
+        let all_profiles = db::get_recent_memories_scoped(&db, "user", None, 100)
+            .await
+            .unwrap();
         let n_profiles = {
             let mut c = 0;
             for m in &all_profiles {

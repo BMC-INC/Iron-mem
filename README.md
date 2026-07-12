@@ -335,6 +335,18 @@ Headline (Gemini 2.5 Pro answerer + Pro judge, hybrid retrieval, pool 100, retri
 
 Setting the writer-tier and temporal-trust retrieval weights to 0 (ranking on pure relevance) scores **68.4%**, **+2.1 points** over the governed configuration. Governance metadata (writer identity, trust tier, provenance, ledger) is still recorded and queryable on every memory; the finding is only that letting trust tier tilt retrieval ranking was net-negative on this benchmark. The benchmark repo has the per-category analysis, second-judge agreement (Cohen's kappa 0.88), and the documented path past 70%.
 
+### LongMemEval
+
+An in-repo harness runs [LongMemEval](https://github.com/xiaowu0162/LongMemEval) (Wu et al., ICLR 2025) against the live write + retrieval pipeline with per-ability breakdowns (information extraction, multi-session reasoning, temporal reasoning, knowledge updates, abstention):
+
+```bash
+ironmem bench longmemeval --data longmemeval_s.json               # scored run (needs an LLM API key)
+ironmem bench longmemeval --data longmemeval_s.json --full-context # the published baseline column
+ironmem bench longmemeval --data longmemeval_s.json --dry-run      # pipeline smoke test, no API key
+```
+
+Every report records the answer model, judge model, embedder, and retrieval depth so runs are comparable — scores are only published next to a same-model full-context baseline. Deterministic retrieval-quality regression checks (42 cases across multi-hop, temporal, open-domain, knowledge-update, abstention, governance-parity, entity, and chunk clusters) run via `ironmem eval` and gate CI on every change.
+
 ---
 
 ## Install

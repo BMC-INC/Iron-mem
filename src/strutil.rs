@@ -41,7 +41,10 @@ mod tests {
         // '✓' occupies bytes 1..4 (3 bytes); cutting at 2 is mid-character.
         let s = "a✓b";
         let out = safe_truncate(s, 2);
-        assert!(out.starts_with("a… "), "kept prefix must end on a char boundary");
+        assert!(
+            out.starts_with("a… "),
+            "kept prefix must end on a char boundary"
+        );
         assert!(out.ends_with("… [truncated]"));
     }
 

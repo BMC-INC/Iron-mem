@@ -1,4 +1,5 @@
 mod auto_dream;
+mod bench;
 mod ccr;
 mod code_anchor;
 mod compress;
@@ -399,6 +400,41 @@ enum Commands {
         out: String,
     },
 
+    /// Run long-term memory benchmarks against the live pipeline
+    Bench {
+        /// Benchmark suite (currently only: longmemeval)
+        suite: String,
+        /// Path to the benchmark dataset JSON (e.g. longmemeval_s.json)
+        #[arg(long)]
+        data: String,
+        /// Directory for reports (markdown summary + per-question JSONL)
+        #[arg(long, default_value = "docs/evals")]
+        out: String,
+        /// Only score the first N questions (cheap iteration runs)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Memories retrieved per question
+        #[arg(long, default_value = "10")]
+        retrieve_k: usize,
+        /// Model that answers questions (defaults to the configured model)
+        #[arg(long)]
+        answer_model: Option<String>,
+        /// Model that judges answers (defaults to the configured model)
+        #[arg(long)]
+        judge_model: Option<String>,
+        /// Skip memory entirely and stuff the haystack into the prompt (the
+        /// published full-context baseline column)
+        #[arg(long)]
+        full_context: bool,
+        /// Character budget for --full-context prompts
+        #[arg(long, default_value = "400000")]
+        context_chars: usize,
+        /// Ingest and retrieve but skip LLM answer/judge calls (pipeline
+        /// smoke test; needs no API key and scores nothing)
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Record usage feedback for a memory
     Feedback {
         memory_id: i64,
@@ -694,6 +730,35 @@ async fn async_main() -> Result<()> {
             force,
         } => run_embed(&cfg, project.as_deref(), all, force).await?,
         Commands::Eval { out } => run_eval(&cfg, &out).await?,
+        Commands::Bench {
+            suite,
+            data,
+            out,
+            limit,
+            retrieve_k,
+            answer_model,
+            judge_model,
+            full_context,
+            context_chars,
+            dry_run,
+        } => {
+            run_bench(
+                &cfg,
+                &suite,
+                bench::BenchOptions {
+                    data: std::path::PathBuf::from(data),
+                    out_dir: std::path::PathBuf::from(out),
+                    limit,
+                    retrieve_k,
+                    answer_model,
+                    judge_model,
+                    full_context,
+                    context_chars,
+                    dry_run,
+                },
+            )
+            .await?
+        }
         Commands::Feedback {
             memory_id,
             project,
@@ -837,6 +902,29 @@ async fn run_eval(cfg: &config::Config, out: &str) -> Result<()> {
         );
     }
     eval::ensure_passed(&report)?;
+    Ok(())
+}
+
+async fn run_bench(cfg: &config::Config, suite: &str, opts: bench::BenchOptions) -> Result<()> {
+    if suite != "longmemeval" {
+        anyhow::bail!("unknown bench suite '{suite}' (supported: longmemeval)");
+    }
+    let report = bench::run(cfg, &opts).await?;
+    println!(
+        "IronMem LongMemEval: {}/{} = {:.1}% ({})",
+        report.correct,
+        report.total,
+        report.accuracy() * 100.0,
+        report.mode
+    );
+    for (ability, score) in &report.per_ability {
+        println!(
+            "  {ability}: {}/{} = {:.1}%",
+            score.correct,
+            score.total,
+            score.accuracy() * 100.0
+        );
+    }
     Ok(())
 }
 

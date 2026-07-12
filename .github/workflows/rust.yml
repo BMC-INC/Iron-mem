@@ -45,5 +45,11 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+      # Retrieval-quality regression gate: the deterministic eval suite
+      # (src/eval.rs, no API keys needed) must pass on every change.
+      - name: Memory-quality eval gate
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo run --quiet -- eval --out target/eval-reports
+
       - name: Clippy
         run: cargo clippy -- -D warnings

@@ -84,6 +84,8 @@
 
 **Exit criteria:** a LongMemEval number exists (expect ~65–75% baseline); CI blocks retrieval regressions; ablation tables generate.
 
+**Status (2026-07-12):** items 1–3 landed — `ironmem bench longmemeval` harness (`src/bench.rs`: official dataset loader, per-ability scoring incl. abstention, strict LLM judge, `--full-context` baseline mode, `--dry-run` keyless smoke test); `src/eval.rs` expanded 3 → 42 deterministic cases (multi-hop, temporal, open-domain, knowledge-update, abstention, governance-parity/ledger/namespace, entity, chunk clusters); eval gate wired into CI (`cargo test` gate test + explicit ubuntu step). Remaining: ablation-table flags (item 4) and the first scored LongMemEval run + published methodology (item 5, needs API keys and the dataset download).
+
 ### Phase 1 — Tiered retrieval + reranking defaults (~2–3 weeks) — *attacks multi-hop 52.5 and open-domain 50.0*
 
 1. **Stage `hybrid_search` into explicit tiers with early exit:**

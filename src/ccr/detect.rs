@@ -143,11 +143,10 @@ fn line_looks_like_log(line: &str) -> bool {
 
     // Level tokens (padded with space or brackets)
     const SPACE_LEVELS: &[&str] = &[
-        " INFO ", " WARN ", " ERROR ", " DEBUG ", " TRACE ",
-        " INFO\t", " WARN\t", " ERROR\t", " DEBUG\t", " TRACE\t",
+        " INFO ", " WARN ", " ERROR ", " DEBUG ", " TRACE ", " INFO\t", " WARN\t", " ERROR\t",
+        " DEBUG\t", " TRACE\t",
     ];
-    const BRACKET_LEVELS: &[&str] =
-        &["[INFO]", "[WARN]", "[ERROR]", "[DEBUG]", "[TRACE]"];
+    const BRACKET_LEVELS: &[&str] = &["[INFO]", "[WARN]", "[ERROR]", "[DEBUG]", "[TRACE]"];
 
     for tok in SPACE_LEVELS {
         if line.contains(tok) {
@@ -178,9 +177,8 @@ fn is_log(text: &str) -> bool {
 
 const CODE_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "go", "c", "h", "cpp", "hpp", "java", "rb", "kt",
-    "swift", "php", "cs", "sh", "bash", "zsh", "fish", "lua", "r", "jl", "ex", "exs", "erl",
-    "hs", "ml", "mli", "clj", "cljs", "scala", "groovy", "dart", "vim", "tf", "toml", "yaml",
-    "yml",
+    "swift", "php", "cs", "sh", "bash", "zsh", "fish", "lua", "r", "jl", "ex", "exs", "erl", "hs",
+    "ml", "mli", "clj", "cljs", "scala", "groovy", "dart", "vim", "tf", "toml", "yaml", "yml",
 ];
 
 fn is_code(text: &str, path_hint: Option<&str>) -> bool {
@@ -197,7 +195,10 @@ fn is_code(text: &str, path_hint: Option<&str>) -> bool {
     if chars == 0 {
         return false;
     }
-    let braces = text.chars().filter(|&c| matches!(c, '{' | '}' | '(' | ')')).count();
+    let braces = text
+        .chars()
+        .filter(|&c| matches!(c, '{' | '}' | '(' | ')'))
+        .count();
     let semis = text.chars().filter(|&c| c == ';').count();
     let density = (braces + semis) as f64 / chars as f64;
     // >2% brace/semicolon density is a strong code signal

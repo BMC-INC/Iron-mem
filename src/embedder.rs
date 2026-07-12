@@ -262,7 +262,10 @@ impl Embedder for OnnxEmbedder {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let docs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         let raw = {
-            let m = self.model.lock().map_err(|_| anyhow!("onnx model poisoned"))?;
+            let m = self
+                .model
+                .lock()
+                .map_err(|_| anyhow!("onnx model poisoned"))?;
             m.embed(docs, None)?
         };
         Ok(raw.iter().map(|v| normalize(v)).collect())
@@ -289,7 +292,12 @@ async fn ollama_dim(base: &str, model: &str) -> Option<usize> {
         .map(|v| v.len())
 }
 
-fn build_api(kind: ApiKind, default_model: &str, default_dim: usize, cfg: &Config) -> Option<Arc<dyn Embedder>> {
+fn build_api(
+    kind: ApiKind,
+    default_model: &str,
+    default_dim: usize,
+    cfg: &Config,
+) -> Option<Arc<dyn Embedder>> {
     let provider = match kind {
         ApiKind::OpenAi => Provider::Openai,
         ApiKind::Google => Provider::Google,
@@ -310,19 +318,33 @@ pub async fn resolve_embedder(cfg: &Config) -> Option<Arc<dyn Embedder>> {
     let result: Option<Arc<dyn Embedder>> = match ec.provider.as_str() {
         "none" => None,
         "ollama" => {
-            let model = ec.model.clone().unwrap_or_else(|| "nomic-embed-text".to_string());
+            let model = ec
+                .model
+                .clone()
+                .unwrap_or_else(|| "nomic-embed-text".to_string());
             let dim = ollama_dim(&ec.ollama_url, &model).await?;
-            Some(Arc::new(OllamaEmbedder::new(ec.ollama_url.clone(), model, dim)))
+            Some(Arc::new(OllamaEmbedder::new(
+                ec.ollama_url.clone(),
+                model,
+                dim,
+            )))
         }
         "openai" => build_api(ApiKind::OpenAi, "text-embedding-3-small", 1536, cfg),
         "google" => build_api(ApiKind::Google, "text-embedding-004", 768, cfg),
         "onnx" => build_onnx(),
         _ => {
             // "auto": prefer local/no-egress.
-            let model = ec.model.clone().unwrap_or_else(|| "nomic-embed-text".to_string());
+            let model = ec
+                .model
+                .clone()
+                .unwrap_or_else(|| "nomic-embed-text".to_string());
             if OllamaEmbedder::reachable(&ec.ollama_url).await {
                 if let Some(dim) = ollama_dim(&ec.ollama_url, &model).await {
-                    Some(Arc::new(OllamaEmbedder::new(ec.ollama_url.clone(), model, dim)))
+                    Some(Arc::new(OllamaEmbedder::new(
+                        ec.ollama_url.clone(),
+                        model,
+                        dim,
+                    )))
                 } else {
                     None
                 }

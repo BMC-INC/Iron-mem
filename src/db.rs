@@ -52,7 +52,6 @@ pub struct Memory {
     pub created_at: i64,
 }
 
-#[cfg(test)]
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct MemoryLedgerEntry {
     pub id: i64,
@@ -2594,7 +2593,8 @@ pub async fn latest_ledger_hash(db: &Database, namespace: &str) -> Result<Option
     Ok(row.and_then(|r| r.try_get::<String, _>("entry_hash").ok()))
 }
 
-#[cfg(test)]
+/// Full audit trail for one memory (id ASC). Used by the eval governance
+/// cluster and exposed for lineage/compliance inspection.
 pub async fn memory_ledger_for_memory(
     db: &Database,
     memory_id: i64,

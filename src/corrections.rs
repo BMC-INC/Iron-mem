@@ -225,7 +225,11 @@ mod tests {
     #[test]
     fn mines_fail_edit_pass_loop() {
         let transcript = vec![
-            obs("Bash", "cargo build", "error[E0425]: cannot find value `incref_blob`"),
+            obs(
+                "Bash",
+                "cargo build",
+                "error[E0425]: cannot find value `incref_blob`",
+            ),
             obs("Edit", "src/db.rs", "ok"),
             obs("Bash", "cargo build", "Finished `dev` profile"),
         ];
@@ -289,9 +293,15 @@ mod tests {
         let mems = db::get_recent_memories_scoped(&db, "project", Some("/tmp/p"), 10)
             .await
             .unwrap();
-        let m = mems.iter().find(|m| m.summary.starts_with("Error:")).unwrap();
+        let m = mems
+            .iter()
+            .find(|m| m.summary.starts_with("Error:"))
+            .unwrap();
         let info = db::get_memory_meta_full(&db, m.id).await.unwrap();
-        assert_eq!((info.scope.as_str(), info.kind.as_str()), ("project", "error_solution"));
+        assert_eq!(
+            (info.scope.as_str(), info.kind.as_str()),
+            ("project", "error_solution")
+        );
 
         let _ = std::fs::remove_file(path);
     }
