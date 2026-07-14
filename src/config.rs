@@ -50,6 +50,8 @@ pub struct Config {
     #[serde(default)]
     pub agent_keys: Vec<AgentKeyConfig>,
     #[serde(default)]
+    pub observer: ObserverConfig,
+    #[serde(default)]
     pub auto_dream: AutoDreamConfig,
     #[serde(default)]
     pub auto_compress: AutoCompressConfig,
@@ -284,6 +286,36 @@ impl Default for RankingLeversConfig {
             tier_early_exit: false,
         }
     }
+}
+
+/// Observer pass (Phase 2): append-only, timestamped, priority-tagged
+/// observation log emitted beside the narrative at compression time — the
+/// non-destructive alternative to lossy summarization. Off by default: it
+/// adds one LLM call per compression; set a cheap `model` to control cost.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserverConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Model for the observer call. Empty = the main compression model.
+    #[serde(default)]
+    pub model: String,
+    /// Cap on stored log lines per session.
+    #[serde(default = "default_observer_max_lines")]
+    pub max_lines: usize,
+}
+
+impl Default for ObserverConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: String::new(),
+            max_lines: default_observer_max_lines(),
+        }
+    }
+}
+
+fn default_observer_max_lines() -> usize {
+    60
 }
 
 /// One agent's API key: bearer `token` resolves to `agent_id`, which may only
@@ -607,6 +639,7 @@ impl Default for Config {
             multi_hop: MultiHopConfig::default(),
             ranking: RankingLeversConfig::default(),
             agent_keys: Vec::new(),
+            observer: ObserverConfig::default(),
             auto_dream: AutoDreamConfig::default(),
             auto_compress: AutoCompressConfig::default(),
             scheduler: SchedulerConfig::default(),

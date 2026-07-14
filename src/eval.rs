@@ -99,6 +99,7 @@ pub async fn run(cfg: &Config, out_dir: &Path) -> Result<EvalReport> {
     cases.extend(eval_chunk_cluster(&db).await?);
     cases.extend(eval_ranking_lever_cluster(&db).await?);
     cases.extend(eval_compliance_cluster(&db).await?);
+    cases.extend(eval_observer_cluster(&db).await?);
 
     let mut report = EvalReport {
         command,
@@ -1386,6 +1387,106 @@ async fn eval_compliance_cluster(db: &Database) -> Result<Vec<EvalCase>> {
             report.chains.len(),
             report.inventory.len()
         ),
+    ));
+
+    Ok(cases)
+}
+
+// --- observer cluster (Phase 2) -------------------------------------------------
+// The Observer's persistence contract, exercised without an LLM: parsed log
+// lines become governed kind='observation' memories with priority-scaled
+// importance, their own event dates, parent linkage, and full recall.
+
+async fn eval_observer_cluster(db: &Database) -> Result<Vec<EvalCase>> {
+    let mut cases = Vec::new();
+    let project = "/tmp/ironmem-eval-observer";
+
+    let narrative = compress::remember(
+        db,
+        None,
+        &BruteForceStore,
+        project,
+        "project",
+        "session",
+        "Narrative summary of the planning session",
+        Some("eval"),
+    )
+    .await?;
+
+    let raw = "\
+- [2023-05-07] P1 decision: Caroline joined the LGBTQ support group
+- [-] P2 preference: Dave prefers espresso over filter coffee
+- [2022-06-01] P3 event: Melanie painted a sunrise on canvas
+";
+    let lines = crate::observer::parse_observer_response(raw);
+    let stored =
+        crate::observer::persist_lines(db, None, &BruteForceStore, project, &lines, narrative)
+            .await;
+    cases.push(EvalCase::new(
+        "observer_lines_parse_and_persist",
+        lines.len() == 3 && stored == 3,
+        format!("parsed={} stored={stored}", lines.len()),
+    ));
+
+    // The dated detail must be retrievable — the exact failure mode narrative
+    // compression has ("attended social events" losing the date and the noun).
+    let hits = search(
+        db,
+        project,
+        "When did Caroline join the LGBTQ support group?",
+        3,
+    )
+    .await?;
+    let hit_texts: Vec<String> = {
+        let mut texts = Vec::new();
+        for id in &hits {
+            if let Some(m) = db::get_memory_by_id_any_namespace(db, *id).await? {
+                texts.push(m.summary);
+            }
+        }
+        texts
+    };
+    let detail_recalled = hit_texts.iter().any(|t| t.contains("LGBTQ support group"));
+    cases.push(EvalCase::new(
+        "observer_detail_survives_and_recalls",
+        detail_recalled,
+        format!("hits={hit_texts:?}"),
+    ));
+
+    // Kind is a first-class member of the taxonomy (no clamp to 'session'),
+    // importance scales with priority, and lineage links back to the narrative.
+    let observation_id = hits.first().copied().unwrap_or_default();
+    let meta = db::get_memory_meta_full(db, observation_id).await?;
+    let lineage = crate::compliance::memory_lineage(db, observation_id).await?;
+    cases.push(EvalCase::new(
+        "observer_kind_importance_and_parent_lineage",
+        meta.kind == "observation"
+            && meta.importance > 0.8
+            && meta.writer_identity.as_deref() == Some("ironmem:observer")
+            && lineage.parent_chain.contains(&narrative),
+        format!(
+            "kind={} importance={} writer={:?} parent_chain={:?}",
+            meta.kind, meta.importance, meta.writer_identity, lineage.parent_chain
+        ),
+    ));
+
+    // The observed event's own date is queryable as valid time.
+    let dated = db::memories_by_event_time(db, Some(project), "2022", 10).await?;
+    let painted_dated = {
+        let mut found = false;
+        for id in &dated {
+            if let Some(m) = db::get_memory_by_id_any_namespace(db, *id).await? {
+                if m.summary.contains("sunrise") {
+                    found = true;
+                }
+            }
+        }
+        found
+    };
+    cases.push(EvalCase::new(
+        "observer_event_time_stamped",
+        painted_dated,
+        format!("2022-dated memory ids: {dated:?}"),
     ));
 
     Ok(cases)

@@ -18,6 +18,7 @@ mod governance;
 mod hooks;
 mod mcp;
 mod metrics;
+mod observer;
 mod profile;
 mod provider;
 mod reflection;

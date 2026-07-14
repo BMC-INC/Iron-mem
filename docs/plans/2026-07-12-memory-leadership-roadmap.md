@@ -126,6 +126,12 @@ Remaining Phase 1: benchmark-driven tuning of all lever weights (LoCoMo/LongMemE
 
 **Exit criteria:** LongMemEval information-extraction ≥90%; new deterministic eval cluster "detail present in transcript must be retrievable post-compression" passes; compression ratios surfaced in `ironmem status`.
 
+**Status (2026-07-14):** Observer landed (`src/observer.rs`, `Config.observer` — off by default, one extra LLM call per compression, cheap-`model` override supported):
+- Compression now optionally emits an **append-only, timestamped, priority-tagged observation log** (`- [YYYY-MM-DD] P1 category: text`; P1 critical / P2 important / P3 context; decision|fact|preference|error_fix|event) beside the narrative. Each line persists as a governed `kind='observation'` memory (new taxonomy member) with priority-scaled importance, its own event date (valid time), writer `ironmem:observer`, and `parent_memory_id` linking to the session narrative — so lineage traces every observation to its session.
+- **Reflector duties are covered by existing machinery** rather than duplicated: dream-sweep maturity promotion graduates recurring observations draft→stable→core; the graph reconcile pass extracts durable relations from observation memories into `memory_edges`; reflection consolidation and governed forget remain the only mutation paths. CCR verbatim blobs stay the lossless floor (`retrieve_original` already ships).
+- Tolerant parser (malformed lines skipped, invalid dates degrade to undated) with unit tests; eval suite grew to 54 (observer cluster: parse→persist, dated-detail recall — the exact "attended social events" failure mode narrative compression has — kind/importance/lineage, event-time stamping).
+Remaining Phase 2: enable-by-default decision + the coverage-diff pass (log vs transcript) — both benchmark-gated.
+
 ### Phase 3 — Governance: score-neutral → score-positive + compliance product (~1.5–2 weeks)
 
 1. **Close the 2.1pp governance-on gap:** profile the source (likely PII fail-closed dropping answer-bearing text + namespace pool shrinkage); switch to redact-with-placeholder + governed reveal at answer time; enforce parity ≤0.5pp via the Phase 0 CI cluster.

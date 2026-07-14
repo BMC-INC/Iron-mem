@@ -2237,6 +2237,12 @@ pub const MEMORY_KINDS: &[&str] = &[
     // from default retrieval (see retrieval::exclude_derived); surfaced only on
     // explicit request, with a `derives` provenance edge back to each source.
     "inference",
+    // Observer log lines (see observer.rs): timestamped, priority-tagged,
+    // append-only observations compressed from a session — the non-destructive
+    // alternative to narrative summarization. Fully retrievable (not
+    // quarantined) and linked to their session's narrative memory via
+    // parent_memory_id.
+    "observation",
 ];
 
 /// Clamp an arbitrary kind string to the known set, case-insensitively.
