@@ -306,6 +306,13 @@ summary:
   confidence, and memory provenance.
 - **Adaptive skim chunks:** `memory_chunks` rows with `chunk_id`, density, kind,
   title, token estimate, and optional exact transcript byte offsets.
+- **Observation logs (opt-in):** the Observer pass emits an append-only,
+  timestamped, priority-tagged log beside the narrative — each line its own
+  governed `kind=observation` memory with the event's own date and lineage back
+  to its session — so specifics survive that summarization would generalize away.
+- **Maturity tiers:** memories graduate `draft → stable → core` via the dream
+  sweep as they earn injections and positive feedback, feeding the optional
+  activation ranking lever.
 
 Retrieval is routed by query shape:
 
@@ -420,6 +427,9 @@ ironmem code-relink --dry-run # Tree-sitter Rust AST anchoring/relinking
 ironmem snapshot create --label before-refactor # CCR-backed project brain snapshot
 ironmem sync publish --node ci --op error_solution --payload '{"memory_id":1}' # Multi-agent event log
 ironmem eval                # Run deterministic memory-quality evals into docs/evals
+ironmem bench longmemeval --data longmemeval_s.json # LongMemEval harness (--full-context baseline, --dry-run keyless smoke)
+ironmem compliance-report   # EU AI Act Art. 12/13 report: ledger chain verification, governance inventory, snapshots
+ironmem lineage <memory-id> # Memory→action lineage: writer, ledger trail, every injection into an agent context
 ironmem compress <id>       # Manually compress a session
 ironmem sweep --compress-idle 30m --min-observations 50 --dry-run # Preview auto-compression
 ironmem sweep --dream-due --apply # Run due sleep/dream consolidation
@@ -717,7 +727,25 @@ The REST server runs on `http://localhost:37778` by default. Current high-signal
 | `GET /graph?entity=&project=&history=&at=&limit=` | Query temporal graph edges |
 | `GET /api/graph/window?project=&query=&history=&at=&limit=` | Browse a bounded workbench graph window |
 | `GET /api/memories/{id}/evidence` | Inspect memory metadata, chunks, and graph provenance |
-| `GET /status` | Health, DB stats, CCR stats, graph edge count, and memory chunk count |
+| `GET /memory/{id}/lineage` | Memory→action lineage: writer, governance, ledger trail, every injection with session/rank/query |
+| `GET /compliance/report` | EU AI Act Art. 12/13 report: hash-chain verification per namespace, governance inventory, snapshots |
+| `POST /feedback` | Reinforce or decay a memory's ranking |
+| `GET /snapshots` / `POST /snapshots` | List or create CCR-backed brain snapshots |
+| `GET /status` | Health, DB stats, CCR stats, governance op timings, and retrieval tier metrics |
+
+With `agent_keys` configured (see [Governed Memory](#governed-memory)), every
+REST request must present a listed bearer token; the resolved agent is confined
+to its namespace allowlist and writes are ledger-attributed `agent:<id>`.
+
+### Client SDKs
+
+Thin zero-dependency typed clients over the REST API live in-repo:
+
+- **Python** (`sdk/python`): `pip install ./sdk/python` → `from ironmem import IronMem`
+- **TypeScript** (`sdk/typescript`): Node 18+/browsers/Deno/Bun via global `fetch`
+
+Both cover session lifecycle, governed `remember`, ranked `context`, feedback,
+`lineage`, and `compliance_report` (typed responses), with bearer/agent-key auth.
 
 ---
 
@@ -764,6 +792,27 @@ ironmem remember "Customer asked to retain audit exports for 7 years" \
 ironmem search "audit exports" --namespace tenant-a
 ironmem forget 42 --actor privacy-admin --reason "retention window expired"
 ```
+
+### Compliance product
+
+The governance envelope is auditable end-to-end, mapped to the EU AI Act's
+record-keeping (Art. 12) and transparency (Art. 13) obligations — see
+[`docs/compliance/eu-ai-act-mapping.md`](docs/compliance/eu-ai-act-mapping.md):
+
+- **`ironmem compliance-report`** (also `GET /compliance/report`) walks every
+  namespace's ledger and **re-derives every SHA-256 entry hash** — any edit,
+  deletion, or reordering of history is detected and the first broken entry
+  named. It also emits a governance inventory (namespace × classification ×
+  consent with legal-hold/tombstone/expiry/retention counts) and snapshot
+  versions, as Art. 12/13-mapped markdown + JSON. Exits non-zero on a broken
+  chain, so it can gate a deploy.
+- **`ironmem lineage <id>`** (also `GET /memory/{id}/lineage`) answers "who
+  wrote this, from what, and every agent context it influenced": writer
+  identity, trust tier, consent, parent derivation chain, full ledger trail,
+  and every injection with session, rank, and triggering query.
+- **Per-agent access keys** (`agent_keys` in settings): each REST bearer token
+  resolves to an agent identity confined to a namespace allowlist; writes are
+  ledger-attributed `agent:<id>`, so writer identity cannot be spoofed.
 
 ---
 
@@ -827,6 +876,29 @@ The `rerank` block is off by default because it adds rerank work per query.
 The `auto_compress`/`scheduler` blocks are inert until you run `ironmem sweep`,
 `ironmem scheduler run`, or install the launchd agent. See
 [Sleep Cycle Auto-Compression](docs/sleep-cycle-autocompress.md).
+
+Newer optional sections (all default to pre-existing behavior when absent):
+
+- **`ranking`** — Phase 1 retrieval levers: `chunk_fusion_weight` (chunk-level
+  recall for open-domain queries, default on), `graph_chain_depth`,
+  `stale_demotion_weight`, `activation_weight` / `activation_halflife_days`,
+  `abstention_min_overlap`, `tier_early_exit`. Each is env-overridable at
+  deploy (`IRONMEM_CHUNK_FUSION_WEIGHT`, `IRONMEM_GRAPH_CHAIN_DEPTH`,
+  `IRONMEM_STALE_DEMOTION_WEIGHT`, `IRONMEM_ACTIVATION_WEIGHT`,
+  `IRONMEM_ABSTENTION_MIN_OVERLAP`, `IRONMEM_TIER_EARLY_EXIT`); resolved
+  weights are logged at startup and tier exit rates published on `/status`.
+- **`rerank.escalate_margin`** — T2→T3 escalation: when the cross-encoder's
+  top-two score margin is below this, the LLM reranker runs instead
+  (0.0 = cross-encoder results are final).
+- **`observer`** — `{enabled, model, max_lines}`: the append-only observation
+  log emitted beside narrative compression (one extra LLM call per
+  compression; set a cheap `model` to control cost).
+- **`storage`** — external engines: `vector_backend: "qdrant"` (+
+  `qdrant_url/collection/dim`) and/or `graph_backend: "neo4j"` (+
+  `neo4j_url/database/user/pass`). Down engines degrade to native with a
+  warning; recall never breaks.
+- **`agent_keys`** — `[{token, agent_id, namespaces}]` per-agent REST access
+  with namespace allowlists and ledger-attributed writes.
 
 ### Semantic Search & Embeddings
 
@@ -964,7 +1036,7 @@ cargo clippy --bin ironmem --features local-onnx -- -D warnings
 
 Result:
 
-- **192 tests passed**
+- **213 tests passed** (including the 54-case `eval_suite_gate`)
 - **MCP stdio cleanliness passed**
 - **1 benchmark intentionally ignored** (`bench_ccr_dict_vs_floor`)
 - **0 failed**
@@ -1190,8 +1262,54 @@ This starts IronMem with Streamable HTTP on `http://localhost:37779/mcp` and Pos
   ignored, MCP stdio cleanliness passes, the release `local-onnx` build passes,
   and clippy is clean with `local-onnx` enabled.
 
+### Shipped since v0.4.0 (unreleased)
+
+Executed against the [memory leadership roadmap](docs/plans/2026-07-12-memory-leadership-roadmap.md);
+every feature lands behind config with pre-change defaults, gated by the eval suite in CI.
+
+- [x] **LongMemEval harness** — `ironmem bench longmemeval` runs the official
+  dataset through the live write + retrieval pipeline with per-ability scoring
+  (information extraction, multi-session, temporal, knowledge-update,
+  abstention), a strict LLM judge, a `--full-context` baseline mode, and a
+  keyless `--dry-run` smoke mode; every report records answer/judge models,
+  embedder, and retrieval depth.
+- [x] **Deterministic eval suite 3 → 54 cases + CI gate** — multi-hop, temporal,
+  open-domain, knowledge-update, abstention, governance
+  (parity/PII-fail-closed/ledger-chain/namespace-isolation/delete-audit),
+  entity, chunk, ranking-lever, compliance (incl. tamper detection), and
+  observer clusters; `ironmem eval` gates CI on every change.
+- [x] **Phase 1 ranking levers** (`[ranking]` config, env-overridable) —
+  chunk-level recall fused for open-domain queries (on by default), graph
+  evidence-chain depth, supersession-aware demotion of stale facts, activation
+  scoring (importance × maturity × recency; `maturity` column promoted by the
+  dream sweep), and an abstention guard.
+- [x] **Tiered retrieval pipeline** — opt-in T0 lexical early exit (skip
+  embedding/auxiliary recall when the top FTS hit already carries every salient
+  term), cross-encoder score exposure with T2→T3 LLM-rerank escalation on low
+  margin (`rerank.escalate_margin`), and per-tier count/latency metrics on
+  `/status` (`retrieval_tiers`).
+- [x] **Compliance product** — `ironmem compliance-report` with per-namespace
+  hash-chain re-derivation (tamper detection), governance inventory, snapshot
+  versions, EU AI Act Art. 12/13 mapping doc; `ironmem lineage` memory→action
+  tracing; per-agent access keys with namespace allowlists and ledger-attributed
+  writes.
+- [x] **Observer pass (opt-in)** — append-only, timestamped, priority-tagged
+  observation log beside narrative compression; each line a governed
+  `kind=observation` memory with its own event date and session lineage.
+- [x] **Runtime external backends** — `[storage]` selectors wire the Qdrant
+  (vector) and Neo4j (graph) adapters into CLI/REST/MCP, stackable, degrading
+  to native with a warning if an engine is down.
+- [x] **Python + TypeScript SDKs** — zero-dependency typed clients in
+  `sdk/python` and `sdk/typescript` covering session lifecycle, governed
+  writes, ranked recall, feedback, lineage, and compliance reports.
+- [x] **Current verification** — 214 Rust tests pass, eval gate 54/54, clippy
+  clean; Python SDK smoke-tested against a live server.
+
 ### Next
 
+- [ ] **Benchmark-driven lever tuning** — A/B the Phase 1 levers, observer, and
+  tier exits on LoCoMo/LongMemEval (needs API keys + datasets), publish scores
+  with the same-model full-context baseline and the governance-on column
 - [ ] **Bespoke per-content-type transforms** — invertible log timestamp-delta / diff-token / AST-aware code normalization on top of the dictionary codecs (currently documented-future; the byte-exact contract is the gate)
 - [ ] **Observation-blob lifecycle GC** — reclaim CCR blobs behind deleted observations (memory-session blobs are already GC'd)
 
