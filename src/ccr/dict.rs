@@ -138,7 +138,11 @@ mod tests {
 
         for s in samples.iter().take(50) {
             let c = codec.compress(s).unwrap();
-            assert_eq!(codec.decompress(&c).unwrap(), *s, "dict round-trip byte-exact");
+            assert_eq!(
+                codec.decompress(&c).unwrap(),
+                *s,
+                "dict round-trip byte-exact"
+            );
         }
         // Edge inputs the dict was not trained on must still round-trip exactly.
         for s in [&b""[..], "héllo ✓ 日本語 🦀 multibyte".as_bytes()] {

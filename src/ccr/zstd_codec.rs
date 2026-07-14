@@ -58,7 +58,10 @@ mod tests {
 
     #[test]
     fn round_trips_ascii() {
-        assert_round_trips(&ZstdCodec { level: 19 }, b"the quick brown fox jumps over the lazy dog");
+        assert_round_trips(
+            &ZstdCodec { level: 19 },
+            b"the quick brown fox jumps over the lazy dog",
+        );
     }
 
     #[test]

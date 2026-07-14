@@ -42,6 +42,18 @@ pub struct Config {
     #[serde(default)]
     pub multi_hop: MultiHopConfig,
     #[serde(default)]
+    pub ranking: RankingLeversConfig,
+    /// Per-agent API keys for the REST server. Empty (default) = no agent
+    /// auth (local single-user mode). Non-empty = every REST request must
+    /// present a listed bearer token; the resolved agent identity is enforced
+    /// against namespace allowlists and stamped as writer_identity on writes.
+    #[serde(default)]
+    pub agent_keys: Vec<AgentKeyConfig>,
+    #[serde(default)]
+    pub observer: ObserverConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
     pub auto_dream: AutoDreamConfig,
     #[serde(default)]
     pub auto_compress: AutoCompressConfig,
@@ -232,6 +244,173 @@ fn default_router_weight() -> f64 {
     0.05
 }
 
+/// Phase 1 ranking levers (memory-leadership roadmap): each defaults to the
+/// pre-lever behavior so a deploy is a no-op until a weight is raised, and each
+/// can be A/B-tuned via env at startup (see `server::router`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankingLeversConfig {
+    /// Times the chunk-parent (skim layer) id-list is fused for open-domain
+    /// queries. 0 disables chunk recall; 1 (default) gives it FTS footing.
+    #[serde(default = "default_chunk_fusion_weight")]
+    pub chunk_fusion_weight: usize,
+    /// Graph evidence-chain bridge depth. 1 (default) = historical single hop.
+    #[serde(default = "default_graph_chain_depth")]
+    pub graph_chain_depth: usize,
+    /// Demotion weight for candidates whose only edge support was superseded
+    /// by another candidate's live edge. 0.0 (default) = off.
+    #[serde(default)]
+    pub stale_demotion_weight: f64,
+    /// Activation boost weight (importance × maturity × recency). 0.0 = off.
+    #[serde(default)]
+    pub activation_weight: f64,
+    /// Recency half-life (days) for the activation boost.
+    #[serde(default = "default_activation_halflife_days")]
+    pub activation_halflife_days: f64,
+    /// Abstention guard: drop results sharing less than this fraction of the
+    /// query's salient terms. 0.0 (default) = off.
+    #[serde(default)]
+    pub abstention_min_overlap: f64,
+    /// T0 lexical early exit: skip embedding/auxiliary recall when the top FTS
+    /// hit already contains every salient query term. false (default) = off.
+    #[serde(default)]
+    pub tier_early_exit: bool,
+}
+
+impl Default for RankingLeversConfig {
+    fn default() -> Self {
+        Self {
+            chunk_fusion_weight: default_chunk_fusion_weight(),
+            graph_chain_depth: default_graph_chain_depth(),
+            stale_demotion_weight: 0.0,
+            activation_weight: 0.0,
+            activation_halflife_days: default_activation_halflife_days(),
+            abstention_min_overlap: 0.0,
+            tier_early_exit: false,
+        }
+    }
+}
+
+/// External storage engines (HYBRID mode): route vector recall through Qdrant
+/// and/or graph recall through Neo4j while IronMem keeps identity, governance,
+/// and the audit trail. Defaults are the native engine — a deploy with this
+/// section absent behaves exactly as before.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// "native" (default) or "qdrant".
+    #[serde(default = "default_backend_native")]
+    pub vector_backend: String,
+    #[serde(default = "default_qdrant_url")]
+    pub qdrant_url: String,
+    #[serde(default = "default_qdrant_collection")]
+    pub qdrant_collection: String,
+    /// Vector dimension for the Qdrant collection (must match the embedder).
+    #[serde(default = "default_qdrant_dim")]
+    pub qdrant_dim: usize,
+    /// "native" (default) or "neo4j".
+    #[serde(default = "default_backend_native")]
+    pub graph_backend: String,
+    #[serde(default = "default_neo4j_url")]
+    pub neo4j_url: String,
+    #[serde(default = "default_neo4j_database")]
+    pub neo4j_database: String,
+    #[serde(default = "default_neo4j_user")]
+    pub neo4j_user: String,
+    #[serde(default)]
+    pub neo4j_pass: String,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            vector_backend: default_backend_native(),
+            qdrant_url: default_qdrant_url(),
+            qdrant_collection: default_qdrant_collection(),
+            qdrant_dim: default_qdrant_dim(),
+            graph_backend: default_backend_native(),
+            neo4j_url: default_neo4j_url(),
+            neo4j_database: default_neo4j_database(),
+            neo4j_user: default_neo4j_user(),
+            neo4j_pass: String::new(),
+        }
+    }
+}
+
+fn default_backend_native() -> String {
+    "native".to_string()
+}
+fn default_qdrant_url() -> String {
+    "http://localhost:6333".to_string()
+}
+fn default_qdrant_collection() -> String {
+    "ironmem".to_string()
+}
+fn default_qdrant_dim() -> usize {
+    384
+}
+fn default_neo4j_url() -> String {
+    "http://localhost:7474".to_string()
+}
+fn default_neo4j_database() -> String {
+    "neo4j".to_string()
+}
+fn default_neo4j_user() -> String {
+    "neo4j".to_string()
+}
+
+/// Observer pass (Phase 2): append-only, timestamped, priority-tagged
+/// observation log emitted beside the narrative at compression time — the
+/// non-destructive alternative to lossy summarization. Off by default: it
+/// adds one LLM call per compression; set a cheap `model` to control cost.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserverConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Model for the observer call. Empty = the main compression model.
+    #[serde(default)]
+    pub model: String,
+    /// Cap on stored log lines per session.
+    #[serde(default = "default_observer_max_lines")]
+    pub max_lines: usize,
+}
+
+impl Default for ObserverConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: String::new(),
+            max_lines: default_observer_max_lines(),
+        }
+    }
+}
+
+fn default_observer_max_lines() -> usize {
+    60
+}
+
+/// One agent's API key: bearer `token` resolves to `agent_id`, which may only
+/// touch the listed `namespaces` (empty = all). Writes performed under this
+/// key carry `writer_identity = "agent:<agent_id>"` so the ledger attributes
+/// every memory to the agent that wrote it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentKeyConfig {
+    pub token: String,
+    pub agent_id: String,
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+}
+
+fn default_chunk_fusion_weight() -> usize {
+    1
+}
+
+fn default_graph_chain_depth() -> usize {
+    1
+}
+
+fn default_activation_halflife_days() -> f64 {
+    30.0
+}
+
 /// Temporal trust trajectory as a retrieval signal (paper Finding 4: "standard
 /// semantic consolidation often destroys crucial chronological cues"). Each
 /// memory accrues a trajectory — first_seen / last_validated / receipt-confirmed
@@ -325,6 +504,12 @@ pub struct RerankConfig {
     /// beyond N keeps its base order (recall-safe).
     #[serde(default = "default_cross_encoder_max_candidates")]
     pub cross_encoder_max_candidates: usize,
+    /// T2→T3 escalation threshold on the cross-encoder's top-two score margin
+    /// (raw model logits). When the margin is below this, the ordering is
+    /// ambiguous and the LLM reranker is invoked instead. 0.0 (default) never
+    /// escalates — cross-encoder results stay final.
+    #[serde(default)]
+    pub escalate_margin: f64,
 }
 
 impl Default for RerankConfig {
@@ -336,6 +521,7 @@ impl Default for RerankConfig {
             backend: default_rerank_backend(),
             cross_encoder_model: default_cross_encoder_model(),
             cross_encoder_max_candidates: default_cross_encoder_max_candidates(),
+            escalate_margin: 0.0,
         }
     }
 }
@@ -520,6 +706,10 @@ impl Default for Config {
             temporal_trust: TemporalTrustConfig::default(),
             governance_router: GovernanceRouterConfig::default(),
             multi_hop: MultiHopConfig::default(),
+            ranking: RankingLeversConfig::default(),
+            agent_keys: Vec::new(),
+            observer: ObserverConfig::default(),
+            storage: StorageConfig::default(),
             auto_dream: AutoDreamConfig::default(),
             auto_compress: AutoCompressConfig::default(),
             scheduler: SchedulerConfig::default(),

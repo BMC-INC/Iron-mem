@@ -1,6 +1,8 @@
 mod auto_dream;
+mod bench;
 mod ccr;
 mod code_anchor;
+mod compliance;
 mod compress;
 mod config;
 mod context;
@@ -16,6 +18,7 @@ mod governance;
 mod hooks;
 mod mcp;
 mod metrics;
+mod observer;
 mod profile;
 mod provider;
 mod reflection;
@@ -399,6 +402,52 @@ enum Commands {
         out: String,
     },
 
+    /// Run long-term memory benchmarks against the live pipeline
+    Bench {
+        /// Benchmark suite (currently only: longmemeval)
+        suite: String,
+        /// Path to the benchmark dataset JSON (e.g. longmemeval_s.json)
+        #[arg(long)]
+        data: String,
+        /// Directory for reports (markdown summary + per-question JSONL)
+        #[arg(long, default_value = "docs/evals")]
+        out: String,
+        /// Only score the first N questions (cheap iteration runs)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Memories retrieved per question
+        #[arg(long, default_value = "10")]
+        retrieve_k: usize,
+        /// Model that answers questions (defaults to the configured model)
+        #[arg(long)]
+        answer_model: Option<String>,
+        /// Model that judges answers (defaults to the configured model)
+        #[arg(long)]
+        judge_model: Option<String>,
+        /// Skip memory entirely and stuff the haystack into the prompt (the
+        /// published full-context baseline column)
+        #[arg(long)]
+        full_context: bool,
+        /// Character budget for --full-context prompts
+        #[arg(long, default_value = "400000")]
+        context_chars: usize,
+        /// Ingest and retrieve but skip LLM answer/judge calls (pipeline
+        /// smoke test; needs no API key and scores nothing)
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Generate an auditable compliance report (ledger chain verification,
+    /// governance inventory, snapshots) mapped to EU AI Act Art. 12/13
+    ComplianceReport {
+        /// Directory for the markdown + JSON report
+        #[arg(long, default_value = "docs/compliance/reports")]
+        out: String,
+    },
+
+    /// Show the full memory→action lineage (ledger + injections) for a memory
+    Lineage { memory_id: i64 },
+
     /// Record usage feedback for a memory
     Feedback {
         memory_id: i64,
@@ -533,6 +582,10 @@ async fn async_main() -> Result<()> {
 
     let cli = Cli::parse();
     let cfg = config::load()?;
+    // Install the storage backend selection once for the process (default:
+    // native engine, unchanged behavior). Every retrieval path — CLI, REST,
+    // MCP — sees the same selection.
+    storage::set_storage_selection(storage::StorageSelection::from_config(&cfg));
 
     match cli.command {
         Commands::Server => run_server(cfg).await?,
@@ -694,6 +747,37 @@ async fn async_main() -> Result<()> {
             force,
         } => run_embed(&cfg, project.as_deref(), all, force).await?,
         Commands::Eval { out } => run_eval(&cfg, &out).await?,
+        Commands::Bench {
+            suite,
+            data,
+            out,
+            limit,
+            retrieve_k,
+            answer_model,
+            judge_model,
+            full_context,
+            context_chars,
+            dry_run,
+        } => {
+            run_bench(
+                &cfg,
+                &suite,
+                bench::BenchOptions {
+                    data: std::path::PathBuf::from(data),
+                    out_dir: std::path::PathBuf::from(out),
+                    limit,
+                    retrieve_k,
+                    answer_model,
+                    judge_model,
+                    full_context,
+                    context_chars,
+                    dry_run,
+                },
+            )
+            .await?
+        }
+        Commands::ComplianceReport { out } => run_compliance_report(&cfg, &out).await?,
+        Commands::Lineage { memory_id } => run_lineage(&cfg, memory_id).await?,
         Commands::Feedback {
             memory_id,
             project,
@@ -837,6 +921,67 @@ async fn run_eval(cfg: &config::Config, out: &str) -> Result<()> {
         );
     }
     eval::ensure_passed(&report)?;
+    Ok(())
+}
+
+async fn run_bench(cfg: &config::Config, suite: &str, opts: bench::BenchOptions) -> Result<()> {
+    if suite != "longmemeval" {
+        anyhow::bail!("unknown bench suite '{suite}' (supported: longmemeval)");
+    }
+    let report = bench::run(cfg, &opts).await?;
+    println!(
+        "IronMem LongMemEval: {}/{} = {:.1}% ({})",
+        report.correct,
+        report.total,
+        report.accuracy() * 100.0,
+        report.mode
+    );
+    for (ability, score) in &report.per_ability {
+        println!(
+            "  {ability}: {}/{} = {:.1}%",
+            score.correct,
+            score.total,
+            score.accuracy() * 100.0
+        );
+    }
+    Ok(())
+}
+
+async fn run_compliance_report(cfg: &config::Config, out: &str) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let report = compliance::generate(&database).await?;
+
+    std::fs::create_dir_all(out)?;
+    let stamp = report.generated_at.replace([':', '.'], "-");
+    let md_path = std::path::Path::new(out).join(format!("{stamp}-compliance.md"));
+    std::fs::write(&md_path, report.to_markdown())?;
+    let json_path = std::path::Path::new(out).join(format!("{stamp}-compliance.json"));
+    std::fs::write(&json_path, serde_json::to_string_pretty(&report)?)?;
+
+    println!(
+        "IronMem compliance: {} namespace chain(s), integrity: {}; {} inventory row(s), {} snapshot(s)",
+        report.chains.len(),
+        if report.all_chains_valid() {
+            "ALL VALID"
+        } else {
+            "FAILED"
+        },
+        report.inventory.len(),
+        report.snapshots.len()
+    );
+    println!("Report: {}", md_path.display());
+    if !report.all_chains_valid() {
+        anyhow::bail!("ledger chain verification failed — see report");
+    }
+    Ok(())
+}
+
+async fn run_lineage(cfg: &config::Config, memory_id: i64) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let lineage = compliance::memory_lineage(&database, memory_id).await?;
+    println!("{}", serde_json::to_string_pretty(&lineage)?);
     Ok(())
 }
 

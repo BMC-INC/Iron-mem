@@ -52,7 +52,6 @@ pub struct Memory {
     pub created_at: i64,
 }
 
-#[cfg(test)]
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct MemoryLedgerEntry {
     pub id: i64,
@@ -673,6 +672,9 @@ impl Database {
         add_memory_meta_column(self, "trust_first_seen_at BIGINT").await?;
         add_memory_meta_column(self, "trust_last_validated_at BIGINT").await?;
         add_memory_meta_column(self, "trust_ref_count BIGINT NOT NULL DEFAULT 0").await?;
+        // Maturity tier (Context-Tree analog): draft → stable → core, promoted by
+        // the dream sweep as a memory earns references. NULL reads as 'draft'.
+        add_memory_meta_column(self, "maturity TEXT").await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_memory_meta_namespace
              ON memory_meta(namespace, memory_id)",
@@ -2235,6 +2237,12 @@ pub const MEMORY_KINDS: &[&str] = &[
     // from default retrieval (see retrieval::exclude_derived); surfaced only on
     // explicit request, with a `derives` provenance edge back to each source.
     "inference",
+    // Observer log lines (see observer.rs): timestamped, priority-tagged,
+    // append-only observations compressed from a session — the non-destructive
+    // alternative to narrative summarization. Fully retrievable (not
+    // quarantined) and linked to their session's narrative memory via
+    // parent_memory_id.
+    "observation",
 ];
 
 /// Clamp an arbitrary kind string to the known set, case-insensitively.
@@ -2594,7 +2602,8 @@ pub async fn latest_ledger_hash(db: &Database, namespace: &str) -> Result<Option
     Ok(row.and_then(|r| r.try_get::<String, _>("entry_hash").ok()))
 }
 
-#[cfg(test)]
+/// Full audit trail for one memory (id ASC). Used by the eval governance
+/// cluster and exposed for lineage/compliance inspection.
 pub async fn memory_ledger_for_memory(
     db: &Database,
     memory_id: i64,
@@ -2622,9 +2631,9 @@ pub async fn memory_ledger_for_memory(
         .collect())
 }
 
-/// All ledger entries in a namespace, ordered by insertion (id ASC). Used by the
-/// storage conformance suite to verify hash-chain continuity across a backend.
-#[cfg(test)]
+/// All ledger entries in a namespace, ordered by insertion (id ASC). Used by
+/// the compliance report's chain verification and the storage conformance
+/// suite.
 pub async fn memory_ledger_for_namespace(
     db: &Database,
     namespace: &str,
@@ -2649,6 +2658,101 @@ pub async fn memory_ledger_for_namespace(
             entry_hash: r.get("entry_hash"),
             payload: r.get("payload"),
             created_at: r.get("created_at"),
+        })
+        .collect())
+}
+
+/// Distinct namespaces present in the ledger, insertion-ordered.
+pub async fn list_ledger_namespaces(db: &Database) -> Result<Vec<String>> {
+    let rows = sqlx::query("SELECT DISTINCT namespace FROM memory_ledger ORDER BY namespace ASC")
+        .fetch_all(&db.pool)
+        .await?;
+    Ok(rows.into_iter().map(|r| r.get("namespace")).collect())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GovernanceInventoryRow {
+    pub namespace: String,
+    pub classification: String,
+    pub consent_state: Option<String>,
+    pub total: i64,
+    pub legal_holds: i64,
+    pub tombstoned: i64,
+    pub with_expiry: i64,
+    pub with_retention_policy: i64,
+}
+
+/// Per-(namespace, classification, consent) inventory of governed memories —
+/// the counts an EU AI Act Art. 12 record-keeping section is built from.
+pub async fn governance_inventory(db: &Database) -> Result<Vec<GovernanceInventoryRow>> {
+    let rows = sqlx::query(
+        "SELECT COALESCE(namespace, 'local') AS ns,
+                COALESCE(classification, 'internal') AS cls,
+                consent_state,
+                COUNT(*) AS total,
+                SUM(CASE WHEN legal_hold <> 0 THEN 1 ELSE 0 END) AS legal_holds,
+                SUM(CASE WHEN tombstoned_at IS NOT NULL THEN 1 ELSE 0 END) AS tombstoned,
+                SUM(CASE WHEN expires_at IS NOT NULL THEN 1 ELSE 0 END) AS with_expiry,
+                SUM(CASE WHEN retention_policy_id IS NOT NULL THEN 1 ELSE 0 END)
+                    AS with_retention_policy
+         FROM memory_meta
+         GROUP BY ns, cls, consent_state
+         ORDER BY ns ASC, cls ASC",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| GovernanceInventoryRow {
+            namespace: r.get("ns"),
+            classification: r.get("cls"),
+            consent_state: r
+                .try_get::<Option<String>, _>("consent_state")
+                .ok()
+                .flatten(),
+            total: r.try_get("total").unwrap_or(0),
+            legal_holds: r.try_get("legal_holds").unwrap_or(0),
+            tombstoned: r.try_get("tombstoned").unwrap_or(0),
+            with_expiry: r.try_get("with_expiry").unwrap_or(0),
+            with_retention_policy: r.try_get("with_retention_policy").unwrap_or(0),
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InjectionEventInfo {
+    pub project: String,
+    pub session_id: Option<String>,
+    pub rank: i64,
+    pub query: Option<String>,
+    pub created_at: i64,
+}
+
+/// Every recorded injection of `memory_id` into an agent context — the
+/// memory→action lineage half of the audit trail (the ledger is the write
+/// half). Most recent first.
+pub async fn injection_events_for_memory(
+    db: &Database,
+    memory_id: i64,
+    limit: i64,
+) -> Result<Vec<InjectionEventInfo>> {
+    let rows = sqlx::query(
+        "SELECT project, session_id, rank, query, created_at
+         FROM injection_events WHERE memory_id = $1
+         ORDER BY created_at DESC, id DESC LIMIT $2",
+    )
+    .bind(memory_id)
+    .bind(limit)
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| InjectionEventInfo {
+            project: r.get("project"),
+            session_id: r.try_get::<Option<String>, _>("session_id").ok().flatten(),
+            rank: r.try_get("rank").unwrap_or(0),
+            query: r.try_get::<Option<String>, _>("query").ok().flatten(),
+            created_at: r.try_get("created_at").unwrap_or(0),
         })
         .collect())
 }
@@ -3672,6 +3776,220 @@ pub async fn recent_memory_chunks_in_namespace(
             .await?,
         };
     Ok(rows.into_iter().map(memory_chunk_from_row).collect())
+}
+
+/// Rank parent memories by lexical overlap between `terms` and their chunks'
+/// title+summary (the skim layer). Returns parent memory ids, best-first.
+/// Chunk-level recall catches paraphrase/detail hits the memory-level FTS
+/// misses; fused as an RRF signal for open-domain queries.
+pub async fn search_memory_chunk_parents_in_namespace(
+    db: &Database,
+    namespace: &str,
+    project: Option<&str>,
+    terms: &[String],
+    limit: usize,
+) -> Result<Vec<i64>> {
+    let namespace = normalize_namespace(namespace);
+    let now = Utc::now().timestamp();
+    let terms: Vec<String> = terms
+        .iter()
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| t.chars().count() >= 3)
+        .take(8)
+        .collect();
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One CASE per term so multi-term matches outrank single-term ones. Terms
+    // are bound (never inlined); LIKE special chars in user text are harmless
+    // here because a false positive only adds a candidate to RRF fusion.
+    let score_expr = (0..terms.len())
+        .map(|i| {
+            format!(
+                "CASE WHEN LOWER(mc.title || ' ' || mc.summary) LIKE ${} THEN 1 ELSE 0 END",
+                i + 1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let mut param = terms.len();
+    let ns_param = {
+        param += 1;
+        param
+    };
+    let now_param = {
+        param += 1;
+        param
+    };
+    let project_clause = if project.is_some() {
+        param += 1;
+        format!("AND mc.project = ${param}")
+    } else {
+        String::new()
+    };
+    let limit_param = param + 1;
+    let sql = format!(
+        "SELECT mc.memory_id, MAX({score_expr}) AS score, MAX(mc.created_at) AS ca
+         FROM memory_chunks mc
+         LEFT JOIN memory_meta mm ON mm.memory_id = mc.memory_id
+         WHERE COALESCE(mm.namespace, 'local') = ${ns_param}
+           AND mm.tombstoned_at IS NULL
+           AND (mm.expires_at IS NULL OR mm.expires_at > ${now_param})
+           {project_clause}
+         GROUP BY mc.memory_id
+         HAVING MAX({score_expr}) > 0
+         ORDER BY score DESC, ca DESC, mc.memory_id DESC
+         LIMIT ${limit_param}"
+    );
+    let mut query = sqlx::query(&sql);
+    for term in &terms {
+        query = query.bind(format!("%{term}%"));
+    }
+    query = query.bind(&namespace).bind(now);
+    if let Some(p) = project {
+        query = query.bind(p);
+    }
+    query = query.bind(limit as i64);
+    let rows: Vec<sqlx::any::AnyRow> = query.fetch_all(&db.pool).await?;
+    Ok(rows.into_iter().map(|r| r.get("memory_id")).collect())
+}
+
+/// Like `memory_edges_for_memories` but including superseded edges, so ranking
+/// can tell a candidate whose only support is stale from one holding the live
+/// edge for the same (source, relation).
+pub async fn memory_edges_for_memories_with_history(
+    db: &Database,
+    memory_ids: &[i64],
+) -> Result<HashMap<i64, Vec<MemoryEdge>>> {
+    let mut out: HashMap<i64, Vec<MemoryEdge>> = HashMap::new();
+    if memory_ids.is_empty() {
+        return Ok(out);
+    }
+    let in_list = memory_ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, project, memory_id, source, relation, target, valid_from, valid_until,
+                observed_at, confidence, superseded_by, superseded_reason, created_at
+         FROM memory_edges
+         WHERE memory_id IN ({in_list})
+         ORDER BY memory_id ASC, confidence DESC, observed_at DESC, id DESC"
+    );
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql).fetch_all(&db.pool).await?;
+    for row in rows {
+        let edge = memory_edge_from_row(row);
+        out.entry(edge.memory_id).or_default().push(edge);
+    }
+    Ok(out)
+}
+
+pub fn clamp_maturity(maturity: &str) -> &'static str {
+    match maturity.trim().to_lowercase().as_str() {
+        "core" => "core",
+        "stable" => "stable",
+        _ => "draft",
+    }
+}
+
+/// Multiplier a maturity tier contributes to activation scoring: memories that
+/// survived promotion carry more authority than fresh drafts.
+pub fn maturity_multiplier(maturity: Option<&str>) -> f64 {
+    match maturity.map(clamp_maturity) {
+        Some("core") => 1.3,
+        Some("stable") => 1.15,
+        _ => 1.0,
+    }
+}
+
+pub async fn set_memory_maturity(db: &Database, memory_id: i64, maturity: &str) -> Result<()> {
+    sqlx::query("UPDATE memory_meta SET maturity = $1 WHERE memory_id = $2")
+        .bind(clamp_maturity(maturity))
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ActivationMeta {
+    pub importance: f64,
+    pub maturity: Option<String>,
+    pub created_at: i64,
+}
+
+/// Batch-fetch the activation-scoring inputs (importance, maturity, age) for
+/// candidate ids. Ids are DB-controlled integers, so the inlined IN-list is
+/// injection-safe (mirrors `score_adjustments_for_memories`).
+pub async fn activation_meta_for(
+    db: &Database,
+    ids: &[i64],
+) -> Result<HashMap<i64, ActivationMeta>> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let id_col = match db.backend {
+        Backend::Sqlite => "m.rowid",
+        Backend::Postgres => "m.id",
+    };
+    let in_list = ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT {id_col} AS id, m.created_at AS ca,
+                COALESCE(mm.importance, 0.5) AS importance, mm.maturity AS maturity
+         FROM memories m
+         LEFT JOIN memory_meta mm ON mm.memory_id = {id_col}
+         WHERE {id_col} IN ({in_list})"
+    );
+    for r in sqlx::query(&sql).fetch_all(&db.pool).await? {
+        let id: i64 = r.get("id");
+        out.insert(
+            id,
+            ActivationMeta {
+                importance: r.try_get::<f64, _>("importance").unwrap_or(0.5),
+                maturity: r.try_get::<Option<String>, _>("maturity").ok().flatten(),
+                created_at: r.try_get::<i64, _>("ca").unwrap_or(0),
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// Dream-sweep maturity promotion (deterministic, idempotent):
+/// draft → stable once a memory has been injected ≥ 3 times;
+/// stable → core once its net feedback reaches ≥ 2.0.
+/// Returns the number of promoted rows.
+pub async fn promote_memories_maturity(db: &Database) -> Result<usize> {
+    let stable = sqlx::query(
+        "UPDATE memory_meta SET maturity = 'stable'
+         WHERE (maturity IS NULL OR maturity = 'draft')
+           AND tombstoned_at IS NULL
+           AND memory_id IN (
+               SELECT memory_id FROM injection_events
+               GROUP BY memory_id HAVING COUNT(*) >= 3
+           )",
+    )
+    .execute(&db.pool)
+    .await?
+    .rows_affected();
+    let core = sqlx::query(
+        "UPDATE memory_meta SET maturity = 'core'
+         WHERE maturity = 'stable'
+           AND tombstoned_at IS NULL
+           AND memory_id IN (
+               SELECT memory_id FROM memory_feedback
+               GROUP BY memory_id HAVING SUM(weight) >= 2.0
+           )",
+    )
+    .execute(&db.pool)
+    .await?
+    .rows_affected();
+    Ok((stable + core) as usize)
 }
 
 // ── Feedback, decay, and usage reinforcement ────────────────────────────────

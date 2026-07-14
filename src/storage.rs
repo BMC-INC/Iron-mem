@@ -25,8 +25,149 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
 
-use crate::db::{self, DatedMemory, Database, Memory, MemoryEdge};
+use crate::db::{self, Database, DatedMemory, Memory, MemoryEdge};
 use crate::vectorstore::VectorStore;
+
+/// Deploy-time backend selection (HYBRID mode): which engines serve vector and
+/// graph recall. Installed once at startup from `Config.storage` (same
+/// fixed-for-the-process model as `retrieval::set_retrieval_tuning`); the
+/// default is the native engine, byte-identical to pre-selection behavior.
+#[derive(Debug, Clone, Default)]
+pub struct StorageSelection {
+    pub qdrant: Option<QdrantSettings>,
+    pub neo4j: Option<Neo4jSettings>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QdrantSettings {
+    pub url: String,
+    pub collection: String,
+    pub dim: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct Neo4jSettings {
+    pub url: String,
+    pub database: String,
+    pub user: String,
+    pub pass: String,
+}
+
+impl StorageSelection {
+    pub fn from_config(cfg: &crate::config::Config) -> Self {
+        let qdrant = if cfg.storage.vector_backend.eq_ignore_ascii_case("qdrant") {
+            Some(QdrantSettings {
+                url: cfg.storage.qdrant_url.clone(),
+                collection: cfg.storage.qdrant_collection.clone(),
+                dim: cfg.storage.qdrant_dim,
+            })
+        } else {
+            None
+        };
+        let neo4j = if cfg.storage.graph_backend.eq_ignore_ascii_case("neo4j") {
+            Some(Neo4jSettings {
+                url: cfg.storage.neo4j_url.clone(),
+                database: cfg.storage.neo4j_database.clone(),
+                user: cfg.storage.neo4j_user.clone(),
+                pass: cfg.storage.neo4j_pass.clone(),
+            })
+        } else {
+            None
+        };
+        Self { qdrant, neo4j }
+    }
+}
+
+static STORAGE_SELECTION: std::sync::OnceLock<StorageSelection> = std::sync::OnceLock::new();
+/// Marks the Qdrant collection as ensured so only the first query pays the
+/// create-collection round trip.
+static QDRANT_READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Install the backend selection (call once at startup). Idempotent.
+pub fn set_storage_selection(s: StorageSelection) {
+    if s.qdrant.is_some() || s.neo4j.is_some() {
+        tracing::info!(
+            "storage backends: vector={} graph={}",
+            if s.qdrant.is_some() {
+                "qdrant"
+            } else {
+                "native"
+            },
+            if s.neo4j.is_some() { "neo4j" } else { "native" },
+        );
+    }
+    let _ = STORAGE_SELECTION.set(s);
+}
+
+fn selection() -> StorageSelection {
+    STORAGE_SELECTION.get().cloned().unwrap_or_default()
+}
+
+/// Build the configured backend for one retrieval call. External engines
+/// decorate the native backend (vector via Qdrant, graph via Neo4j, both
+/// stackable); any connection failure degrades to native with a warning, so a
+/// down external engine can never break recall.
+pub async fn make_backend<'a>(
+    db: &'a Database,
+    store: &'a dyn VectorStore,
+) -> Box<dyn StorageBackend + 'a> {
+    let sel = selection();
+    match (sel.qdrant, sel.neo4j) {
+        (None, None) => Box::new(NativeBackend::new(db, store)),
+        (Some(q), neo4j) => {
+            let qdrant = if QDRANT_READY.get().is_some() {
+                Ok(QdrantVectorBackend::attach(
+                    NativeBackend::new(db, store),
+                    &q.url,
+                    &q.collection,
+                ))
+            } else {
+                let made = QdrantVectorBackend::new(
+                    NativeBackend::new(db, store),
+                    &q.url,
+                    &q.collection,
+                    q.dim,
+                )
+                .await;
+                if made.is_ok() {
+                    let _ = QDRANT_READY.set(());
+                }
+                made
+            };
+            match (qdrant, neo4j) {
+                (Ok(qb), Some(n)) => Box::new(Neo4jGraphBackend::new(
+                    qb,
+                    &n.url,
+                    &n.database,
+                    &n.user,
+                    &n.pass,
+                )),
+                (Ok(qb), None) => Box::new(qb),
+                (Err(e), Some(n)) => {
+                    tracing::warn!("qdrant backend unavailable ({e}); vector recall stays native");
+                    Box::new(Neo4jGraphBackend::new(
+                        NativeBackend::new(db, store),
+                        &n.url,
+                        &n.database,
+                        &n.user,
+                        &n.pass,
+                    ))
+                }
+                (Err(e), None) => {
+                    tracing::warn!("qdrant backend unavailable ({e}); vector recall stays native");
+                    Box::new(NativeBackend::new(db, store))
+                }
+            }
+        }
+        (None, Some(n)) => Box::new(Neo4jGraphBackend::new(
+            NativeBackend::new(db, store),
+            &n.url,
+            &n.database,
+            &n.user,
+            &n.pass,
+        )),
+    }
+}
 
 /// What recall signals a backend can serve. The fusion layer gates optional
 /// signals on these flags so an adapter that lacks (say) a graph engine simply
@@ -237,8 +378,12 @@ impl StorageBackend for NativeBackend<'_> {
         k: usize,
     ) -> Result<Vec<Candidate>> {
         let rows = match project {
-            Some(p) => db::search_memories_in_namespace(self.db, namespace, p, query, k as i64).await?,
-            None => db::search_all_memories_in_namespace(self.db, namespace, query, k as i64).await?,
+            Some(p) => {
+                db::search_memories_in_namespace(self.db, namespace, p, query, k as i64).await?
+            }
+            None => {
+                db::search_all_memories_in_namespace(self.db, namespace, query, k as i64).await?
+            }
         };
         // FTS rank is the order; the id-based RRF above ignores the score, but a
         // descending positional score keeps it meaningful if ever consumed.
@@ -339,22 +484,27 @@ impl StorageBackend for NativeBackend<'_> {
 /// Real vector adapter backed by an external **Qdrant** over its REST API.
 /// Embeddings live in Qdrant; everything governance-bearing stays native.
 #[allow(dead_code)]
-pub struct QdrantVectorBackend<'a> {
-    inner: NativeBackend<'a>,
+pub struct QdrantVectorBackend<I> {
+    inner: I,
     http: Client,
     base: String,
     collection: String,
 }
 
-#[allow(dead_code)]
-impl<'a> QdrantVectorBackend<'a> {
+impl<I: StorageBackend> QdrantVectorBackend<I> {
+    /// Attach without the ensure-collection round trip (the collection is
+    /// known to exist — see `QDRANT_READY` in `make_backend`).
+    pub fn attach(inner: I, base_url: &str, collection: &str) -> Self {
+        Self {
+            inner,
+            http: Client::new(),
+            base: base_url.trim_end_matches('/').to_string(),
+            collection: collection.to_string(),
+        }
+    }
+
     /// Connect and ensure the collection exists (Cosine, `dim`-d vectors).
-    pub async fn new(
-        inner: NativeBackend<'a>,
-        base_url: &str,
-        collection: &str,
-        dim: usize,
-    ) -> Result<Self> {
+    pub async fn new(inner: I, base_url: &str, collection: &str, dim: usize) -> Result<Self> {
         let http = Client::new();
         let base = base_url.trim_end_matches('/').to_string();
         let resp = http
@@ -380,7 +530,7 @@ impl<'a> QdrantVectorBackend<'a> {
 }
 
 #[async_trait]
-impl StorageBackend for QdrantVectorBackend<'_> {
+impl<I: StorageBackend> StorageBackend for QdrantVectorBackend<I> {
     fn capabilities(&self) -> BackendCaps {
         BackendCaps {
             vector: true,
@@ -524,23 +674,16 @@ impl StorageBackend for QdrantVectorBackend<'_> {
 /// Real graph adapter backed by an external **Neo4j** over its transactional
 /// Cypher HTTP API. Entities + edges live in Neo4j; governance stays native.
 #[allow(dead_code)]
-pub struct Neo4jGraphBackend<'a> {
-    inner: NativeBackend<'a>,
+pub struct Neo4jGraphBackend<I> {
+    inner: I,
     http: Client,
     endpoint: String,
     user: String,
     pass: String,
 }
 
-#[allow(dead_code)]
-impl<'a> Neo4jGraphBackend<'a> {
-    pub fn new(
-        inner: NativeBackend<'a>,
-        base_url: &str,
-        database: &str,
-        user: &str,
-        pass: &str,
-    ) -> Self {
+impl<I: StorageBackend> Neo4jGraphBackend<I> {
+    pub fn new(inner: I, base_url: &str, database: &str, user: &str, pass: &str) -> Self {
         let endpoint = format!(
             "{}/db/{}/tx/commit",
             base_url.trim_end_matches('/'),
@@ -575,7 +718,7 @@ impl<'a> Neo4jGraphBackend<'a> {
 }
 
 #[async_trait]
-impl StorageBackend for Neo4jGraphBackend<'_> {
+impl<I: StorageBackend> StorageBackend for Neo4jGraphBackend<I> {
     fn capabilities(&self) -> BackendCaps {
         BackendCaps {
             graph: true,
@@ -671,7 +814,10 @@ impl StorageBackend for Neo4jGraphBackend<'_> {
         let v = self
             .cypher(&stmt, json!({"project": project, "entity": entity}))
             .await?;
-        let rows = v["results"][0]["data"].as_array().cloned().unwrap_or_default();
+        let rows = v["results"][0]["data"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         Ok(rows
             .iter()
             .enumerate()
@@ -749,10 +895,12 @@ mod conformance {
     }
     impl InProcessVectorIndex {
         fn insert(&self, id: i64, project: &str, emb: &Embedding) {
-            self.rows
-                .lock()
-                .unwrap()
-                .push((id, project.to_string(), emb.model.clone(), emb.vector.clone()));
+            self.rows.lock().unwrap().push((
+                id,
+                project.to_string(),
+                emb.model.clone(),
+                emb.vector.clone(),
+            ));
         }
         fn knn(&self, project: Option<&str>, q: &[f32], model: &str, k: usize) -> Vec<Candidate> {
             let mut scored: Vec<(i64, f32)> = {
@@ -1085,7 +1233,9 @@ mod conformance {
             "put/get round-trip must preserve content"
         );
         assert!(
-            fulltext_ids(backend, "local", project, "widget").await.contains(&id),
+            fulltext_ids(backend, "local", project, "widget")
+                .await
+                .contains(&id),
             "fulltext must recall a written memory"
         );
 
@@ -1103,20 +1253,36 @@ mod conformance {
             None,
         )
         .await;
-        assert!(blocked.is_err(), "PHI write without consent must be refused");
         assert!(
-            fulltext_ids(backend, "phi_ns", project, "bravo").await.is_empty(),
+            blocked.is_err(),
+            "PHI write without consent must be refused"
+        );
+        assert!(
+            fulltext_ids(backend, "phi_ns", project, "bravo")
+                .await
+                .is_empty(),
             "a refused consent write must leave nothing retrievable"
         );
         assert!(
-            db::memory_ledger_for_namespace(db, "phi_ns").await.unwrap().is_empty(),
+            db::memory_ledger_for_namespace(db, "phi_ns")
+                .await
+                .unwrap()
+                .is_empty(),
             "a refused write must not append a ledger entry"
         );
         // And the same record WITH consent granted is admitted.
         phi.consent_state = Some(ConsentState::Granted);
-        let phi_id = governed_write(db, backend, project, &session, "patient charlie record", &phi, None)
-            .await
-            .expect("PHI write with granted consent must be admitted");
+        let phi_id = governed_write(
+            db,
+            backend,
+            project,
+            &session,
+            "patient charlie record",
+            &phi,
+            None,
+        )
+        .await
+        .expect("PHI write with granted consent must be admitted");
 
         // ── 3. namespace isolation: no cross-namespace leakage ──
         let a_id = governed_write(
@@ -1130,41 +1296,69 @@ mod conformance {
         )
         .await
         .unwrap();
-        assert!(backend.get_memory("tenant_a", a_id).await.unwrap().is_some());
+        assert!(backend
+            .get_memory("tenant_a", a_id)
+            .await
+            .unwrap()
+            .is_some());
         assert!(
-            backend.get_memory("tenant_b", a_id).await.unwrap().is_none(),
+            backend
+                .get_memory("tenant_b", a_id)
+                .await
+                .unwrap()
+                .is_none(),
             "a memory must not be visible from another namespace by id"
         );
         assert!(
-            fulltext_ids(backend, "tenant_a", project, "delta").await.contains(&a_id),
+            fulltext_ids(backend, "tenant_a", project, "delta")
+                .await
+                .contains(&a_id),
             "fulltext must find the memory in its own namespace"
         );
         assert!(
-            fulltext_ids(backend, "tenant_b", project, "delta").await.is_empty(),
+            fulltext_ids(backend, "tenant_b", project, "delta")
+                .await
+                .is_empty(),
             "fulltext must not leak the memory into another namespace"
         );
 
         // ── 4. tombstone hides from retrieval ──
-        assert!(fulltext_ids(backend, "tenant_a", project, "delta").await.contains(&a_id));
-        let hidden = backend.hide(a_id, Some("admin"), Some("dsr")).await.unwrap();
+        assert!(fulltext_ids(backend, "tenant_a", project, "delta")
+            .await
+            .contains(&a_id));
+        let hidden = backend
+            .hide(a_id, Some("admin"), Some("dsr"))
+            .await
+            .unwrap();
         assert!(hidden, "hide must report it acted");
         assert!(
-            backend.get_memory("tenant_a", a_id).await.unwrap().is_none(),
+            backend
+                .get_memory("tenant_a", a_id)
+                .await
+                .unwrap()
+                .is_none(),
             "tombstoned memory must be un-retrievable by id"
         );
         assert!(
-            !fulltext_ids(backend, "tenant_a", project, "delta").await.contains(&a_id),
+            !fulltext_ids(backend, "tenant_a", project, "delta")
+                .await
+                .contains(&a_id),
             "tombstoned memory must be gone from fulltext"
         );
 
         // ── 5. ledger hash-chain continuity (over the tenant_a namespace) ──
-        let entries = db::memory_ledger_for_namespace(db, "tenant_a").await.unwrap();
+        let entries = db::memory_ledger_for_namespace(db, "tenant_a")
+            .await
+            .unwrap();
         assert!(
             entries.len() >= 2,
             "tenant_a must have a create + forget entry, got {}",
             entries.len()
         );
-        assert!(entries[0].prev_hash.is_none(), "first ledger entry has no parent");
+        assert!(
+            entries[0].prev_hash.is_none(),
+            "first ledger entry has no parent"
+        );
         for win in entries.windows(2) {
             assert_eq!(
                 win[1].prev_hash.as_deref(),
@@ -1182,12 +1376,35 @@ mod conformance {
                 &e.payload,
                 e.created_at,
             );
-            assert_eq!(recomputed, e.entry_hash, "ledger entry must be tamper-evident");
+            assert_eq!(
+                recomputed, e.entry_hash,
+                "ledger entry must be tamper-evident"
+            );
         }
 
         // ── 6. trust-tier metadata fidelity (the signal retrieval prioritizes) ──
-        let hi = governed_write(db, backend, project, &session, "echo high-trust fact", &gov_in("trust_ns", TrustTier::High), None).await.unwrap();
-        let lo = governed_write(db, backend, project, &session, "echo low-trust fact", &gov_in("trust_ns", TrustTier::Low), None).await.unwrap();
+        let hi = governed_write(
+            db,
+            backend,
+            project,
+            &session,
+            "echo high-trust fact",
+            &gov_in("trust_ns", TrustTier::High),
+            None,
+        )
+        .await
+        .unwrap();
+        let lo = governed_write(
+            db,
+            backend,
+            project,
+            &session,
+            "echo low-trust fact",
+            &gov_in("trust_ns", TrustTier::Low),
+            None,
+        )
+        .await
+        .unwrap();
         let tiers = db::trust_tiers_for(db, &[hi, lo]).await.unwrap();
         assert_eq!(tiers.get(&hi).map(String::as_str), Some("high"));
         assert_eq!(tiers.get(&lo).map(String::as_str), Some("low"));
@@ -1201,7 +1418,11 @@ mod conformance {
                 &session,
                 "foxtrot vector carrier",
                 &gov_in("vec_ns", TrustTier::Medium),
-                Some(Embedding { model: "conf-model".to_string(), dim: 4, vector: vec![1.0, 0.0, 0.0, 0.0] }),
+                Some(Embedding {
+                    model: "conf-model".to_string(),
+                    dim: 4,
+                    vector: vec![1.0, 0.0, 0.0, 0.0],
+                }),
             )
             .await
             .unwrap();
@@ -1229,9 +1450,14 @@ mod conformance {
                 })
                 .await
                 .unwrap();
-            let edges = backend.edges_for_entity(Some(project), "acme", false, 5).await.unwrap();
+            let edges = backend
+                .edges_for_entity(Some(project), "acme", false, 5)
+                .await
+                .unwrap();
             assert!(
-                edges.iter().any(|e| e.memory_id == phi_id && e.target.eq_ignore_ascii_case("globex")),
+                edges
+                    .iter()
+                    .any(|e| e.memory_id == phi_id && e.target.eq_ignore_ascii_case("globex")),
                 "edges_for_entity must recall an edge written through put_edge"
             );
         }

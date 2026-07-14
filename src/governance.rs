@@ -388,13 +388,19 @@ mod tests {
         let fresh = trust_trajectory_boost(10, Some(now), now, 0.1, 30.0, 5.0);
         let stale = trust_trajectory_boost(10, Some(now - 86_400 * 90), now, 0.1, 30.0, 5.0);
         assert!(fresh > stale, "recent validation should outscore stale");
-        assert!(fresh > 0.0 && fresh <= 0.1, "boost stays within weight bound");
+        assert!(
+            fresh > 0.0 && fresh <= 0.1,
+            "boost stays within weight bound"
+        );
     }
 
     #[test]
     fn trajectory_boost_saturates_on_reference_count() {
         let now = 2_000;
         let many = trust_trajectory_boost(100, Some(now), now, 0.1, 30.0, 5.0);
-        assert!(many < 0.1, "reference term saturates below the weight ceiling");
+        assert!(
+            many < 0.1,
+            "reference term saturates below the weight ceiling"
+        );
     }
 }

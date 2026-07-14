@@ -54,7 +54,15 @@ impl VectorStore for BruteForceStore {
         dim: usize,
         embedding: &[f32],
     ) -> Result<()> {
-        db::upsert_embedding(db, "memory", owner_id, model, dim as i64, &encode(embedding)).await
+        db::upsert_embedding(
+            db,
+            "memory",
+            owner_id,
+            model,
+            dim as i64,
+            &encode(embedding),
+        )
+        .await
     }
 
     async fn knn(
@@ -114,7 +122,15 @@ impl VectorStore for SqliteVecStore {
         dim: usize,
         embedding: &[f32],
     ) -> Result<()> {
-        db::upsert_embedding(db, "memory", owner_id, model, dim as i64, &encode(embedding)).await?;
+        db::upsert_embedding(
+            db,
+            "memory",
+            owner_id,
+            model,
+            dim as i64,
+            &encode(embedding),
+        )
+        .await?;
         sqlx::query("INSERT OR REPLACE INTO vec_memories(memory_id, embedding) VALUES ($1, $2)")
             .bind(owner_id)
             .bind(encode(embedding))
@@ -204,7 +220,15 @@ impl VectorStore for PgVectorStore {
         dim: usize,
         embedding: &[f32],
     ) -> Result<()> {
-        db::upsert_embedding(db, "memory", owner_id, model, dim as i64, &encode(embedding)).await?;
+        db::upsert_embedding(
+            db,
+            "memory",
+            owner_id,
+            model,
+            dim as i64,
+            &encode(embedding),
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO memory_embeddings(memory_id, embedding) VALUES ($1, $2::vector)
              ON CONFLICT(memory_id) DO UPDATE SET embedding = excluded.embedding",
@@ -361,7 +385,10 @@ pub async fn make_vector_store(db: &Database, dim: usize) -> Arc<dyn VectorStore
             Backend::Postgres => Arc::new(PgVectorStore),
         },
         Err(e) => {
-            tracing::warn!("ANN index unavailable ({}); using brute-force vector search", e);
+            tracing::warn!(
+                "ANN index unavailable ({}); using brute-force vector search",
+                e
+            );
             Arc::new(BruteForceStore)
         }
     }
@@ -376,9 +403,15 @@ mod tests {
     async fn seed(db: &Database) {
         let s = create_session(db, "/tmp/p").await.unwrap();
         // rowids 1,2,3
-        insert_memory(db, "/tmp/p", &s, "alpha auth", Some("a")).await.unwrap();
-        insert_memory(db, "/tmp/p", &s, "beta search", Some("b")).await.unwrap();
-        insert_memory(db, "/tmp/p", &s, "gamma db", Some("c")).await.unwrap();
+        insert_memory(db, "/tmp/p", &s, "alpha auth", Some("a"))
+            .await
+            .unwrap();
+        insert_memory(db, "/tmp/p", &s, "beta search", Some("b"))
+            .await
+            .unwrap();
+        insert_memory(db, "/tmp/p", &s, "gamma db", Some("c"))
+            .await
+            .unwrap();
     }
 
     fn vecs() -> [Vec<f32>; 3] {
@@ -411,24 +444,40 @@ mod tests {
         let db = Database::new(&path.to_string_lossy()).await.unwrap();
         db.migrate().await.unwrap();
         let s = create_session(&db, "/tmp/p").await.unwrap();
-        insert_memory(&db, "/tmp/p", &s, "alpha auth", Some("a")).await.unwrap();
-        insert_memory(&db, "/tmp/p", &s, "beta search", Some("b")).await.unwrap();
+        insert_memory(&db, "/tmp/p", &s, "alpha auth", Some("a"))
+            .await
+            .unwrap();
+        insert_memory(&db, "/tmp/p", &s, "beta search", Some("b"))
+            .await
+            .unwrap();
 
         let emb = crate::embedder::FakeEmbedder::new(8);
         let store = make_vector_store(&db, 8).await;
 
         // First pass embeds both.
-        let n = backfill(&db, &emb, store.as_ref(), Some("/tmp/p"), false).await.unwrap();
+        let n = backfill(&db, &emb, store.as_ref(), Some("/tmp/p"), false)
+            .await
+            .unwrap();
         assert_eq!(n, 2);
-        assert!(db::get_embedding(&db, "memory", 1, emb.id()).await.unwrap().is_some());
-        assert!(db::get_embedding(&db, "memory", 2, emb.id()).await.unwrap().is_some());
+        assert!(db::get_embedding(&db, "memory", 1, emb.id())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(db::get_embedding(&db, "memory", 2, emb.id())
+            .await
+            .unwrap()
+            .is_some());
 
         // Second pass is a no-op (nothing missing).
-        let n2 = backfill(&db, &emb, store.as_ref(), Some("/tmp/p"), false).await.unwrap();
+        let n2 = backfill(&db, &emb, store.as_ref(), Some("/tmp/p"), false)
+            .await
+            .unwrap();
         assert_eq!(n2, 0);
 
         // Force re-embeds everything.
-        let n3 = backfill(&db, &emb, store.as_ref(), Some("/tmp/p"), true).await.unwrap();
+        let n3 = backfill(&db, &emb, store.as_ref(), Some("/tmp/p"), true)
+            .await
+            .unwrap();
         assert_eq!(n3, 2);
         let _ = std::fs::remove_file(path);
     }
@@ -449,7 +498,10 @@ mod tests {
         assert!(db::delete_memory(&db, 1).await.unwrap());
         purge_memory(&db, &store, 1).await.unwrap();
 
-        assert!(db::get_embedding(&db, "memory", 1, "m").await.unwrap().is_none());
+        assert!(db::get_embedding(&db, "memory", 1, "m")
+            .await
+            .unwrap()
+            .is_none());
         // Entity-index rows for the memory are physically gone (checked directly,
         // not via the memories JOIN which already excludes the deleted row).
         let ent_rows: i64 =

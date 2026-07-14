@@ -70,6 +70,25 @@ pub async fn run(
     {
         tracing::warn!("correction mining failed (session {session_id}): {e}");
     }
+
+    // Observer pass (Phase 2, opt-in): append-only timestamped observation log
+    // beside the narrative. Best-effort — the narrative memory is already safe.
+    if cfg.observer.enabled {
+        if let Err(e) = crate::observer::run_observer(
+            db,
+            embedder,
+            store,
+            cfg,
+            &session.project,
+            session_id,
+            &observations,
+            memory_id,
+        )
+        .await
+        {
+            tracing::warn!("observer pass failed (session {session_id}): {e}");
+        }
+    }
     Ok(memory_id)
 }
 
@@ -118,7 +137,9 @@ fn build_transcript_with_sections(
 }
 
 /// Render observations into a plain-text transcript (the pre-LLM session view).
-fn build_transcript(observations: &[db::Observation]) -> String {
+/// Also used by the Observer pass (observer.rs) so both passes see the exact
+/// same session text.
+pub fn build_transcript(observations: &[db::Observation]) -> String {
     build_transcript_with_sections(observations).0
 }
 

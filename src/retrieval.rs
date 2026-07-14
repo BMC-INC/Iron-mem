@@ -11,7 +11,7 @@ use crate::config::{Config, Weights};
 use crate::context;
 use crate::db::{self, Database, Memory};
 use crate::embedder::Embedder;
-use crate::storage::{NativeBackend, StorageBackend};
+use crate::storage::StorageBackend;
 use crate::vectorstore::VectorStore;
 
 /// Standard RRF damping constant. Larger ⇒ rank position matters less.
@@ -51,10 +51,14 @@ struct FusionWeights {
     temporal_event: usize,
     graph: usize,
     entity: usize,
+    /// Chunk-level (skim layer) recall, mapped back to parent memories. Only
+    /// open-domain queries fuse it: that route loses the most detail to
+    /// narrative summaries, and chunks carry the specifics.
+    chunk: usize,
 }
 
 impl FusionWeights {
-    fn for_query(query: &str, temporal_weight: usize) -> Self {
+    fn for_query(query: &str, temporal_weight: usize, chunk_weight: usize) -> Self {
         match classify_query_route(query) {
             QueryRoute::Temporal => Self {
                 fts: 1,
@@ -64,6 +68,7 @@ impl FusionWeights {
                 temporal_event: temporal_weight.max(1) + 2,
                 graph: 0,
                 entity: 0,
+                chunk: 0,
             },
             QueryRoute::MultiHop => Self {
                 fts: 1,
@@ -73,6 +78,7 @@ impl FusionWeights {
                 temporal_event: temporal_weight.max(1),
                 graph: 3,
                 entity: 0,
+                chunk: 0,
             },
             QueryRoute::SingleHop => Self {
                 fts: 2,
@@ -82,6 +88,7 @@ impl FusionWeights {
                 temporal_event: temporal_weight.max(1),
                 graph: 1,
                 entity: 0,
+                chunk: 0,
             },
             QueryRoute::OpenDomain => Self {
                 fts: 1,
@@ -91,6 +98,7 @@ impl FusionWeights {
                 temporal_event: temporal_weight.max(1),
                 graph: 1,
                 entity: 0,
+                chunk: chunk_weight,
             },
         }
     }
@@ -114,6 +122,29 @@ pub struct RetrievalTuning {
     /// off). High-tier (user-explicit) facts outrank machine-derived ones on
     /// near-ties. See `governance::tier_authority_boost`.
     pub tier_weight: f64,
+    /// Times the chunk-parent id-list is pushed into RRF for open-domain
+    /// queries (0 = signal off). 1 = one list, same footing as FTS.
+    pub chunk_fusion_weight: usize,
+    /// Bridge-hop depth in the graph id-list builder. 1 = the historical
+    /// single evidence-chain hop; 2 adds a second-order hop at decayed weight.
+    pub graph_chain_depth: usize,
+    /// Demotion weight for candidates whose only edge support is superseded
+    /// while another candidate holds the live edge for the same
+    /// (source, relation). 0.0 = off.
+    pub stale_demotion_weight: f64,
+    /// Additive activation boost weight: importance × maturity × recency.
+    /// 0.0 = off.
+    pub activation_weight: f64,
+    /// Recency half-life (days) for the activation boost.
+    pub activation_halflife_days: f64,
+    /// Abstention guard: drop result memories sharing less than this fraction
+    /// of the query's salient terms (0.0 = off). Better an empty answer than a
+    /// confident wrong one — abstention is a scored LongMemEval ability.
+    pub abstention_min_overlap: f64,
+    /// T0 lexical early exit: skip embedding/auxiliary recall when the top FTS
+    /// hit already contains every salient query term (single-hop route only).
+    /// Off by default; tier exit rates are published in `/status` metrics.
+    pub tier_early_exit: bool,
 }
 
 impl Default for RetrievalTuning {
@@ -124,6 +155,13 @@ impl Default for RetrievalTuning {
             trust_halflife_days: 30.0,
             trust_ref_saturation: 5.0,
             tier_weight: 0.0,
+            chunk_fusion_weight: 1,
+            graph_chain_depth: 1,
+            stale_demotion_weight: 0.0,
+            activation_weight: 0.0,
+            activation_halflife_days: 30.0,
+            abstention_min_overlap: 0.0,
+            tier_early_exit: false,
         }
     }
 }
@@ -553,24 +591,44 @@ async fn graph_ids_for_query(
         }
     }
 
-    // Evidence-chain expansion: one hop through connected entities. This gives
-    // multi-hop questions a chance to retrieve both sides of a relation chain
-    // without turning graph lookup into a broad recency-ordered entity search.
-    for bridge in bridge_entities.into_iter().take(MAX_GRAPH_ENTITIES * 2) {
-        let edges = backend
-            .edges_for_entity(project, &bridge, false, GRAPH_CHAIN_EDGES_PER_BRIDGE)
-            .await
-            .unwrap_or_default();
-        for edge in edges {
-            let score = graph_edge_score(&edge, &query_terms) * 0.75;
-            let current =
-                best.entry(edge.memory_id)
-                    .or_insert((score, edge.observed_at, first_seen));
-            if score > current.0 || (score == current.0 && edge.observed_at > current.1) {
-                *current = (score, edge.observed_at, first_seen);
-            }
-            first_seen += 1;
+    // Evidence-chain expansion: hop through connected entities so multi-hop
+    // questions can retrieve both sides of a relation chain without turning
+    // graph lookup into a broad recency-ordered entity search. Depth 1 (the
+    // default) is the historical single hop; deeper hops decay geometrically
+    // and each level's frontier stays capped, so noise cannot compound.
+    let chain_depth = tuning().graph_chain_depth.max(1);
+    let mut frontier = bridge_entities;
+    for level in 0..chain_depth {
+        if frontier.is_empty() {
+            break;
         }
+        let decay = 0.75_f64.powi(level as i32 + 1);
+        let mut next_frontier = Vec::new();
+        for bridge in frontier.into_iter().take(MAX_GRAPH_ENTITIES * 2) {
+            let edges = backend
+                .edges_for_entity(project, &bridge, false, GRAPH_CHAIN_EDGES_PER_BRIDGE)
+                .await
+                .unwrap_or_default();
+            for edge in edges {
+                let score = graph_edge_score(&edge, &query_terms) * decay;
+                let current =
+                    best.entry(edge.memory_id)
+                        .or_insert((score, edge.observed_at, first_seen));
+                if score > current.0 || (score == current.0 && edge.observed_at > current.1) {
+                    *current = (score, edge.observed_at, first_seen);
+                }
+                first_seen += 1;
+                if level + 1 < chain_depth {
+                    for endpoint in [&edge.source, &edge.target] {
+                        let key = endpoint.to_ascii_lowercase();
+                        if !lookup_entities.contains(&key) && bridge_seen.insert(key) {
+                            next_frontier.push(endpoint.clone());
+                        }
+                    }
+                }
+            }
+        }
+        frontier = next_frontier;
     }
 
     let mut scored: Vec<(i64, f64, i64, usize)> = best
@@ -1005,7 +1063,9 @@ pub async fn hybrid_search_in_namespace(
     // Ranking (RRF, reserve) and governance (trust/tier boosts) below compose ON
     // TOP of this trait; only the raw recall/materialize calls flow through it,
     // so behavior is identical to the prior direct-SQL path.
-    let backend = NativeBackend::new(db, store);
+    let backend = crate::storage::make_backend(db, store).await;
+
+    let started = std::time::Instant::now();
 
     // Keyword side (always run).
     let fts: Vec<Memory> = backend
@@ -1015,8 +1075,27 @@ pub async fn hybrid_search_in_namespace(
         .filter_map(|c| c.memory)
         .collect();
 
+    let route = classify_query_route(query);
+
+    // T0 lexical early exit (opt-in): a single-hop query whose top FTS hit
+    // already contains every salient query term is lexically resolved — skip
+    // the embedding calls and auxiliary recall and fuse the cheap signals
+    // (FTS + graph) only. Off by default; the benchmark harness owns the
+    // accuracy/latency trade.
+    let t0_exit = tuning().tier_early_exit
+        && route == QueryRoute::SingleHop
+        && fts
+            .first()
+            .map(|m| {
+                let terms = salient_query_terms(query);
+                !terms.is_empty() && salient_overlap_fraction(&terms, &m.summary) >= 1.0
+            })
+            .unwrap_or(false);
+
     // Semantic side (best-effort; only when an embedder is configured).
-    let vec_ids: Vec<i64> = if let Some(emb) = embedder {
+    let vec_ids: Vec<i64> = if t0_exit {
+        Vec::new()
+    } else if let Some(emb) = embedder {
         match embed_one(emb, query).await {
             Some(qvec) => backend
                 .vector_search(project, &qvec, emb.id(), pool)
@@ -1036,7 +1115,7 @@ pub async fn hybrid_search_in_namespace(
     // this only ever lifts dated memories, never suppresses anything.
     let time_ids: Vec<i64> = {
         let years = query_years(query);
-        if years.is_empty() {
+        if years.is_empty() || t0_exit {
             Vec::new()
         } else {
             let mut seen = HashSet::new();
@@ -1060,8 +1139,8 @@ pub async fn hybrid_search_in_namespace(
     // an event ("when did X happen?") and do not name the answer year. Rank
     // date-bearing event/fact memories by event-term overlap so old exact facts
     // can beat newer broad memories that only share the same person/topic.
-    let temporal_event_ids = if is_temporal_lookup_query(query) {
-        temporal_event_ids_for_query(&backend, project, query, pool).await?
+    let temporal_event_ids = if is_temporal_lookup_query(query) && !t0_exit {
+        temporal_event_ids_for_query(backend.as_ref(), project, query, pool).await?
     } else {
         Vec::new()
     };
@@ -1089,7 +1168,6 @@ pub async fn hybrid_search_in_namespace(
         Vec::new()
     };
 
-    let route = classify_query_route(query);
     let query_variants = match route {
         QueryRoute::MultiHop | QueryRoute::Temporal => decomposed_queries(query),
         QueryRoute::SingleHop | QueryRoute::OpenDomain => Vec::new(),
@@ -1154,7 +1232,7 @@ pub async fn hybrid_search_in_namespace(
     let graph_ids = if route == QueryRoute::Temporal {
         Vec::new()
     } else {
-        graph_ids_for_query(&backend, project, query, pool).await?
+        graph_ids_for_query(backend.as_ref(), project, query, pool).await?
     };
 
     // Candidate ordering: route-weighted RRF over keyword + auxiliary signals.
@@ -1164,7 +1242,29 @@ pub async fn hybrid_search_in_namespace(
     let lexical_floor_ids = lexical_source_fact_floor_ids(db, query, &fts, limit).await?;
     let by_id: HashMap<i64, Memory> = fts.into_iter().map(|m| (m.id, m)).collect();
 
-    let weights = FusionWeights::for_query(query, tuning().temporal_fusion_weight);
+    let weights = FusionWeights::for_query(
+        query,
+        tuning().temporal_fusion_weight,
+        tuning().chunk_fusion_weight,
+    );
+
+    // Chunk-level (skim layer) recall for open-domain queries: chunks preserve
+    // the specifics narrative summaries generalize away, so their parents join
+    // fusion as a first-class signal. Zero cost on the other routes.
+    let chunk_ids = if weights.chunk > 0 {
+        db::search_memory_chunk_parents_in_namespace(
+            db,
+            namespace,
+            project,
+            &salient_query_terms(query),
+            pool,
+        )
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let mut lists: Vec<Vec<i64>> = Vec::new();
     push_weighted_signal(&mut lists, &fts_ids, weights.fts);
     push_weighted_signal(&mut lists, &vec_ids, weights.vector);
@@ -1174,6 +1274,7 @@ pub async fn hybrid_search_in_namespace(
     push_weighted_signal(&mut lists, &temporal_event_ids, weights.temporal_event);
     push_weighted_signal(&mut lists, &graph_ids, weights.graph);
     push_weighted_signal(&mut lists, &entity_ids, weights.entity);
+    push_weighted_signal(&mut lists, &chunk_ids, weights.chunk);
     let candidates: Vec<i64> = match lists.len() {
         0 => Vec::new(),
         1 => lists.pop().unwrap_or_default(),
@@ -1187,6 +1288,15 @@ pub async fn hybrid_search_in_namespace(
     // (#1) Governed-retrieval router: nudge by writer trust-tier authority.
     // No-op (and zero DB cost) unless governance_router.weight > 0.
     let candidates = apply_tier_boost(db, candidates).await?;
+
+    // Knowledge-update enforcement: demote candidates whose only edge support
+    // is superseded while another candidate holds the live edge for the same
+    // (source, relation). No-op unless ranking.stale_demotion_weight > 0.
+    let candidates = apply_supersession_demotion(db, candidates).await?;
+
+    // Activation re-rank (Context-Tree analog): importance × maturity ×
+    // recency decay. No-op unless ranking.activation_weight > 0.
+    let candidates = apply_activation_boost(db, candidates).await?;
 
     // Quarantine derived inferences (kind="inference") from default retrieval:
     // a wrong inference that ranked high would poison the answer. They stay
@@ -1206,7 +1316,161 @@ pub async fn hybrid_search_in_namespace(
             out.push(m);
         }
     }
+
+    // Abstention guard: drop results that share too little of the query's
+    // salient vocabulary. An empty result lets callers answer "I don't know"
+    // instead of confidently citing a bad hit. Off by default.
+    let min_overlap = tuning().abstention_min_overlap;
+    if min_overlap > 0.0 {
+        let terms = salient_query_terms(query);
+        out.retain(|m| salient_overlap_fraction(&terms, &m.summary) >= min_overlap);
+    }
+
+    crate::metrics::record_tier(
+        if t0_exit {
+            crate::metrics::RetrievalTier::T0LexicalExit
+        } else {
+            crate::metrics::RetrievalTier::FullFusion
+        },
+        started.elapsed(),
+    );
     Ok(out)
+}
+
+/// Fraction of `terms` present (case-insensitive substring) in `text`.
+/// 1.0 when there are no salient terms — an unusual query must not force
+/// abstention on its own.
+fn salient_overlap_fraction(terms: &[String], text: &str) -> f64 {
+    if terms.is_empty() {
+        return 1.0;
+    }
+    let haystack = text.to_lowercase();
+    let hits = terms
+        .iter()
+        .filter(|t| haystack.contains(t.to_lowercase().as_str()))
+        .count();
+    hits as f64 / terms.len() as f64
+}
+
+/// Ids of candidates whose entire edge support is superseded/validity-closed
+/// while some *other* candidate holds a live edge for the same
+/// (source, relation) key — the fingerprint of a stale fact competing with its
+/// own update. Pure so the policy is unit-testable.
+fn stale_candidate_ids(
+    candidates: &[i64],
+    edges: &HashMap<i64, Vec<db::MemoryEdge>>,
+) -> HashSet<i64> {
+    let key = |e: &db::MemoryEdge| {
+        (
+            e.source.trim().to_lowercase(),
+            e.relation.trim().to_lowercase(),
+        )
+    };
+    let mut live_keys: HashSet<(String, String)> = HashSet::new();
+    for id in candidates {
+        for edge in edges.get(id).map(|v| v.as_slice()).unwrap_or_default() {
+            if edge.superseded_by.is_none() && edge.valid_until.is_none() {
+                live_keys.insert(key(edge));
+            }
+        }
+    }
+    let mut stale = HashSet::new();
+    for id in candidates {
+        let Some(own) = edges.get(id) else { continue };
+        if own.is_empty() {
+            continue;
+        }
+        let all_closed = own
+            .iter()
+            .all(|e| e.superseded_by.is_some() || e.valid_until.is_some());
+        let update_exists = own.iter().any(|e| {
+            (e.superseded_by.is_some() || e.valid_until.is_some()) && live_keys.contains(&key(e))
+        });
+        if all_closed && update_exists {
+            stale.insert(*id);
+        }
+    }
+    stale
+}
+
+/// Knowledge-update demotion pass: same base+boost shape as
+/// `apply_trust_boost`, with a negative boost for stale candidates so the
+/// live fact wins the near-tie its own update created.
+async fn apply_supersession_demotion(db: &Database, candidates: Vec<i64>) -> Result<Vec<i64>> {
+    let t = tuning();
+    if t.stale_demotion_weight <= 0.0 || candidates.len() < 2 {
+        return Ok(candidates);
+    }
+    let edges = db::memory_edges_for_memories_with_history(db, &candidates)
+        .await
+        .unwrap_or_default();
+    if edges.is_empty() {
+        return Ok(candidates);
+    }
+    let stale = stale_candidate_ids(&candidates, &edges);
+    if stale.is_empty() {
+        return Ok(candidates);
+    }
+    let mut scored: Vec<(usize, i64, f64)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(rank, &id)| {
+            let base = 1.0 / (RRF_K as f64 + rank as f64);
+            let penalty = if stale.contains(&id) {
+                t.stale_demotion_weight
+            } else {
+                0.0
+            };
+            (rank, id, base - penalty)
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    Ok(scored.into_iter().map(|(_, id, _)| id).collect())
+}
+
+/// Activation re-rank: importance × maturity multiplier × recency half-life
+/// decay, added on top of the reciprocal-rank base like the trust/tier passes.
+async fn apply_activation_boost(db: &Database, candidates: Vec<i64>) -> Result<Vec<i64>> {
+    let t = tuning();
+    if t.activation_weight <= 0.0 || candidates.len() < 2 {
+        return Ok(candidates);
+    }
+    let meta = db::activation_meta_for(db, &candidates)
+        .await
+        .unwrap_or_default();
+    if meta.is_empty() {
+        return Ok(candidates);
+    }
+    let now = Utc::now().timestamp();
+    let mut scored: Vec<(usize, i64, f64)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(rank, &id)| {
+            let base = 1.0 / (RRF_K as f64 + rank as f64);
+            let boost = meta
+                .get(&id)
+                .map(|m| {
+                    let age_days = ((now - m.created_at).max(0) as f64) / 86_400.0;
+                    let recency = 0.5_f64.powf(age_days / t.activation_halflife_days.max(0.001));
+                    t.activation_weight
+                        * m.importance.clamp(0.0, 1.0)
+                        * db::maturity_multiplier(m.maturity.as_deref())
+                        * recency
+                })
+                .unwrap_or(0.0);
+            (rank, id, base + boost)
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    Ok(scored.into_iter().map(|(_, id, _)| id).collect())
 }
 
 /// Apply the narrative-reserve quota over a ranked candidate id list, returning at
@@ -1685,16 +1949,40 @@ async fn rerank_candidates(
     candidates: Vec<Memory>,
     limit: usize,
 ) -> Vec<Memory> {
+    let started = std::time::Instant::now();
     if config.rerank.backend.eq_ignore_ascii_case("cross_encoder") {
         let cap = config.rerank.cross_encoder_max_candidates.max(limit);
         let head = candidates.len().min(cap);
         let evidence = enrich_rerank_evidence(db, query, candidates[..head].to_vec()).await;
         let docs: Vec<String> = evidence.iter().map(rerank_doc).collect();
-        if let Some(order) = crate::reranker::rerank_order(query, &docs) {
+        if let Some(scored) = crate::reranker::rerank_scored(query, &docs) {
+            // T2→T3 escalation: when the cross-encoder can't separate its top
+            // candidates (margin below the configured threshold), the ordering
+            // is a coin flip — spend the LLM call. 0.0 (default) never
+            // escalates, keeping cross-encoder results final.
+            let margin = match (scored.first(), scored.get(1)) {
+                (Some(a), Some(b)) => (a.1 - b.1) as f64,
+                _ => f64::MAX,
+            };
+            if config.rerank.escalate_margin > 0.0 && margin < config.rerank.escalate_margin {
+                let out = llm_rerank(db, config, query, candidates, limit).await;
+                crate::metrics::record_tier(
+                    crate::metrics::RetrievalTier::RerankEscalated,
+                    started.elapsed(),
+                );
+                return out;
+            }
+            let order: Vec<usize> = scored.into_iter().map(|(i, _)| i).collect();
+            crate::metrics::record_tier(
+                crate::metrics::RetrievalTier::RerankCrossEncoder,
+                started.elapsed(),
+            );
             return fuse_rerank(&candidates, &order, limit);
         }
     }
-    llm_rerank(db, config, query, candidates, limit).await
+    let out = llm_rerank(db, config, query, candidates, limit).await;
+    crate::metrics::record_tier(crate::metrics::RetrievalTier::RerankLlm, started.elapsed());
+    out
 }
 
 /// Merge the narrow (`limit`-sized) retrieval with the wider pool: narrow items
@@ -2521,18 +2809,76 @@ mod tests {
 
     #[test]
     fn routed_fusion_weights_emphasize_the_right_signals() {
-        let temporal = FusionWeights::for_query("When did Dave buy it?", 1);
+        let temporal = FusionWeights::for_query("When did Dave buy it?", 1, 1);
         assert!(temporal.temporal_event > temporal.fts);
         assert_eq!(temporal.graph, 0);
+        assert_eq!(temporal.chunk, 0);
 
-        let multi = FusionWeights::for_query("Which project does Caroline depend on?", 1);
+        let multi = FusionWeights::for_query("Which project does Caroline depend on?", 1, 1);
         assert!(multi.graph > multi.fts);
         assert!(multi.vector > multi.fts);
         assert!(multi.query_variant > 0);
+        assert_eq!(multi.chunk, 0);
 
-        let single = FusionWeights::for_query("What camera did Dave buy?", 1);
+        let single = FusionWeights::for_query("What camera did Dave buy?", 1, 1);
         assert!(single.fts > single.vector);
         assert_eq!(single.query_variant, 0);
+        assert_eq!(single.chunk, 0);
+
+        // Open-domain is the only route that fuses chunk-level recall, and the
+        // knob gates it entirely.
+        let open = FusionWeights::for_query("lunch policy", 1, 1);
+        assert_eq!(open.chunk, 1);
+        let open_off = FusionWeights::for_query("lunch policy", 1, 0);
+        assert_eq!(open_off.chunk, 0);
+    }
+
+    #[test]
+    fn salient_overlap_fraction_measures_query_term_coverage() {
+        let terms = vec!["vineyard".to_string(), "booking".to_string()];
+        assert_eq!(
+            salient_overlap_fraction(&terms, "Caroline booked the vineyard trip"),
+            0.5
+        );
+        assert_eq!(salient_overlap_fraction(&terms, "unrelated text"), 0.0);
+        assert_eq!(
+            salient_overlap_fraction(&[], "anything"),
+            1.0,
+            "no salient terms must not force abstention"
+        );
+    }
+
+    #[test]
+    fn stale_candidate_detection_requires_live_update_from_another_candidate() {
+        let mk_edge = |memory_id: i64, target: &str, superseded: Option<i64>| db::MemoryEdge {
+            id: memory_id * 10,
+            project: "/tmp/p".to_string(),
+            memory_id,
+            source: "Bob".to_string(),
+            relation: "status".to_string(),
+            target: target.to_string(),
+            valid_from: None,
+            valid_until: None,
+            observed_at: 0,
+            confidence: 0.9,
+            superseded_by: superseded,
+            superseded_reason: None,
+            created_at: 0,
+        };
+        let mut edges: HashMap<i64, Vec<db::MemoryEdge>> = HashMap::new();
+        edges.insert(1, vec![mk_edge(1, "onboarding", Some(20))]); // stale
+        edges.insert(2, vec![mk_edge(2, "active", None)]); // the live update
+        edges.insert(3, Vec::new()); // no edge support: untouched
+
+        let stale = stale_candidate_ids(&[1, 2, 3], &edges);
+        assert!(stale.contains(&1), "superseded candidate must be demotable");
+        assert!(!stale.contains(&2), "live candidate must never be stale");
+        assert!(!stale.contains(&3), "edge-less candidates are untouched");
+
+        // Without the live update in the candidate set, nothing is demoted:
+        // demotion only enforces a supersession that retrieval can substitute.
+        let stale_alone = stale_candidate_ids(&[1, 3], &edges);
+        assert!(stale_alone.is_empty());
     }
 
     #[test]

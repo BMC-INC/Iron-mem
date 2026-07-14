@@ -190,7 +190,17 @@ mod tests {
         // load_blob will decompress to "B", whose hash != key => must error.
         let key = sha256_hex(b"A");
         let wrong = codec_for(ContentType::Text).compress(b"B")?;
-        insert_blob(&db, &key, "text", "zstd", 1, wrong.len() as i64, &wrong, None).await?;
+        insert_blob(
+            &db,
+            &key,
+            "text",
+            "zstd",
+            1,
+            wrong.len() as i64,
+            &wrong,
+            None,
+        )
+        .await?;
 
         let err = load_blob(&db, &key).await.unwrap_err();
         assert!(
@@ -217,14 +227,20 @@ mod tests {
         // Below the sample threshold: floor only, no dictionary.
         let early = store_blob(&db, b"{\"i\":0,\"msg\":\"first\"}", Some("json")).await?;
         assert_eq!(early.codec, "zstd");
-        assert!(get_blob(&db, &early.hash).await?.unwrap().dict_hash.is_none());
+        assert!(get_blob(&db, &early.hash)
+            .await?
+            .unwrap()
+            .dict_hash
+            .is_none());
 
         // Store enough similar JSON records to trigger lazy dictionary training.
         let mut last_hash = early.hash.clone();
         let mut last_src = String::new();
         for i in 1..60 {
             last_src = format!("{{\"i\":{i},\"msg\":\"event number {i} happened\",\"ok\":true}}");
-            last_hash = store_blob(&db, last_src.as_bytes(), Some("json")).await?.hash;
+            last_hash = store_blob(&db, last_src.as_bytes(), Some("json"))
+                .await?
+                .hash;
         }
 
         // A dictionary now exists for json and the latest blob used it...
@@ -263,7 +279,10 @@ mod tests {
         eprintln!(
             "CCR json corpus: floor={floor_total} B, stored(dict-or-floor)={stored_total} B, saved={pct:.1}%"
         );
-        assert!(stored_total <= floor_total, "store must never be worse than the floor");
+        assert!(
+            stored_total <= floor_total,
+            "store must never be worse than the floor"
+        );
 
         let _ = std::fs::remove_file(path);
         Ok(())
