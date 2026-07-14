@@ -52,6 +52,8 @@ pub struct Config {
     #[serde(default)]
     pub observer: ObserverConfig,
     #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
     pub auto_dream: AutoDreamConfig,
     #[serde(default)]
     pub auto_compress: AutoCompressConfig,
@@ -286,6 +288,73 @@ impl Default for RankingLeversConfig {
             tier_early_exit: false,
         }
     }
+}
+
+/// External storage engines (HYBRID mode): route vector recall through Qdrant
+/// and/or graph recall through Neo4j while IronMem keeps identity, governance,
+/// and the audit trail. Defaults are the native engine — a deploy with this
+/// section absent behaves exactly as before.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// "native" (default) or "qdrant".
+    #[serde(default = "default_backend_native")]
+    pub vector_backend: String,
+    #[serde(default = "default_qdrant_url")]
+    pub qdrant_url: String,
+    #[serde(default = "default_qdrant_collection")]
+    pub qdrant_collection: String,
+    /// Vector dimension for the Qdrant collection (must match the embedder).
+    #[serde(default = "default_qdrant_dim")]
+    pub qdrant_dim: usize,
+    /// "native" (default) or "neo4j".
+    #[serde(default = "default_backend_native")]
+    pub graph_backend: String,
+    #[serde(default = "default_neo4j_url")]
+    pub neo4j_url: String,
+    #[serde(default = "default_neo4j_database")]
+    pub neo4j_database: String,
+    #[serde(default = "default_neo4j_user")]
+    pub neo4j_user: String,
+    #[serde(default)]
+    pub neo4j_pass: String,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            vector_backend: default_backend_native(),
+            qdrant_url: default_qdrant_url(),
+            qdrant_collection: default_qdrant_collection(),
+            qdrant_dim: default_qdrant_dim(),
+            graph_backend: default_backend_native(),
+            neo4j_url: default_neo4j_url(),
+            neo4j_database: default_neo4j_database(),
+            neo4j_user: default_neo4j_user(),
+            neo4j_pass: String::new(),
+        }
+    }
+}
+
+fn default_backend_native() -> String {
+    "native".to_string()
+}
+fn default_qdrant_url() -> String {
+    "http://localhost:6333".to_string()
+}
+fn default_qdrant_collection() -> String {
+    "ironmem".to_string()
+}
+fn default_qdrant_dim() -> usize {
+    384
+}
+fn default_neo4j_url() -> String {
+    "http://localhost:7474".to_string()
+}
+fn default_neo4j_database() -> String {
+    "neo4j".to_string()
+}
+fn default_neo4j_user() -> String {
+    "neo4j".to_string()
 }
 
 /// Observer pass (Phase 2): append-only, timestamped, priority-tagged
@@ -640,6 +709,7 @@ impl Default for Config {
             ranking: RankingLeversConfig::default(),
             agent_keys: Vec::new(),
             observer: ObserverConfig::default(),
+            storage: StorageConfig::default(),
             auto_dream: AutoDreamConfig::default(),
             auto_compress: AutoCompressConfig::default(),
             scheduler: SchedulerConfig::default(),

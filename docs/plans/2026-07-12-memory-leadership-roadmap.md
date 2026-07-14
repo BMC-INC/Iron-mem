@@ -163,6 +163,11 @@ Remaining Phase 2: enable-by-default decision + the coverage-diff pass (log vs t
 2. **Python + TypeScript SDKs:** thin typed clients over the ~35 REST routes (OpenAPI spec first); `pip install ironmem` / `npm i ironmem` with MCP config snippets.
 3. **Publish** the LongMemEval harness beside the LoCoMo repo + a results page.
 
+**Status (2026-07-14):** items 1–2 landed:
+- **External backends wired** (`[storage]` config: `vector_backend = "qdrant"`, `graph_backend = "neo4j"` + connection fields, default native): `QdrantVectorBackend`/`Neo4jGraphBackend` genericized over their inner backend so the overrides stack (Neo4j-over-Qdrant-over-native); a process-wide selection (same model as `RetrievalTuning`) is installed at startup for CLI/REST/MCP alike, and `storage::make_backend` degrades to native with a warning on any connection failure so a down external engine can never break recall. Qdrant's ensure-collection round trip is paid once per process. Embedding backfill into Qdrant remains (`ironmem embed` covers native).
+- **SDKs shipped** (`sdk/python`, `sdk/typescript`): zero-dependency typed clients over the REST surface — session lifecycle, remember (full governance fields), context/skim, feedback, lineage, compliance report, snapshots, status, profile; bearer/agent-key auth. Python smoke-tested against a live server (remember → context → lineage → compliance chain-valid); TypeScript compiles clean under `tsc --strict`. Registry publishing (PyPI/npm) intentionally deferred.
+Remaining Phase 5: publish harness results page + registry publishing — both blocked on the benchmark runs by design.
+
 ---
 
 ## 4. Sequencing

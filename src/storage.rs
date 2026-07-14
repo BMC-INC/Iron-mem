@@ -28,6 +28,147 @@ use serde_json::{json, Value};
 use crate::db::{self, Database, DatedMemory, Memory, MemoryEdge};
 use crate::vectorstore::VectorStore;
 
+/// Deploy-time backend selection (HYBRID mode): which engines serve vector and
+/// graph recall. Installed once at startup from `Config.storage` (same
+/// fixed-for-the-process model as `retrieval::set_retrieval_tuning`); the
+/// default is the native engine, byte-identical to pre-selection behavior.
+#[derive(Debug, Clone, Default)]
+pub struct StorageSelection {
+    pub qdrant: Option<QdrantSettings>,
+    pub neo4j: Option<Neo4jSettings>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QdrantSettings {
+    pub url: String,
+    pub collection: String,
+    pub dim: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct Neo4jSettings {
+    pub url: String,
+    pub database: String,
+    pub user: String,
+    pub pass: String,
+}
+
+impl StorageSelection {
+    pub fn from_config(cfg: &crate::config::Config) -> Self {
+        let qdrant = if cfg.storage.vector_backend.eq_ignore_ascii_case("qdrant") {
+            Some(QdrantSettings {
+                url: cfg.storage.qdrant_url.clone(),
+                collection: cfg.storage.qdrant_collection.clone(),
+                dim: cfg.storage.qdrant_dim,
+            })
+        } else {
+            None
+        };
+        let neo4j = if cfg.storage.graph_backend.eq_ignore_ascii_case("neo4j") {
+            Some(Neo4jSettings {
+                url: cfg.storage.neo4j_url.clone(),
+                database: cfg.storage.neo4j_database.clone(),
+                user: cfg.storage.neo4j_user.clone(),
+                pass: cfg.storage.neo4j_pass.clone(),
+            })
+        } else {
+            None
+        };
+        Self { qdrant, neo4j }
+    }
+}
+
+static STORAGE_SELECTION: std::sync::OnceLock<StorageSelection> = std::sync::OnceLock::new();
+/// Marks the Qdrant collection as ensured so only the first query pays the
+/// create-collection round trip.
+static QDRANT_READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Install the backend selection (call once at startup). Idempotent.
+pub fn set_storage_selection(s: StorageSelection) {
+    if s.qdrant.is_some() || s.neo4j.is_some() {
+        tracing::info!(
+            "storage backends: vector={} graph={}",
+            if s.qdrant.is_some() {
+                "qdrant"
+            } else {
+                "native"
+            },
+            if s.neo4j.is_some() { "neo4j" } else { "native" },
+        );
+    }
+    let _ = STORAGE_SELECTION.set(s);
+}
+
+fn selection() -> StorageSelection {
+    STORAGE_SELECTION.get().cloned().unwrap_or_default()
+}
+
+/// Build the configured backend for one retrieval call. External engines
+/// decorate the native backend (vector via Qdrant, graph via Neo4j, both
+/// stackable); any connection failure degrades to native with a warning, so a
+/// down external engine can never break recall.
+pub async fn make_backend<'a>(
+    db: &'a Database,
+    store: &'a dyn VectorStore,
+) -> Box<dyn StorageBackend + 'a> {
+    let sel = selection();
+    match (sel.qdrant, sel.neo4j) {
+        (None, None) => Box::new(NativeBackend::new(db, store)),
+        (Some(q), neo4j) => {
+            let qdrant = if QDRANT_READY.get().is_some() {
+                Ok(QdrantVectorBackend::attach(
+                    NativeBackend::new(db, store),
+                    &q.url,
+                    &q.collection,
+                ))
+            } else {
+                let made = QdrantVectorBackend::new(
+                    NativeBackend::new(db, store),
+                    &q.url,
+                    &q.collection,
+                    q.dim,
+                )
+                .await;
+                if made.is_ok() {
+                    let _ = QDRANT_READY.set(());
+                }
+                made
+            };
+            match (qdrant, neo4j) {
+                (Ok(qb), Some(n)) => Box::new(Neo4jGraphBackend::new(
+                    qb,
+                    &n.url,
+                    &n.database,
+                    &n.user,
+                    &n.pass,
+                )),
+                (Ok(qb), None) => Box::new(qb),
+                (Err(e), Some(n)) => {
+                    tracing::warn!("qdrant backend unavailable ({e}); vector recall stays native");
+                    Box::new(Neo4jGraphBackend::new(
+                        NativeBackend::new(db, store),
+                        &n.url,
+                        &n.database,
+                        &n.user,
+                        &n.pass,
+                    ))
+                }
+                (Err(e), None) => {
+                    tracing::warn!("qdrant backend unavailable ({e}); vector recall stays native");
+                    Box::new(NativeBackend::new(db, store))
+                }
+            }
+        }
+        (None, Some(n)) => Box::new(Neo4jGraphBackend::new(
+            NativeBackend::new(db, store),
+            &n.url,
+            &n.database,
+            &n.user,
+            &n.pass,
+        )),
+    }
+}
+
 /// What recall signals a backend can serve. The fusion layer gates optional
 /// signals on these flags so an adapter that lacks (say) a graph engine simply
 /// contributes nothing rather than erroring.
@@ -343,22 +484,27 @@ impl StorageBackend for NativeBackend<'_> {
 /// Real vector adapter backed by an external **Qdrant** over its REST API.
 /// Embeddings live in Qdrant; everything governance-bearing stays native.
 #[allow(dead_code)]
-pub struct QdrantVectorBackend<'a> {
-    inner: NativeBackend<'a>,
+pub struct QdrantVectorBackend<I> {
+    inner: I,
     http: Client,
     base: String,
     collection: String,
 }
 
-#[allow(dead_code)]
-impl<'a> QdrantVectorBackend<'a> {
+impl<I: StorageBackend> QdrantVectorBackend<I> {
+    /// Attach without the ensure-collection round trip (the collection is
+    /// known to exist — see `QDRANT_READY` in `make_backend`).
+    pub fn attach(inner: I, base_url: &str, collection: &str) -> Self {
+        Self {
+            inner,
+            http: Client::new(),
+            base: base_url.trim_end_matches('/').to_string(),
+            collection: collection.to_string(),
+        }
+    }
+
     /// Connect and ensure the collection exists (Cosine, `dim`-d vectors).
-    pub async fn new(
-        inner: NativeBackend<'a>,
-        base_url: &str,
-        collection: &str,
-        dim: usize,
-    ) -> Result<Self> {
+    pub async fn new(inner: I, base_url: &str, collection: &str, dim: usize) -> Result<Self> {
         let http = Client::new();
         let base = base_url.trim_end_matches('/').to_string();
         let resp = http
@@ -384,7 +530,7 @@ impl<'a> QdrantVectorBackend<'a> {
 }
 
 #[async_trait]
-impl StorageBackend for QdrantVectorBackend<'_> {
+impl<I: StorageBackend> StorageBackend for QdrantVectorBackend<I> {
     fn capabilities(&self) -> BackendCaps {
         BackendCaps {
             vector: true,
@@ -528,23 +674,16 @@ impl StorageBackend for QdrantVectorBackend<'_> {
 /// Real graph adapter backed by an external **Neo4j** over its transactional
 /// Cypher HTTP API. Entities + edges live in Neo4j; governance stays native.
 #[allow(dead_code)]
-pub struct Neo4jGraphBackend<'a> {
-    inner: NativeBackend<'a>,
+pub struct Neo4jGraphBackend<I> {
+    inner: I,
     http: Client,
     endpoint: String,
     user: String,
     pass: String,
 }
 
-#[allow(dead_code)]
-impl<'a> Neo4jGraphBackend<'a> {
-    pub fn new(
-        inner: NativeBackend<'a>,
-        base_url: &str,
-        database: &str,
-        user: &str,
-        pass: &str,
-    ) -> Self {
+impl<I: StorageBackend> Neo4jGraphBackend<I> {
+    pub fn new(inner: I, base_url: &str, database: &str, user: &str, pass: &str) -> Self {
         let endpoint = format!(
             "{}/db/{}/tx/commit",
             base_url.trim_end_matches('/'),
@@ -579,7 +718,7 @@ impl<'a> Neo4jGraphBackend<'a> {
 }
 
 #[async_trait]
-impl StorageBackend for Neo4jGraphBackend<'_> {
+impl<I: StorageBackend> StorageBackend for Neo4jGraphBackend<I> {
     fn capabilities(&self) -> BackendCaps {
         BackendCaps {
             graph: true,

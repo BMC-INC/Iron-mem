@@ -582,6 +582,10 @@ async fn async_main() -> Result<()> {
 
     let cli = Cli::parse();
     let cfg = config::load()?;
+    // Install the storage backend selection once for the process (default:
+    // native engine, unchanged behavior). Every retrieval path — CLI, REST,
+    // MCP — sees the same selection.
+    storage::set_storage_selection(storage::StorageSelection::from_config(&cfg));
 
     match cli.command {
         Commands::Server => run_server(cfg).await?,

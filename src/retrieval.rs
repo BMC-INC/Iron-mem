@@ -11,7 +11,7 @@ use crate::config::{Config, Weights};
 use crate::context;
 use crate::db::{self, Database, Memory};
 use crate::embedder::Embedder;
-use crate::storage::{NativeBackend, StorageBackend};
+use crate::storage::StorageBackend;
 use crate::vectorstore::VectorStore;
 
 /// Standard RRF damping constant. Larger ⇒ rank position matters less.
@@ -1063,7 +1063,7 @@ pub async fn hybrid_search_in_namespace(
     // Ranking (RRF, reserve) and governance (trust/tier boosts) below compose ON
     // TOP of this trait; only the raw recall/materialize calls flow through it,
     // so behavior is identical to the prior direct-SQL path.
-    let backend = NativeBackend::new(db, store);
+    let backend = crate::storage::make_backend(db, store).await;
 
     let started = std::time::Instant::now();
 
@@ -1140,7 +1140,7 @@ pub async fn hybrid_search_in_namespace(
     // date-bearing event/fact memories by event-term overlap so old exact facts
     // can beat newer broad memories that only share the same person/topic.
     let temporal_event_ids = if is_temporal_lookup_query(query) && !t0_exit {
-        temporal_event_ids_for_query(&backend, project, query, pool).await?
+        temporal_event_ids_for_query(backend.as_ref(), project, query, pool).await?
     } else {
         Vec::new()
     };
@@ -1232,7 +1232,7 @@ pub async fn hybrid_search_in_namespace(
     let graph_ids = if route == QueryRoute::Temporal {
         Vec::new()
     } else {
-        graph_ids_for_query(&backend, project, query, pool).await?
+        graph_ids_for_query(backend.as_ref(), project, query, pool).await?
     };
 
     // Candidate ordering: route-weighted RRF over keyword + auxiliary signals.
