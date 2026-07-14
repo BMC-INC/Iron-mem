@@ -111,27 +111,105 @@ fn round3(us: f64) -> f64 {
     (us * 1000.0).round() / 1000.0
 }
 
-/// JSON snapshot for `/status`: per op `{count, avg_us, max_us}`.
+/// Retrieval pipeline tiers (memory-leadership roadmap Phase 1): which stage
+/// resolved a query and what each costs. Published so "most queries resolve
+/// without LLM calls" is a measured number, not a claim.
+#[derive(Debug, Clone, Copy)]
+pub enum RetrievalTier {
+    /// Lexical T0 early exit: FTS+graph resolved the query, deeper signals skipped.
+    T0LexicalExit,
+    /// Full RRF fusion over every collected signal (the T1 default).
+    FullFusion,
+    /// Cross-encoder rerank accepted (T2).
+    RerankCrossEncoder,
+    /// Cross-encoder margin too low → escalated to the LLM reranker (T3).
+    RerankEscalated,
+    /// LLM rerank ran directly (no cross-encoder available/selected).
+    RerankLlm,
+}
+
+impl RetrievalTier {
+    const COUNT: usize = 5;
+
+    fn idx(self) -> usize {
+        match self {
+            RetrievalTier::T0LexicalExit => 0,
+            RetrievalTier::FullFusion => 1,
+            RetrievalTier::RerankCrossEncoder => 2,
+            RetrievalTier::RerankEscalated => 3,
+            RetrievalTier::RerankLlm => 4,
+        }
+    }
+
+    fn label(idx: usize) -> &'static str {
+        match idx {
+            0 => "t0_lexical_exit",
+            1 => "full_fusion",
+            2 => "rerank_cross_encoder",
+            3 => "rerank_escalated",
+            4 => "rerank_llm",
+            _ => "unknown",
+        }
+    }
+}
+
+static TIER_STATS: [OpStat; RetrievalTier::COUNT] = [
+    OpStat::new(),
+    OpStat::new(),
+    OpStat::new(),
+    OpStat::new(),
+    OpStat::new(),
+];
+
+/// Record one query resolving at `tier` after `dur`.
+pub fn record_tier(tier: RetrievalTier, dur: Duration) {
+    let s = &TIER_STATS[tier.idx()];
+    let nanos = dur.as_nanos().min(u64::MAX as u128) as u64;
+    s.count.fetch_add(1, Ordering::Relaxed);
+    s.total_nanos.fetch_add(nanos, Ordering::Relaxed);
+    let mut cur = s.max_nanos.load(Ordering::Relaxed);
+    while nanos > cur {
+        match s
+            .max_nanos
+            .compare_exchange_weak(cur, nanos, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(prev) => cur = prev,
+        }
+    }
+}
+
+fn stat_json(s: &OpStat) -> serde_json::Value {
+    let count = s.count.load(Ordering::Relaxed);
+    let total = s.total_nanos.load(Ordering::Relaxed);
+    let max = s.max_nanos.load(Ordering::Relaxed);
+    let avg_us = if count > 0 {
+        (total as f64 / count as f64) / 1000.0
+    } else {
+        0.0
+    };
+    serde_json::json!({
+        "count": count,
+        "avg_us": round3(avg_us),
+        "max_us": round3(max as f64 / 1000.0),
+    })
+}
+
+/// JSON snapshot for `/status`: per governance op and per retrieval tier
+/// `{count, avg_us, max_us}`.
 pub fn snapshot() -> serde_json::Value {
     let mut ops = serde_json::Map::new();
     for (i, s) in STATS.iter().enumerate() {
-        let count = s.count.load(Ordering::Relaxed);
-        let total = s.total_nanos.load(Ordering::Relaxed);
-        let max = s.max_nanos.load(Ordering::Relaxed);
-        let avg_us = if count > 0 {
-            (total as f64 / count as f64) / 1000.0
-        } else {
-            0.0
-        };
-        ops.insert(
-            GovOp::label(i).to_string(),
-            serde_json::json!({
-                "count": count,
-                "avg_us": round3(avg_us),
-                "max_us": round3(max as f64 / 1000.0),
-            }),
-        );
+        ops.insert(GovOp::label(i).to_string(), stat_json(s));
     }
+    let mut tiers = serde_json::Map::new();
+    for (i, s) in TIER_STATS.iter().enumerate() {
+        tiers.insert(RetrievalTier::label(i).to_string(), stat_json(s));
+    }
+    ops.insert(
+        "retrieval_tiers".to_string(),
+        serde_json::Value::Object(tiers),
+    );
     serde_json::Value::Object(ops)
 }
 
@@ -154,5 +232,16 @@ mod tests {
     fn timed_returns_inner_value() {
         let v = timed(GovOp::TrustEval, || 7 + 1);
         assert_eq!(v, 8);
+    }
+
+    #[test]
+    fn retrieval_tiers_surface_in_snapshot() {
+        record_tier(RetrievalTier::T0LexicalExit, Duration::from_micros(5));
+        record_tier(RetrievalTier::FullFusion, Duration::from_micros(50));
+        let snap = snapshot();
+        let tiers = &snap["retrieval_tiers"];
+        assert!(tiers["t0_lexical_exit"]["count"].as_u64().unwrap() >= 1);
+        assert!(tiers["full_fusion"]["count"].as_u64().unwrap() >= 1);
+        assert!(tiers["rerank_escalated"]["count"].as_u64().is_some());
     }
 }

@@ -141,6 +141,10 @@ pub struct RetrievalTuning {
     /// of the query's salient terms (0.0 = off). Better an empty answer than a
     /// confident wrong one — abstention is a scored LongMemEval ability.
     pub abstention_min_overlap: f64,
+    /// T0 lexical early exit: skip embedding/auxiliary recall when the top FTS
+    /// hit already contains every salient query term (single-hop route only).
+    /// Off by default; tier exit rates are published in `/status` metrics.
+    pub tier_early_exit: bool,
 }
 
 impl Default for RetrievalTuning {
@@ -157,6 +161,7 @@ impl Default for RetrievalTuning {
             activation_weight: 0.0,
             activation_halflife_days: 30.0,
             abstention_min_overlap: 0.0,
+            tier_early_exit: false,
         }
     }
 }
@@ -1060,6 +1065,8 @@ pub async fn hybrid_search_in_namespace(
     // so behavior is identical to the prior direct-SQL path.
     let backend = NativeBackend::new(db, store);
 
+    let started = std::time::Instant::now();
+
     // Keyword side (always run).
     let fts: Vec<Memory> = backend
         .fulltext_search(namespace, project, query, pool)
@@ -1068,8 +1075,27 @@ pub async fn hybrid_search_in_namespace(
         .filter_map(|c| c.memory)
         .collect();
 
+    let route = classify_query_route(query);
+
+    // T0 lexical early exit (opt-in): a single-hop query whose top FTS hit
+    // already contains every salient query term is lexically resolved — skip
+    // the embedding calls and auxiliary recall and fuse the cheap signals
+    // (FTS + graph) only. Off by default; the benchmark harness owns the
+    // accuracy/latency trade.
+    let t0_exit = tuning().tier_early_exit
+        && route == QueryRoute::SingleHop
+        && fts
+            .first()
+            .map(|m| {
+                let terms = salient_query_terms(query);
+                !terms.is_empty() && salient_overlap_fraction(&terms, &m.summary) >= 1.0
+            })
+            .unwrap_or(false);
+
     // Semantic side (best-effort; only when an embedder is configured).
-    let vec_ids: Vec<i64> = if let Some(emb) = embedder {
+    let vec_ids: Vec<i64> = if t0_exit {
+        Vec::new()
+    } else if let Some(emb) = embedder {
         match embed_one(emb, query).await {
             Some(qvec) => backend
                 .vector_search(project, &qvec, emb.id(), pool)
@@ -1089,7 +1115,7 @@ pub async fn hybrid_search_in_namespace(
     // this only ever lifts dated memories, never suppresses anything.
     let time_ids: Vec<i64> = {
         let years = query_years(query);
-        if years.is_empty() {
+        if years.is_empty() || t0_exit {
             Vec::new()
         } else {
             let mut seen = HashSet::new();
@@ -1113,7 +1139,7 @@ pub async fn hybrid_search_in_namespace(
     // an event ("when did X happen?") and do not name the answer year. Rank
     // date-bearing event/fact memories by event-term overlap so old exact facts
     // can beat newer broad memories that only share the same person/topic.
-    let temporal_event_ids = if is_temporal_lookup_query(query) {
+    let temporal_event_ids = if is_temporal_lookup_query(query) && !t0_exit {
         temporal_event_ids_for_query(&backend, project, query, pool).await?
     } else {
         Vec::new()
@@ -1142,7 +1168,6 @@ pub async fn hybrid_search_in_namespace(
         Vec::new()
     };
 
-    let route = classify_query_route(query);
     let query_variants = match route {
         QueryRoute::MultiHop | QueryRoute::Temporal => decomposed_queries(query),
         QueryRoute::SingleHop | QueryRoute::OpenDomain => Vec::new(),
@@ -1300,6 +1325,15 @@ pub async fn hybrid_search_in_namespace(
         let terms = salient_query_terms(query);
         out.retain(|m| salient_overlap_fraction(&terms, &m.summary) >= min_overlap);
     }
+
+    crate::metrics::record_tier(
+        if t0_exit {
+            crate::metrics::RetrievalTier::T0LexicalExit
+        } else {
+            crate::metrics::RetrievalTier::FullFusion
+        },
+        started.elapsed(),
+    );
     Ok(out)
 }
 
@@ -1915,16 +1949,40 @@ async fn rerank_candidates(
     candidates: Vec<Memory>,
     limit: usize,
 ) -> Vec<Memory> {
+    let started = std::time::Instant::now();
     if config.rerank.backend.eq_ignore_ascii_case("cross_encoder") {
         let cap = config.rerank.cross_encoder_max_candidates.max(limit);
         let head = candidates.len().min(cap);
         let evidence = enrich_rerank_evidence(db, query, candidates[..head].to_vec()).await;
         let docs: Vec<String> = evidence.iter().map(rerank_doc).collect();
-        if let Some(order) = crate::reranker::rerank_order(query, &docs) {
+        if let Some(scored) = crate::reranker::rerank_scored(query, &docs) {
+            // T2→T3 escalation: when the cross-encoder can't separate its top
+            // candidates (margin below the configured threshold), the ordering
+            // is a coin flip — spend the LLM call. 0.0 (default) never
+            // escalates, keeping cross-encoder results final.
+            let margin = match (scored.first(), scored.get(1)) {
+                (Some(a), Some(b)) => (a.1 - b.1) as f64,
+                _ => f64::MAX,
+            };
+            if config.rerank.escalate_margin > 0.0 && margin < config.rerank.escalate_margin {
+                let out = llm_rerank(db, config, query, candidates, limit).await;
+                crate::metrics::record_tier(
+                    crate::metrics::RetrievalTier::RerankEscalated,
+                    started.elapsed(),
+                );
+                return out;
+            }
+            let order: Vec<usize> = scored.into_iter().map(|(i, _)| i).collect();
+            crate::metrics::record_tier(
+                crate::metrics::RetrievalTier::RerankCrossEncoder,
+                started.elapsed(),
+            );
             return fuse_rerank(&candidates, &order, limit);
         }
     }
-    llm_rerank(db, config, query, candidates, limit).await
+    let out = llm_rerank(db, config, query, candidates, limit).await;
+    crate::metrics::record_tier(crate::metrics::RetrievalTier::RerankLlm, started.elapsed());
+    out
 }
 
 /// Merge the narrow (`limit`-sized) retrieval with the wider pool: narrow items

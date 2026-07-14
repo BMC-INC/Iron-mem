@@ -260,6 +260,10 @@ pub struct RankingLeversConfig {
     /// query's salient terms. 0.0 (default) = off.
     #[serde(default)]
     pub abstention_min_overlap: f64,
+    /// T0 lexical early exit: skip embedding/auxiliary recall when the top FTS
+    /// hit already contains every salient query term. false (default) = off.
+    #[serde(default)]
+    pub tier_early_exit: bool,
 }
 
 impl Default for RankingLeversConfig {
@@ -271,6 +275,7 @@ impl Default for RankingLeversConfig {
             activation_weight: 0.0,
             activation_halflife_days: default_activation_halflife_days(),
             abstention_min_overlap: 0.0,
+            tier_early_exit: false,
         }
     }
 }
@@ -380,6 +385,12 @@ pub struct RerankConfig {
     /// beyond N keeps its base order (recall-safe).
     #[serde(default = "default_cross_encoder_max_candidates")]
     pub cross_encoder_max_candidates: usize,
+    /// T2→T3 escalation threshold on the cross-encoder's top-two score margin
+    /// (raw model logits). When the margin is below this, the ordering is
+    /// ambiguous and the LLM reranker is invoked instead. 0.0 (default) never
+    /// escalates — cross-encoder results stay final.
+    #[serde(default)]
+    pub escalate_margin: f64,
 }
 
 impl Default for RerankConfig {
@@ -391,6 +402,7 @@ impl Default for RerankConfig {
             backend: default_rerank_backend(),
             cross_encoder_model: default_cross_encoder_model(),
             cross_encoder_max_candidates: default_cross_encoder_max_candidates(),
+            escalate_margin: 0.0,
         }
     }
 }

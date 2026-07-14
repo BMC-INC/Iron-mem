@@ -60,8 +60,10 @@ mod onnx {
             Ok(Self { model })
         }
 
-        /// Rank `docs` against `query`, returning document indices best-first.
-        pub fn order(&self, query: &str, docs: &[String]) -> Result<Vec<usize>> {
+        /// Rank `docs` against `query`, returning (index, score) best-first.
+        /// Scores are the model's raw relevance logits: comparable within one
+        /// call (margins), not across models.
+        pub fn scored(&self, query: &str, docs: &[String]) -> Result<Vec<(usize, f32)>> {
             let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
             let mut results = self.model.rerank(query, refs, false, None)?;
             results.sort_by(|a, b| {
@@ -69,7 +71,7 @@ mod onnx {
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            Ok(results.into_iter().map(|r| r.index).collect())
+            Ok(results.into_iter().map(|r| (r.index, r.score)).collect())
         }
     }
 }
@@ -116,14 +118,16 @@ pub fn is_ready() -> bool {
     }
 }
 
-/// Reranked order (indices into `docs`, best-first) or `None` when the
-/// cross-encoder is unavailable — the caller then keeps the LLM reranker.
-pub fn rerank_order(query: &str, docs: &[String]) -> Option<Vec<usize>> {
+/// Reranked (index, score) pairs best-first, or `None` when the cross-encoder
+/// is unavailable — the caller then keeps the LLM reranker. The scores let the
+/// dispatch tier measure its confidence margin and escalate ambiguous
+/// orderings to the LLM reranker.
+pub fn rerank_scored(query: &str, docs: &[String]) -> Option<Vec<(usize, f32)>> {
     #[cfg(feature = "local-onnx")]
     {
         let ce = RERANKER.get()?.as_ref()?;
-        match ce.order(query, docs) {
-            Ok(order) => Some(order),
+        match ce.scored(query, docs) {
+            Ok(scored) => Some(scored),
             Err(e) => {
                 tracing::warn!("cross-encoder rerank failed ({e}); falling back to LLM rerank");
                 None
@@ -139,11 +143,11 @@ pub fn rerank_order(query: &str, docs: &[String]) -> Option<Vec<usize>> {
 
 #[cfg(test)]
 mod tests {
-    /// Without `init`, no cross-encoder is loaded, so `rerank_order` returns None
-    /// and callers keep the LLM reranker. This is the safety contract the rerank
-    /// dispatch relies on.
+    /// Without `init`, no cross-encoder is loaded, so `rerank_scored` returns
+    /// None and callers keep the LLM reranker. This is the safety contract the
+    /// rerank dispatch relies on.
     #[test]
     fn uninitialized_falls_back() {
-        assert!(super::rerank_order("when did X happen", &["a fact".to_string()]).is_none());
+        assert!(super::rerank_scored("when did X happen", &["a fact".to_string()]).is_none());
     }
 }

@@ -108,7 +108,14 @@
 - **Supersession-aware ranking (item 5, off by default):** `apply_supersession_demotion` demotes candidates whose entire edge support is superseded while another candidate holds the live edge for the same (source, relation).
 - **Activation scoring (item 4, off by default):** `maturity` column on memory_meta (draft→stable→core, promoted idempotently by the dream sweep from injection/feedback counts) + `apply_activation_boost` (importance × maturity × recency half-life).
 - **Abstention (item 6, off by default):** salient-term-overlap guard drops low-affinity results so callers can answer "I don't know".
-Eval suite grew to 46 cases (chunk recall, maturity clamp/promotion/multiplier). Remaining Phase 1: the explicit T0–T3 early-exit tier restructure with tier-exit metrics (item 1) — note the cross-encoder is already the default rerank backend — and benchmark-driven tuning of the new lever weights (LoCoMo/LongMemEval A/B, which needs API keys).
+Eval suite grew to 46 cases (chunk recall, maturity clamp/promotion/multiplier).
+
+**Status update 2 (2026-07-12), tier pipeline (item 1) landed:**
+- **T0 lexical early exit** (`ranking.tier_early_exit` / `IRONMEM_TIER_EARLY_EXIT`, off by default): a single-hop query whose top FTS hit contains every salient query term skips embedding calls and auxiliary recall, fusing FTS+graph only.
+- **T2→T3 escalation** (`rerank.escalate_margin`, 0.0 = never): `reranker::rerank_scored` now exposes cross-encoder scores; when the top-two margin is below threshold the LLM reranker is invoked instead. Note: the default rerank backend is `llm` (the README documents the cross-encoder currently trailing the LLM reranker on LoCoMo), so flipping `rerank.backend = "cross_encoder"` + tuning `escalate_margin` is a benchmark decision, not a code change.
+- **Tier metrics:** `/status` now publishes `retrieval_tiers` (`t0_lexical_exit`, `full_fusion`, `rerank_cross_encoder`, `rerank_escalated`, `rerank_llm`) with count/avg/max latency — "most queries resolve without LLM calls" becomes a measured number.
+
+Remaining Phase 1: benchmark-driven tuning of all lever weights (LoCoMo/LongMemEval A/B runs, needs API keys + datasets).
 
 ### Phase 2 — Observation-log extraction (~2–3 weeks) — *raises the ceiling every retrieval gain is capped by*
 

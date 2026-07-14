@@ -98,6 +98,9 @@ pub fn router(state: AppState) -> Router {
             "IRONMEM_ABSTENTION_MIN_OVERLAP",
             state.config.ranking.abstention_min_overlap,
         ),
+        tier_early_exit: std::env::var("IRONMEM_TIER_EARLY_EXIT")
+            .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(state.config.ranking.tier_early_exit),
     };
     // Log the resolved weights so a run can be audited for which retrieval levers
     // were actually live (env override vs settings default) — no more silent config.
