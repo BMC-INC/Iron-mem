@@ -136,6 +136,13 @@ Remaining Phase 1: benchmark-driven tuning of all lever weights (LoCoMo/LongMemE
 
 **Exit criteria:** governance-on delta ≥ −0.5pp (target: positive on knowledge-update); compliance report generated end-to-end in tests; lineage answerable for any memory id.
 
+**Status (2026-07-14):** items 3–5 landed (items 1–2 are benchmark-dependent tuning, deferred with the rest of benchmark work):
+- **`ironmem compliance-report`** (`src/compliance.rs`, also `GET /compliance/report`): per-namespace ledger **chain verification that re-derives every SHA-256 hash** (tampering is detected and named by entry id), governance inventory (namespace × classification × consent with legal-hold/tombstone/expiry/retention counts), snapshot versions — emitted as Art. 12/13-mapped markdown + JSON. CLI exits non-zero on a broken chain.
+- **Memory→action lineage** (`ironmem lineage <id>` / `GET /memory/{id}/lineage`): writer identity, source, trust tier, classification/consent, parent derivation chain, full ledger trail, and every injection into an agent context (session, rank, triggering query).
+- **Per-agent access keys** (`Config.agent_keys`): bearer token → agent identity; namespace allowlists enforced on query params (middleware) and write bodies (`/remember`); writes are attributed `agent:<id>` in the ledger — writer identity cannot be spoofed under agent keys.
+- **`docs/compliance/eu-ai-act-mapping.md`**: obligation-by-obligation mapping to the mechanisms in this codebase.
+- Eval suite grew to 50 cases (compliance cluster: honest-history verification, tamper detection, write→action lineage, report generation).
+
 ### Phase 4 — Leaderboard push (~1–2 weeks, then ongoing)
 
 1. **Temporal 78.2 → 90+:** absolute-date normalization at extraction (Observer stamps resolved dates), interval reasoning ("how long between X and Y") over `event_time`, temporal chain-walks over edge validity windows for before/after questions.

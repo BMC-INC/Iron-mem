@@ -2,6 +2,7 @@ mod auto_dream;
 mod bench;
 mod ccr;
 mod code_anchor;
+mod compliance;
 mod compress;
 mod config;
 mod context;
@@ -435,6 +436,17 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Generate an auditable compliance report (ledger chain verification,
+    /// governance inventory, snapshots) mapped to EU AI Act Art. 12/13
+    ComplianceReport {
+        /// Directory for the markdown + JSON report
+        #[arg(long, default_value = "docs/compliance/reports")]
+        out: String,
+    },
+
+    /// Show the full memory→action lineage (ledger + injections) for a memory
+    Lineage { memory_id: i64 },
+
     /// Record usage feedback for a memory
     Feedback {
         memory_id: i64,
@@ -759,6 +771,8 @@ async fn async_main() -> Result<()> {
             )
             .await?
         }
+        Commands::ComplianceReport { out } => run_compliance_report(&cfg, &out).await?,
+        Commands::Lineage { memory_id } => run_lineage(&cfg, memory_id).await?,
         Commands::Feedback {
             memory_id,
             project,
@@ -925,6 +939,44 @@ async fn run_bench(cfg: &config::Config, suite: &str, opts: bench::BenchOptions)
             score.accuracy() * 100.0
         );
     }
+    Ok(())
+}
+
+async fn run_compliance_report(cfg: &config::Config, out: &str) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let report = compliance::generate(&database).await?;
+
+    std::fs::create_dir_all(out)?;
+    let stamp = report.generated_at.replace([':', '.'], "-");
+    let md_path = std::path::Path::new(out).join(format!("{stamp}-compliance.md"));
+    std::fs::write(&md_path, report.to_markdown())?;
+    let json_path = std::path::Path::new(out).join(format!("{stamp}-compliance.json"));
+    std::fs::write(&json_path, serde_json::to_string_pretty(&report)?)?;
+
+    println!(
+        "IronMem compliance: {} namespace chain(s), integrity: {}; {} inventory row(s), {} snapshot(s)",
+        report.chains.len(),
+        if report.all_chains_valid() {
+            "ALL VALID"
+        } else {
+            "FAILED"
+        },
+        report.inventory.len(),
+        report.snapshots.len()
+    );
+    println!("Report: {}", md_path.display());
+    if !report.all_chains_valid() {
+        anyhow::bail!("ledger chain verification failed — see report");
+    }
+    Ok(())
+}
+
+async fn run_lineage(cfg: &config::Config, memory_id: i64) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let lineage = compliance::memory_lineage(&database, memory_id).await?;
+    println!("{}", serde_json::to_string_pretty(&lineage)?);
     Ok(())
 }
 

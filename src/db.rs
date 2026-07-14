@@ -2625,9 +2625,9 @@ pub async fn memory_ledger_for_memory(
         .collect())
 }
 
-/// All ledger entries in a namespace, ordered by insertion (id ASC). Used by the
-/// storage conformance suite to verify hash-chain continuity across a backend.
-#[cfg(test)]
+/// All ledger entries in a namespace, ordered by insertion (id ASC). Used by
+/// the compliance report's chain verification and the storage conformance
+/// suite.
 pub async fn memory_ledger_for_namespace(
     db: &Database,
     namespace: &str,
@@ -2652,6 +2652,101 @@ pub async fn memory_ledger_for_namespace(
             entry_hash: r.get("entry_hash"),
             payload: r.get("payload"),
             created_at: r.get("created_at"),
+        })
+        .collect())
+}
+
+/// Distinct namespaces present in the ledger, insertion-ordered.
+pub async fn list_ledger_namespaces(db: &Database) -> Result<Vec<String>> {
+    let rows = sqlx::query("SELECT DISTINCT namespace FROM memory_ledger ORDER BY namespace ASC")
+        .fetch_all(&db.pool)
+        .await?;
+    Ok(rows.into_iter().map(|r| r.get("namespace")).collect())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GovernanceInventoryRow {
+    pub namespace: String,
+    pub classification: String,
+    pub consent_state: Option<String>,
+    pub total: i64,
+    pub legal_holds: i64,
+    pub tombstoned: i64,
+    pub with_expiry: i64,
+    pub with_retention_policy: i64,
+}
+
+/// Per-(namespace, classification, consent) inventory of governed memories —
+/// the counts an EU AI Act Art. 12 record-keeping section is built from.
+pub async fn governance_inventory(db: &Database) -> Result<Vec<GovernanceInventoryRow>> {
+    let rows = sqlx::query(
+        "SELECT COALESCE(namespace, 'local') AS ns,
+                COALESCE(classification, 'internal') AS cls,
+                consent_state,
+                COUNT(*) AS total,
+                SUM(CASE WHEN legal_hold <> 0 THEN 1 ELSE 0 END) AS legal_holds,
+                SUM(CASE WHEN tombstoned_at IS NOT NULL THEN 1 ELSE 0 END) AS tombstoned,
+                SUM(CASE WHEN expires_at IS NOT NULL THEN 1 ELSE 0 END) AS with_expiry,
+                SUM(CASE WHEN retention_policy_id IS NOT NULL THEN 1 ELSE 0 END)
+                    AS with_retention_policy
+         FROM memory_meta
+         GROUP BY ns, cls, consent_state
+         ORDER BY ns ASC, cls ASC",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| GovernanceInventoryRow {
+            namespace: r.get("ns"),
+            classification: r.get("cls"),
+            consent_state: r
+                .try_get::<Option<String>, _>("consent_state")
+                .ok()
+                .flatten(),
+            total: r.try_get("total").unwrap_or(0),
+            legal_holds: r.try_get("legal_holds").unwrap_or(0),
+            tombstoned: r.try_get("tombstoned").unwrap_or(0),
+            with_expiry: r.try_get("with_expiry").unwrap_or(0),
+            with_retention_policy: r.try_get("with_retention_policy").unwrap_or(0),
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InjectionEventInfo {
+    pub project: String,
+    pub session_id: Option<String>,
+    pub rank: i64,
+    pub query: Option<String>,
+    pub created_at: i64,
+}
+
+/// Every recorded injection of `memory_id` into an agent context — the
+/// memory→action lineage half of the audit trail (the ledger is the write
+/// half). Most recent first.
+pub async fn injection_events_for_memory(
+    db: &Database,
+    memory_id: i64,
+    limit: i64,
+) -> Result<Vec<InjectionEventInfo>> {
+    let rows = sqlx::query(
+        "SELECT project, session_id, rank, query, created_at
+         FROM injection_events WHERE memory_id = $1
+         ORDER BY created_at DESC, id DESC LIMIT $2",
+    )
+    .bind(memory_id)
+    .bind(limit)
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| InjectionEventInfo {
+            project: r.get("project"),
+            session_id: r.try_get::<Option<String>, _>("session_id").ok().flatten(),
+            rank: r.try_get("rank").unwrap_or(0),
+            query: r.try_get::<Option<String>, _>("query").ok().flatten(),
+            created_at: r.try_get("created_at").unwrap_or(0),
         })
         .collect())
 }

@@ -98,6 +98,7 @@ pub async fn run(cfg: &Config, out_dir: &Path) -> Result<EvalReport> {
     cases.extend(eval_entity_cluster(&db).await?);
     cases.extend(eval_chunk_cluster(&db).await?);
     cases.extend(eval_ranking_lever_cluster(&db).await?);
+    cases.extend(eval_compliance_cluster(&db).await?);
 
     let mut report = EvalReport {
         command,
@@ -1257,6 +1258,133 @@ async fn eval_ranking_lever_cluster(db: &Database) -> Result<Vec<EvalCase>> {
             db::maturity_multiplier(Some("core")),
             db::maturity_multiplier(Some("stable")),
             db::maturity_multiplier(None)
+        ),
+    ));
+
+    Ok(cases)
+}
+
+// --- compliance cluster (Phase 3) ---------------------------------------------
+// The compliance product's guarantees must hold deterministically: chain
+// verification passes on honest history, fails on tampered history, and
+// lineage answers "who wrote this and where did it act" for any memory.
+
+async fn eval_compliance_cluster(db: &Database) -> Result<Vec<EvalCase>> {
+    let mut cases = Vec::new();
+    let project = "/tmp/ironmem-eval-compliance";
+    let namespace = "evalcompliance";
+
+    let governance = || MemoryGovernance {
+        namespace: namespace.to_string(),
+        ..MemoryGovernance::explicit()
+    };
+    let first = compress::remember_with_governance(
+        db,
+        None,
+        &BruteForceStore,
+        project,
+        "project",
+        "fact",
+        "Compliance chain fact alpha",
+        Some("eval"),
+        governance(),
+    )
+    .await?;
+    compress::remember_with_governance(
+        db,
+        None,
+        &BruteForceStore,
+        project,
+        "project",
+        "fact",
+        "Compliance chain fact beta",
+        Some("eval"),
+        governance(),
+    )
+    .await?;
+
+    let verification = crate::compliance::verify_ledger_chain(db, namespace).await?;
+    cases.push(EvalCase::new(
+        "compliance_chain_verifies_honest_history",
+        verification.valid && verification.entries >= 2,
+        format!(
+            "valid={} entries={}",
+            verification.valid, verification.entries
+        ),
+    ));
+
+    // Tamper with history behind the ledger's back: verification must catch it
+    // and name the first broken entry.
+    sqlx::query("UPDATE memory_ledger SET payload = 'tampered' WHERE memory_id = $1")
+        .bind(first)
+        .execute(&db.pool)
+        .await?;
+    let verification = crate::compliance::verify_ledger_chain(db, namespace).await?;
+    cases.push(EvalCase::new(
+        "compliance_chain_detects_tampering",
+        !verification.valid && verification.first_broken_id.is_some(),
+        format!(
+            "valid={} first_broken_id={:?}",
+            verification.valid, verification.first_broken_id
+        ),
+    ));
+
+    // Lineage: writer attribution + ledger trail + injection (action) records.
+    let acted = compress::remember(
+        db,
+        None,
+        &BruteForceStore,
+        project,
+        "project",
+        "fact",
+        "Compliance lineage subject",
+        Some("eval"),
+    )
+    .await?;
+    if let Some(memory) = db::get_memory_by_id_any_namespace(db, acted).await? {
+        db::record_injection_events(
+            db,
+            project,
+            Some("eval-session"),
+            Some("lineage query"),
+            std::slice::from_ref(&memory),
+        )
+        .await?;
+    }
+    let lineage = crate::compliance::memory_lineage(db, acted).await?;
+    cases.push(EvalCase::new(
+        "compliance_lineage_traces_write_and_action",
+        lineage.writer_identity.as_deref() == Some("ironmem:remember")
+            && lineage.ledger.iter().any(|e| e.op_type == "remember")
+            && lineage
+                .injections
+                .iter()
+                .any(|i| i.session_id.as_deref() == Some("eval-session")),
+        format!(
+            "writer={:?} ledger_ops={:?} injections={}",
+            lineage.writer_identity,
+            lineage
+                .ledger
+                .iter()
+                .map(|e| &e.op_type)
+                .collect::<Vec<_>>(),
+            lineage.injections.len()
+        ),
+    ));
+
+    // Full report: chains + inventory + Art. 12 section render end-to-end.
+    let report = crate::compliance::generate(db).await?;
+    let markdown = report.to_markdown();
+    cases.push(EvalCase::new(
+        "compliance_report_generates",
+        !report.chains.is_empty()
+            && !report.inventory.is_empty()
+            && markdown.contains("Art. 12")
+            && markdown.contains("CHAIN VERIFICATION FAILED"),
+        format!(
+            "chains={} inventory_rows={} (tampered namespace must surface as failed)",
+            report.chains.len(),
+            report.inventory.len()
         ),
     ));
 

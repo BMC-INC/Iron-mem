@@ -43,6 +43,12 @@ pub struct Config {
     pub multi_hop: MultiHopConfig,
     #[serde(default)]
     pub ranking: RankingLeversConfig,
+    /// Per-agent API keys for the REST server. Empty (default) = no agent
+    /// auth (local single-user mode). Non-empty = every REST request must
+    /// present a listed bearer token; the resolved agent identity is enforced
+    /// against namespace allowlists and stamped as writer_identity on writes.
+    #[serde(default)]
+    pub agent_keys: Vec<AgentKeyConfig>,
     #[serde(default)]
     pub auto_dream: AutoDreamConfig,
     #[serde(default)]
@@ -278,6 +284,18 @@ impl Default for RankingLeversConfig {
             tier_early_exit: false,
         }
     }
+}
+
+/// One agent's API key: bearer `token` resolves to `agent_id`, which may only
+/// touch the listed `namespaces` (empty = all). Writes performed under this
+/// key carry `writer_identity = "agent:<agent_id>"` so the ledger attributes
+/// every memory to the agent that wrote it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentKeyConfig {
+    pub token: String,
+    pub agent_id: String,
+    #[serde(default)]
+    pub namespaces: Vec<String>,
 }
 
 fn default_chunk_fusion_weight() -> usize {
@@ -588,6 +606,7 @@ impl Default for Config {
             governance_router: GovernanceRouterConfig::default(),
             multi_hop: MultiHopConfig::default(),
             ranking: RankingLeversConfig::default(),
+            agent_keys: Vec::new(),
             auto_dream: AutoDreamConfig::default(),
             auto_compress: AutoCompressConfig::default(),
             scheduler: SchedulerConfig::default(),

@@ -1,7 +1,8 @@
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::{Html, Json},
+    extract::{Path, Query, Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Json, Response},
     routing::{delete, get, post},
     Router,
 };
@@ -118,7 +119,8 @@ pub fn router(state: AppState) -> Router {
         retrieval_tuning.abstention_min_overlap,
     );
     crate::retrieval::set_retrieval_tuning(retrieval_tuning);
-    Router::new()
+    let agent_keys = state.config.agent_keys.clone();
+    let router = Router::new()
         .route("/session/start", post(session_start))
         .route("/session/end", post(session_end))
         .route("/event", post(record_event))
@@ -143,6 +145,8 @@ pub fn router(state: AppState) -> Router {
         .route("/code/relink", post(code_relink))
         .route("/snapshots", get(list_snapshots).post(create_snapshot))
         .route("/snapshots/{id}/restore", post(restore_snapshot))
+        .route("/compliance/report", get(get_compliance_report))
+        .route("/memory/{id}/lineage", get(get_memory_lineage))
         .route(
             "/sync/events",
             get(export_sync_events).post(publish_sync_event),
@@ -155,7 +159,91 @@ pub fn router(state: AppState) -> Router {
         .route("/api/memories/{id}/evidence", get(api_memory_evidence))
         .route("/api/memories/{id}", delete(api_delete_memory))
         .route("/api/sessions", get(api_list_sessions))
-        .with_state(Arc::new(state))
+        .with_state(Arc::new(state));
+
+    // Per-agent access control: with agent keys configured, every request must
+    // present a listed bearer token; the resolved identity is enforced against
+    // its namespace allowlist (query param here, request bodies in handlers)
+    // and made available to handlers for writer attribution.
+    if agent_keys.is_empty() {
+        router
+    } else {
+        let keys = Arc::new(agent_keys);
+        router.route_layer(middleware::from_fn(move |request, next| {
+            let keys = keys.clone();
+            async move { require_agent_key(keys, request, next).await }
+        }))
+    }
+}
+
+/// Identity resolved from an agent API key, injected as a request extension.
+#[derive(Clone, Debug)]
+pub struct AgentIdentity {
+    pub agent_id: String,
+    /// Normalized namespace allowlist; empty = all namespaces.
+    pub namespaces: Vec<String>,
+}
+
+impl AgentIdentity {
+    pub fn allows(&self, namespace: &str) -> bool {
+        let namespace = crate::governance::normalize_namespace(namespace);
+        self.namespaces.is_empty() || self.namespaces.contains(&namespace)
+    }
+}
+
+async fn require_agent_key(
+    keys: Arc<Vec<crate::config::AgentKeyConfig>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let Some(key) = token.and_then(|t| keys.iter().find(|k| k.token == t)) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            "Missing or unknown agent key",
+        )
+            .into_response();
+    };
+    let identity = AgentIdentity {
+        agent_id: key.agent_id.clone(),
+        namespaces: key
+            .namespaces
+            .iter()
+            .map(|n| crate::governance::normalize_namespace(n))
+            .collect(),
+    };
+    // Generic guard for namespace-scoped GET endpoints (?namespace=...).
+    // Handlers that take a namespace in the body enforce the same allowlist
+    // themselves via the injected identity.
+    if let Some(ns) = request
+        .uri()
+        .query()
+        .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("namespace=")))
+    {
+        if !identity.allows(ns) {
+            tracing::warn!(
+                "agent {} denied namespace {} on {}",
+                identity.agent_id,
+                ns,
+                request.uri().path()
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "agent '{}' may not access namespace '{ns}'",
+                    identity.agent_id
+                ),
+            )
+                .into_response();
+        }
+    }
+    request.extensions_mut().insert(identity);
+    next.run(request).await
 }
 
 // POST /session/start
@@ -353,6 +441,7 @@ pub struct RememberResponse {
 
 async fn remember(
     State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
     Json(body): Json<RememberRequest>,
 ) -> Result<Json<RememberResponse>, (StatusCode, String)> {
     if body.text.trim().is_empty() {
@@ -361,25 +450,44 @@ async fn remember(
             "'text' must not be empty".to_string(),
         ));
     }
+    // Agent-keyed callers: the body namespace must be on the agent's
+    // allowlist, and the write is attributed to the agent — the caller cannot
+    // spoof writer_identity when agent keys are enforced.
+    let requested_namespace = body
+        .namespace
+        .as_deref()
+        .unwrap_or(crate::governance::DEFAULT_NAMESPACE);
+    let agent_writer = match &agent {
+        Some(axum::Extension(identity)) => {
+            if !identity.allows(requested_namespace) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "agent '{}' may not write namespace '{requested_namespace}'",
+                        identity.agent_id
+                    ),
+                ));
+            }
+            Some(format!("agent:{}", identity.agent_id))
+        }
+        None => None,
+    };
     let scope = body.scope.as_deref().unwrap_or("project");
     let kind = body.kind.as_deref().unwrap_or("preference");
     let governance = crate::governance::MemoryGovernance {
-        namespace: crate::governance::normalize_namespace(
-            body.namespace
-                .as_deref()
-                .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
-        ),
+        namespace: crate::governance::normalize_namespace(requested_namespace),
         source_type: crate::governance::parse_source_type(
             body.source_type.as_deref().unwrap_or("user_input"),
         ),
         trust_tier: crate::governance::parse_trust_tier(
             body.trust_tier.as_deref().unwrap_or("high"),
         ),
-        writer_identity: body
-            .writer_identity
-            .as_deref()
-            .map(str::to_string)
-            .or_else(|| Some("ironmem:rest".to_string())),
+        writer_identity: agent_writer.or_else(|| {
+            body.writer_identity
+                .as_deref()
+                .map(str::to_string)
+                .or_else(|| Some("ironmem:rest".to_string()))
+        }),
         source_ref: body.source_ref.clone(),
         parent_memory_id: None,
         classification: crate::governance::parse_classification(
@@ -753,6 +861,29 @@ async fn list_snapshots(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(snaps))
+}
+
+/// EU AI Act Art. 12/13 compliance report: hash-chain verification per
+/// namespace, governance inventory, snapshot versions.
+async fn get_compliance_report(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<crate::compliance::ComplianceReport>, (StatusCode, String)> {
+    let report = crate::compliance::generate(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(report))
+}
+
+/// Memory→action lineage: governance provenance + ledger trail + every
+/// injection of this memory into an agent context.
+async fn get_memory_lineage(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<Json<crate::compliance::MemoryLineage>, (StatusCode, String)> {
+    let lineage = crate::compliance::memory_lineage(&state.db, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(lineage))
 }
 
 #[derive(Deserialize)]
