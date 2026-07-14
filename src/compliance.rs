@@ -88,7 +88,14 @@ pub struct MemoryLineage {
 
 pub async fn memory_lineage(db: &Database, memory_id: i64) -> Result<MemoryLineage> {
     let memory = db::get_memory_by_id_any_namespace(db, memory_id).await?;
-    let meta = db::get_memory_meta_full(db, memory_id).await.ok();
+    // A forgotten memory is physically purged (tombstone → ledger → delete);
+    // its ledger entries are the surviving record. Don't synthesize default
+    // governance metadata for a purged row — absent fields tell the truth.
+    let meta = if memory.is_some() {
+        db::get_memory_meta_full(db, memory_id).await.ok()
+    } else {
+        None
+    };
 
     let mut parent_chain = Vec::new();
     let mut cursor = meta.as_ref().and_then(|m| m.parent_memory_id);
