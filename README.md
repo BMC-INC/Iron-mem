@@ -360,6 +360,17 @@ dataset, commit, models, embedder, and options to resume without repeating paid
 answer or judge calls. A mismatched configuration is rejected; use a new
 `--out` directory for a fresh run.
 
+Ingestion embeds conversation turns in bounded batches (32 texts per ONNX
+call) with a deterministic id-to-vector mapping that fails visibly on a
+count mismatch, instead of one embedding call per turn.
+
+For long scored runs, `scripts/run_longmemeval.sh` wraps the harness in a
+durable launcher: preflight (dataset SHA-256, clean tree, disk, battery,
+ADC), a release `local-onnx` build, and either a no-credit timed canary
+(`canary`) or a detached full run (`full --authorized`) via
+nohup + caffeinate with a durable console log, recorded PID, and a unique
+checkpointed `--out`. The full run refuses to start without `--authorized`.
+
 ---
 
 ## Install
