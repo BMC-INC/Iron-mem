@@ -372,7 +372,10 @@ durable launcher: preflight (dataset SHA-256, clean tree, disk, battery,
 ADC), a release `local-onnx` build, and either a no-credit timed canary
 (`canary`) or a detached full run (`full --authorized`) via
 nohup + caffeinate with a durable console log, recorded PID, and a unique
-checkpointed `--out`. The full run refuses to start without `--authorized`.
+checkpointed `--out`. The detached wrapper atomically writes `exit.status`
+with the process exit code and completion time; a missing status file means
+the wrapper was forcibly terminated before it could report an outcome. The
+full run refuses to start without `--authorized`.
 
 ---
 
