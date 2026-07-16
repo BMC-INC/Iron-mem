@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::governance::{
     classification_str, consent_state_str, ledger_entry_hash, memory_record_hash,
@@ -20,6 +21,16 @@ pub enum Backend {
 pub struct Database {
     pub pool: AnyPool,
     pub backend: Backend,
+}
+
+// SQLite's busy handler blocks the calling worker while another connection owns
+// the write reservation. Gate ledger writers asynchronously inside this process
+// before taking BEGIN IMMEDIATE; the database reservation still protects against
+// other processes, while this gate prevents Tokio worker-pool starvation.
+static SQLITE_LEDGER_WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn sqlite_ledger_write_lock() -> &'static tokio::sync::Mutex<()> {
+    SQLITE_LEDGER_WRITE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -52,7 +63,7 @@ pub struct Memory {
     pub created_at: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct MemoryLedgerEntry {
     pub id: i64,
     pub namespace: String,
@@ -733,6 +744,20 @@ impl Database {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_memory_ledger_memory
              ON memory_ledger(memory_id, id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS memory_ledger_epochs (
+                namespace          TEXT NOT NULL,
+                epoch              BIGINT NOT NULL,
+                start_entry_id     BIGINT NOT NULL,
+                start_entry_hash   TEXT NOT NULL UNIQUE,
+                evidence_sha256    TEXT NOT NULL,
+                prior_entry_count  BIGINT NOT NULL,
+                created_at         BIGINT NOT NULL,
+                PRIMARY KEY(namespace, epoch)
+            )",
         )
         .execute(&self.pool)
         .await?;
@@ -1723,7 +1748,7 @@ pub async fn search_memories_in_namespace(
                AND COALESCE(mm.namespace, 'local') = $3
                AND mm.tombstoned_at IS NULL
                AND (mm.expires_at IS NULL OR mm.expires_at > $4)
-             ORDER BY memories.created_at DESC LIMIT $5"
+             ORDER BY bm25(memories), memories.created_at DESC, memories.rowid DESC LIMIT $5"
         }
         Backend::Postgres => {
             "SELECT m.id, m.project, m.session_id, m.summary, m.tags, m.created_at
@@ -1734,7 +1759,10 @@ pub async fn search_memories_in_namespace(
                AND COALESCE(mm.namespace, 'local') = $3
                AND mm.tombstoned_at IS NULL
                AND (mm.expires_at IS NULL OR mm.expires_at > $4)
-             ORDER BY m.created_at DESC LIMIT $5"
+             ORDER BY ts_rank(m.search_vector, plainto_tsquery($1)) DESC,
+                      m.created_at DESC,
+                      m.id DESC
+             LIMIT $5"
         }
     };
 
@@ -2561,12 +2589,101 @@ pub async fn append_memory_ledger(
     actor: Option<&str>,
     payload: &str,
 ) -> Result<String> {
+    append_memory_ledger_with_expected_head(db, namespace, memory_id, op_type, actor, payload, None)
+        .await
+}
+
+async fn append_memory_ledger_with_expected_head(
+    db: &Database,
+    namespace: &str,
+    memory_id: Option<i64>,
+    op_type: &str,
+    actor: Option<&str>,
+    payload: &str,
+    expected_prev_hash: Option<&str>,
+) -> Result<String> {
     let namespace = normalize_namespace(namespace);
-    let prev_hash = latest_ledger_hash(db, &namespace).await?;
+    match db.backend {
+        Backend::Sqlite => {
+            // SQLite has no row-level SELECT FOR UPDATE. BEGIN IMMEDIATE obtains
+            // the write reservation before reading the head, so another process
+            // cannot read the same head and append a sibling branch.
+            let _write_guard = sqlite_ledger_write_lock().lock().await;
+            let mut conn = db.pool.acquire().await?;
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+            match append_memory_ledger_on_connection(
+                &mut conn,
+                &namespace,
+                memory_id,
+                op_type,
+                actor,
+                payload,
+                expected_prev_hash,
+            )
+            .await
+            {
+                Ok(entry_hash) => {
+                    sqlx::query("COMMIT").execute(&mut *conn).await?;
+                    Ok(entry_hash)
+                }
+                Err(error) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(error)
+                }
+            }
+        }
+        Backend::Postgres => {
+            let mut tx = db.pool.begin().await?;
+            // Serialize only this namespace. hashtextextended provides a stable
+            // 64-bit advisory-lock key without blocking unrelated tenants.
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(&namespace)
+                .execute(&mut *tx)
+                .await?;
+            let entry_hash = append_memory_ledger_on_connection(
+                &mut tx,
+                &namespace,
+                memory_id,
+                op_type,
+                actor,
+                payload,
+                expected_prev_hash,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(entry_hash)
+        }
+    }
+}
+
+async fn append_memory_ledger_on_connection(
+    conn: &mut sqlx::AnyConnection,
+    namespace: &str,
+    memory_id: Option<i64>,
+    op_type: &str,
+    actor: Option<&str>,
+    payload: &str,
+    expected_prev_hash: Option<&str>,
+) -> Result<String> {
+    let row = sqlx::query(
+        "SELECT entry_hash FROM memory_ledger
+         WHERE namespace = $1
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(namespace)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let prev_hash = row.and_then(|r| r.try_get::<String, _>("entry_hash").ok());
+    if let Some(expected) = expected_prev_hash {
+        anyhow::ensure!(
+            prev_hash.as_deref() == Some(expected),
+            "ledger head changed while migration evidence was being prepared"
+        );
+    }
     let now = Utc::now().timestamp();
     let entry_hash = ledger_entry_hash(
         prev_hash.as_deref(),
-        &namespace,
+        namespace,
         memory_id,
         op_type,
         actor,
@@ -2577,7 +2694,7 @@ pub async fn append_memory_ledger(
         "INSERT INTO memory_ledger(namespace, memory_id, op_type, actor, prev_hash, entry_hash, payload, created_at)
          VALUES($1, $2, $3, $4, $5, $6, $7, $8)",
     )
-    .bind(&namespace)
+    .bind(namespace)
     .bind(memory_id)
     .bind(op_type)
     .bind(actor)
@@ -2585,9 +2702,167 @@ pub async fn append_memory_ledger(
     .bind(&entry_hash)
     .bind(payload)
     .bind(now)
-    .execute(&db.pool)
+    .execute(&mut *conn)
     .await?;
     Ok(entry_hash)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryLedgerEpoch {
+    pub namespace: String,
+    pub epoch: i64,
+    pub start_entry_id: i64,
+    pub start_entry_hash: String,
+    pub evidence_sha256: String,
+    pub prior_entry_count: i64,
+    pub created_at: i64,
+}
+
+/// Atomically append the forward-only migration genesis and register its epoch.
+/// Either both records commit or neither does.
+pub async fn append_memory_ledger_migration(
+    db: &Database,
+    namespace: &str,
+    actor: &str,
+    payload: &str,
+    expected_prev_hash: &str,
+    evidence_sha256: &str,
+    prior_entry_count: i64,
+) -> Result<MemoryLedgerEpoch> {
+    let namespace = normalize_namespace(namespace);
+    match db.backend {
+        Backend::Sqlite => {
+            let _write_guard = sqlite_ledger_write_lock().lock().await;
+            let mut conn = db.pool.acquire().await?;
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+            let result = async {
+                let entry_hash = append_memory_ledger_on_connection(
+                    &mut conn,
+                    &namespace,
+                    None,
+                    "migration_genesis",
+                    Some(actor),
+                    payload,
+                    Some(expected_prev_hash),
+                )
+                .await?;
+                record_memory_ledger_epoch_on_connection(
+                    &mut conn,
+                    &namespace,
+                    &entry_hash,
+                    evidence_sha256,
+                    prior_entry_count,
+                )
+                .await
+            }
+            .await;
+            match result {
+                Ok(epoch) => {
+                    sqlx::query("COMMIT").execute(&mut *conn).await?;
+                    Ok(epoch)
+                }
+                Err(error) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(error)
+                }
+            }
+        }
+        Backend::Postgres => {
+            let mut tx = db.pool.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(&namespace)
+                .execute(&mut *tx)
+                .await?;
+            let entry_hash = append_memory_ledger_on_connection(
+                &mut tx,
+                &namespace,
+                None,
+                "migration_genesis",
+                Some(actor),
+                payload,
+                Some(expected_prev_hash),
+            )
+            .await?;
+            let epoch = record_memory_ledger_epoch_on_connection(
+                &mut tx,
+                &namespace,
+                &entry_hash,
+                evidence_sha256,
+                prior_entry_count,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(epoch)
+        }
+    }
+}
+
+async fn record_memory_ledger_epoch_on_connection(
+    conn: &mut sqlx::AnyConnection,
+    namespace: &str,
+    start_entry_hash: &str,
+    evidence_sha256: &str,
+    prior_entry_count: i64,
+) -> Result<MemoryLedgerEpoch> {
+    let row = sqlx::query("SELECT id FROM memory_ledger WHERE entry_hash = $1")
+        .bind(start_entry_hash)
+        .fetch_one(&mut *conn)
+        .await?;
+    let start_entry_id: i64 = row.get("id");
+    let row = sqlx::query(
+        "SELECT COALESCE(MAX(epoch), 0) + 1 AS next_epoch
+         FROM memory_ledger_epochs WHERE namespace = $1",
+    )
+    .bind(namespace)
+    .fetch_one(&mut *conn)
+    .await?;
+    let epoch: i64 = row.get("next_epoch");
+    let created_at = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO memory_ledger_epochs
+         (namespace,epoch,start_entry_id,start_entry_hash,evidence_sha256,prior_entry_count,created_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7)",
+    )
+    .bind(namespace)
+    .bind(epoch)
+    .bind(start_entry_id)
+    .bind(start_entry_hash)
+    .bind(evidence_sha256)
+    .bind(prior_entry_count)
+    .bind(created_at)
+    .execute(&mut *conn)
+    .await?;
+    Ok(MemoryLedgerEpoch {
+        namespace: namespace.to_string(),
+        epoch,
+        start_entry_id,
+        start_entry_hash: start_entry_hash.to_string(),
+        evidence_sha256: evidence_sha256.to_string(),
+        prior_entry_count,
+        created_at,
+    })
+}
+
+pub async fn latest_memory_ledger_epoch(
+    db: &Database,
+    namespace: &str,
+) -> Result<Option<MemoryLedgerEpoch>> {
+    let row = sqlx::query(
+        "SELECT namespace,epoch,start_entry_id,start_entry_hash,evidence_sha256,prior_entry_count,created_at
+         FROM memory_ledger_epochs WHERE namespace = $1 ORDER BY epoch DESC LIMIT 1",
+    )
+    .bind(normalize_namespace(namespace))
+    .fetch_optional(&db.pool)
+    .await?;
+    Ok(row.map(|r| MemoryLedgerEpoch {
+        namespace: r.get("namespace"),
+        epoch: r.get("epoch"),
+        start_entry_id: r.get("start_entry_id"),
+        start_entry_hash: r.get("start_entry_hash"),
+        evidence_sha256: r.get("evidence_sha256"),
+        prior_entry_count: r.get("prior_entry_count"),
+        created_at: r.get("created_at"),
+    }))
 }
 
 pub async fn latest_ledger_hash(db: &Database, namespace: &str) -> Result<Option<String>> {
@@ -5501,6 +5776,38 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: FTS candidates used to be ordered only by second-resolution
+    /// creation time. Equal timestamps made a weak stopword-only match beat a
+    /// direct fact depending on SQLite's platform-specific row order.
+    #[tokio::test]
+    async fn search_memories_ranks_relevance_before_deterministic_recency() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let s = create_session(&db, "/p").await?;
+        let relevant = insert_memory(
+            &db,
+            "/p",
+            &s,
+            "The billing service depends on the auth library",
+            Some("t"),
+        )
+        .await?;
+        insert_memory(
+            &db,
+            "/p",
+            &s,
+            "The docs site build was migrated to CI",
+            Some("t"),
+        )
+        .await?;
+
+        let hits =
+            search_memories(&db, "/p", "Which service depends on the auth library?", 1).await?;
+        assert_eq!(hits.first().map(|m| m.id), Some(relevant), "got {hits:?}");
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
     async fn test_db() -> Result<(Database, String)> {
         let db_path =
             std::env::temp_dir().join(format!("ironmem-test-{}.db", uuid::Uuid::new_v4()));
@@ -6542,6 +6849,59 @@ mod tests {
         let ledger = memory_ledger_for_memory(&db, id).await?;
         assert!(ledger.iter().any(|e| e.op_type == "remember"));
         assert!(ledger.iter().any(|e| e.op_type == "forget"));
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    /// Regression for the production fork first observed at ledger entry 11245.
+    /// Concurrent writers must all succeed and every entry must reference the
+    /// immediately preceding entry; reading the head and inserting separately
+    /// allows multiple children to select the same predecessor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_ledger_appends_remain_linear() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let writers = 32;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(writers));
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for memory_id in 1..=writers as i64 {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                append_memory_ledger(
+                    &db,
+                    "concurrent-test",
+                    Some(memory_id),
+                    "remember",
+                    Some("test"),
+                    &format!(r#"{{"memory_id":{memory_id}}}"#),
+                )
+                .await
+            });
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(result) = tasks.join_next().await {
+                result??;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("concurrent ledger appends timed out"))??;
+
+        let entries = memory_ledger_for_namespace(&db, "concurrent-test").await?;
+        assert_eq!(entries.len(), writers);
+        let mut expected_prev = None;
+        for entry in entries {
+            assert_eq!(
+                entry.prev_hash, expected_prev,
+                "ledger fork detected at entry {}",
+                entry.id
+            );
+            expected_prev = Some(entry.entry_hash);
+        }
 
         let _ = std::fs::remove_file(path);
         Ok(())
