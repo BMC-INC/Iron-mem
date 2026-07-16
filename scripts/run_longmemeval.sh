@@ -96,6 +96,8 @@ echo "== launching full 500-question run =="
 echo "out: $OUT (checkpoints preserved here; identical command resumes)"
 launchctl submit -l "$LAUNCH_LABEL" -o "$LOG" -e "$LOG" -- \
   "$SCRIPT_PATH" __record-exit "$STATUSFILE" \
+  /usr/bin/env "PATH=$PATH" "HOME=$HOME" \
+  "CLOUDSDK_CONFIG=${CLOUDSDK_CONFIG:-$HOME/.config/gcloud}" \
   /usr/bin/caffeinate -i -s "$PWD/$BIN" bench longmemeval \
   --data "$PWD/$DATA" --out "$OUT_ABS"
 echo "$LAUNCH_LABEL" > "$LABELFILE"
