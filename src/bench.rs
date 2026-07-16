@@ -529,18 +529,17 @@ async fn run_question(
     })
 }
 
-/// Bounded batch size for turn embedding during ingestion. Keeps ONNX peak
-/// memory flat while amortizing per-call overhead across turns.
-const INGEST_EMBED_BATCH: usize = 32;
-
 /// Turn-level ingestion: each turn becomes one memory stamped with its
 /// session's date. This exercises the real write path (FTS, meta, event time)
 /// without LLM extraction cost; LLM-extraction ingest arrives with the Phase 2
 /// observer and will be a second `--ingest` mode.
 ///
-/// Turns are inserted serially (ordering and event-time stamping unchanged),
-/// then embedded in bounded batches: turn order is preserved within and across
-/// batches, so vector N always belongs to pending memory ID N.
+/// Turns embed one at a time on purpose. Measured on the 5-question canary
+/// (2026-07-16, CPU ONNX bge-small): serial 32s/q, naive batch-32 79s/q,
+/// length-sorted batch-32 35s/q — ONNX pads each batch to its longest text,
+/// so batching never beat serial here. Embedding failures are fatal rather
+/// than silently skipped: a partially-embedded store degrades retrieval
+/// scores without any visible error.
 async fn ingest_direct(
     db: &Database,
     embedder: Option<&dyn Embedder>,
@@ -548,7 +547,6 @@ async fn ingest_direct(
     project: &str,
     question: &LmeQuestion,
 ) -> Result<()> {
-    let mut pending: Vec<(i64, String)> = Vec::new();
     for (i, session) in question.haystack_sessions.iter().enumerate() {
         let date = question.haystack_dates.get(i).cloned().unwrap_or_default();
         let session_id = db::create_session(db, project).await?;
@@ -564,27 +562,15 @@ async fn ingest_direct(
                     let _ = db::set_memory_event_time(db, memory_id, event_date).await;
                 }
             }
-            if embedder.is_some() {
-                pending.push((memory_id, text));
-            }
-        }
-    }
-    if let Some(emb) = embedder {
-        for chunk in pending.chunks(INGEST_EMBED_BATCH) {
-            let texts: Vec<String> = chunk.iter().map(|(_, text)| text.clone()).collect();
-            let vecs = emb
-                .embed(&texts)
-                .await
-                .with_context(|| format!("batch-embedding {} ingested turns", texts.len()))?;
-            if vecs.len() != chunk.len() {
-                bail!(
-                    "embedder returned {} vectors for {} texts during ingestion",
-                    vecs.len(),
-                    chunk.len()
-                );
-            }
-            for ((memory_id, _), vec) in chunk.iter().zip(vecs.iter()) {
-                let _ = store.upsert(db, *memory_id, emb.id(), emb.dim(), vec).await;
+            if let Some(emb) = embedder {
+                let mut vecs = emb
+                    .embed(&[text])
+                    .await
+                    .with_context(|| format!("embedding ingested turn (memory {memory_id})"))?;
+                let Some(vec) = vecs.pop() else {
+                    bail!("embedder returned no vector for ingested turn (memory {memory_id})");
+                };
+                let _ = store.upsert(db, memory_id, emb.id(), emb.dim(), &vec).await;
             }
         }
     }
