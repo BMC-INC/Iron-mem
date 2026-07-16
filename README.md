@@ -354,6 +354,12 @@ ironmem bench longmemeval --data longmemeval_s.json --dry-run      # pipeline sm
 
 Every report records the answer model, judge model, embedder, and retrieval depth so runs are comparable — scores are only published next to a same-model full-context baseline. Deterministic retrieval-quality regression checks (42 cases across multi-hop, temporal, open-domain, knowledge-update, abstention, governance-parity, entity, and chunk clusters) run via `ironmem eval` and gate CI on every change.
 
+LongMemEval writes each completed question to an atomic checkpoint inside the
+`--out` directory before advancing. Restart the same command with the same
+dataset, commit, models, embedder, and options to resume without repeating paid
+answer or judge calls. A mismatched configuration is rejected; use a new
+`--out` directory for a fresh run.
+
 ---
 
 ## Install

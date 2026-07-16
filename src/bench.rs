@@ -18,7 +18,9 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
@@ -89,7 +91,7 @@ pub struct BenchOptions {
     pub dry_run: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionResult {
     pub question_id: String,
     pub ability: String,
@@ -99,6 +101,109 @@ pub struct QuestionResult {
     pub correct: bool,
     pub retrieved: usize,
     pub answer_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CheckpointIdentity {
+    schema: u32,
+    dataset_sha256: String,
+    commit: String,
+    answer_model: String,
+    judge_model: String,
+    embedder: String,
+    retrieve_k: usize,
+    limit: Option<usize>,
+    full_context: bool,
+    context_chars: usize,
+    dry_run: bool,
+}
+
+fn checkpoint_file(checkpoint_dir: &Path, question_id: &str) -> PathBuf {
+    let digest = Sha256::digest(question_id.as_bytes());
+    checkpoint_dir.join(format!("{digest:x}.json"))
+}
+
+/// Persist one paid question result independently. The temporary file and
+/// rename keep readers from observing a partial JSON document after a crash.
+fn persist_checkpoint_result(checkpoint_dir: &Path, result: &QuestionResult) -> Result<()> {
+    std::fs::create_dir_all(checkpoint_dir).with_context(|| {
+        format!(
+            "creating LongMemEval checkpoint directory {}",
+            checkpoint_dir.display()
+        )
+    })?;
+    let destination = checkpoint_file(checkpoint_dir, &result.question_id);
+    let temporary = checkpoint_dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let bytes = serde_json::to_vec(result)?;
+    let mut file = std::fs::File::create(&temporary)
+        .with_context(|| format!("creating checkpoint {}", temporary.display()))?;
+    file.write_all(&bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, &destination)
+        .with_context(|| format!("committing question checkpoint {}", destination.display()))?;
+    // Directory syncing is supported on Unix and makes the rename durable.
+    // Other platforms still retain the atomic rename guarantee.
+    if let Ok(directory) = std::fs::File::open(checkpoint_dir) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+fn load_checkpoint_results(checkpoint_dir: &Path) -> Result<Vec<QuestionResult>> {
+    if !checkpoint_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(checkpoint_dir)
+        .with_context(|| format!("reading checkpoint directory {}", checkpoint_dir.display()))?
+    {
+        let path = entry?.path();
+        if path.file_name().and_then(|value| value.to_str()) != Some("manifest.json")
+            && path.extension().and_then(|value| value.to_str()) == Some("json")
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("reading checkpoint {}", path.display()))?;
+            serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing checkpoint {}", path.display()))
+        })
+        .collect()
+}
+
+fn prepare_checkpoint_dir(checkpoint_dir: &Path, identity: &CheckpointIdentity) -> Result<()> {
+    std::fs::create_dir_all(checkpoint_dir)?;
+    let manifest = checkpoint_dir.join("manifest.json");
+    if manifest.exists() {
+        let existing: CheckpointIdentity = serde_json::from_slice(&std::fs::read(&manifest)?)
+            .with_context(|| format!("parsing checkpoint manifest {}", manifest.display()))?;
+        if existing != *identity {
+            bail!(
+                "checkpoint identity mismatch in {}; use the original benchmark configuration or a new --out directory",
+                manifest.display()
+            );
+        }
+        return Ok(());
+    }
+    let temporary = checkpoint_dir.join(format!(".manifest-{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = std::fs::File::create(&temporary)?;
+    file.write_all(&serde_json::to_vec_pretty(identity)?)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, &manifest)?;
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("hashing benchmark dataset {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -223,8 +328,52 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
         mode.push_str(" [dry-run: unscored]");
     }
 
+    let checkpoint_dir = opts.out_dir.join("longmemeval-checkpoint");
+    let checkpoint_identity = CheckpointIdentity {
+        schema: 1,
+        dataset_sha256: sha256_file(&opts.data)?,
+        commit: git_commit(),
+        answer_model: answer_model.clone(),
+        judge_model: judge_model.clone(),
+        embedder: embedder_desc.clone(),
+        retrieve_k: opts.retrieve_k,
+        limit: opts.limit,
+        full_context: opts.full_context,
+        context_chars: opts.context_chars,
+        dry_run: opts.dry_run,
+    };
+    prepare_checkpoint_dir(&checkpoint_dir, &checkpoint_identity)?;
+    let resumed: HashMap<String, QuestionResult> = load_checkpoint_results(&checkpoint_dir)?
+        .into_iter()
+        .map(|result| (result.question_id.clone(), result))
+        .collect();
+    if !resumed.is_empty() {
+        tracing::info!(
+            "resuming LongMemEval from {} durable question checkpoints in {}",
+            resumed.len(),
+            checkpoint_dir.display()
+        );
+    }
+    tracing::info!(
+        "LongMemEval lifecycle pid={} parent_pid={} checkpoint_dir={}",
+        std::process::id(),
+        parent_process_id(),
+        checkpoint_dir.display()
+    );
+
     let mut results: Vec<QuestionResult> = Vec::with_capacity(questions.len());
     for (idx, question) in questions.iter().enumerate() {
+        if let Some(result) = resumed.get(&question.question_id) {
+            tracing::info!(
+                "bench {}/{} {} [{}] -> resumed",
+                idx + 1,
+                questions.len(),
+                result.question_id,
+                result.ability
+            );
+            results.push(result.clone());
+            continue;
+        }
         let result = run_question(
             cfg,
             &database,
@@ -236,23 +385,13 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
             &judge_model,
         )
         .await;
-        match result {
-            Ok(r) => {
-                tracing::info!(
-                    "bench {}/{} {} [{}] -> {}",
-                    idx + 1,
-                    questions.len(),
-                    r.question_id,
-                    r.ability,
-                    if r.correct { "correct" } else { "incorrect" }
-                );
-                results.push(r);
-            }
+        let result = match result {
+            Ok(r) => r,
             Err(e) => {
                 // A failed question is scored as incorrect rather than
                 // aborting a long run; the error is preserved in the record.
                 tracing::warn!("bench question {} failed: {e:#}", question.question_id);
-                results.push(QuestionResult {
+                QuestionResult {
                     question_id: question.question_id.clone(),
                     ability: question.ability().to_string(),
                     question: question.question.clone(),
@@ -261,9 +400,23 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
                     correct: false,
                     retrieved: 0,
                     answer_ms: 0,
-                });
+                }
             }
-        }
+        };
+        persist_checkpoint_result(&checkpoint_dir, &result)?;
+        tracing::info!(
+            "bench {}/{} {} [{}] -> {} (checkpointed)",
+            idx + 1,
+            questions.len(),
+            result.question_id,
+            result.ability,
+            if result.correct {
+                "correct"
+            } else {
+                "incorrect"
+            }
+        );
+        results.push(result);
     }
 
     let mut per_ability: BTreeMap<String, AbilityScore> = BTreeMap::new();
@@ -501,6 +654,17 @@ fn git_commit() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn parent_process_id() -> u32 {
+    std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,5 +758,79 @@ mod tests {
         assert!(ctx.contains("cello lessons"));
         let tiny = full_context(&questions[0], 20);
         assert!(tiny.len() <= 20);
+    }
+
+    #[test]
+    fn checkpoint_round_trip_survives_an_interrupted_run() {
+        let root =
+            std::env::temp_dir().join(format!("ironmem-checkpoint-test-{}", uuid::Uuid::new_v4()));
+        let result = QuestionResult {
+            question_id: "q1".to_string(),
+            ability: "information-extraction".to_string(),
+            question: "What instrument?".to_string(),
+            gold: "cello".to_string(),
+            hypothesis: "cello".to_string(),
+            correct: true,
+            retrieved: 3,
+            answer_ms: 42,
+        };
+
+        persist_checkpoint_result(&root, &result).unwrap();
+        let resumed = load_checkpoint_results(&root).unwrap();
+
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].question_id, "q1");
+        assert!(resumed[0].correct);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rewriting_a_question_checkpoint_is_idempotent() {
+        let root =
+            std::env::temp_dir().join(format!("ironmem-checkpoint-test-{}", uuid::Uuid::new_v4()));
+        let result = QuestionResult {
+            question_id: "q1".to_string(),
+            ability: "abstention".to_string(),
+            question: "Unknown?".to_string(),
+            gold: "unanswerable".to_string(),
+            hypothesis: "I don't know".to_string(),
+            correct: true,
+            retrieved: 0,
+            answer_ms: 7,
+        };
+
+        persist_checkpoint_result(&root, &result).unwrap();
+        persist_checkpoint_result(&root, &result).unwrap();
+        let resumed = load_checkpoint_results(&root).unwrap();
+
+        assert_eq!(resumed.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_rejects_a_different_run_identity() {
+        let root =
+            std::env::temp_dir().join(format!("ironmem-checkpoint-test-{}", uuid::Uuid::new_v4()));
+        let first = CheckpointIdentity {
+            schema: 1,
+            dataset_sha256: "dataset-a".to_string(),
+            commit: "abc1234".to_string(),
+            answer_model: "answerer".to_string(),
+            judge_model: "judge".to_string(),
+            embedder: "embedder".to_string(),
+            retrieve_k: 10,
+            limit: Some(5),
+            full_context: false,
+            context_chars: 400_000,
+            dry_run: false,
+        };
+        let mut changed = first.clone();
+        changed.judge_model = "different-judge".to_string();
+
+        prepare_checkpoint_dir(&root, &first).unwrap();
+        let error = prepare_checkpoint_dir(&root, &changed).unwrap_err();
+
+        assert!(error.to_string().contains("checkpoint identity mismatch"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
