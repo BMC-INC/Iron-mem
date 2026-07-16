@@ -445,6 +445,22 @@ enum Commands {
         out: String,
     },
 
+    /// Export historical ledger evidence and optionally begin a repaired epoch
+    LedgerMigrate {
+        /// Governance namespace to export and migrate
+        #[arg(long, default_value = "local")]
+        namespace: String,
+        /// Directory for the deterministic evidence bundle
+        #[arg(long, default_value = "docs/compliance/ledger-migrations")]
+        out: String,
+        /// Append the migration genesis and epoch record after exporting evidence
+        #[arg(long)]
+        apply: bool,
+        /// Actor recorded on the migration genesis receipt
+        #[arg(long, default_value = "ironmem:ledger-migrate")]
+        actor: String,
+    },
+
     /// Show the full memory→action lineage (ledger + injections) for a memory
     Lineage { memory_id: i64 },
 
@@ -777,6 +793,12 @@ async fn async_main() -> Result<()> {
             .await?
         }
         Commands::ComplianceReport { out } => run_compliance_report(&cfg, &out).await?,
+        Commands::LedgerMigrate {
+            namespace,
+            out,
+            apply,
+            actor,
+        } => run_ledger_migrate(&cfg, &namespace, &out, apply, &actor).await?,
         Commands::Lineage { memory_id } => run_lineage(&cfg, memory_id).await?,
         Commands::Feedback {
             memory_id,
@@ -973,6 +995,62 @@ async fn run_compliance_report(cfg: &config::Config, out: &str) -> Result<()> {
     println!("Report: {}", md_path.display());
     if !report.all_chains_valid() {
         anyhow::bail!("ledger chain verification failed — see report");
+    }
+    Ok(())
+}
+
+async fn run_ledger_migrate(
+    cfg: &config::Config,
+    namespace: &str,
+    out: &str,
+    apply: bool,
+    actor: &str,
+) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let evidence = compliance::build_ledger_evidence(&database, namespace).await?;
+    anyhow::ensure!(
+        !evidence.evidence.entries.is_empty(),
+        "namespace '{namespace}' has no ledger entries"
+    );
+    std::fs::create_dir_all(out)?;
+    let safe_namespace: String = namespace
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let evidence_path = std::path::Path::new(out).join(format!(
+        "ledger-{}-{}.json",
+        safe_namespace,
+        &evidence.evidence_sha256[..16]
+    ));
+    std::fs::write(&evidence_path, serde_json::to_vec_pretty(&evidence)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&evidence_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    println!(
+        "Ledger evidence: namespace={} entries={} forks={} sha256={}",
+        evidence.evidence.namespace,
+        evidence.evidence.entries.len(),
+        evidence.evidence.forks.len(),
+        evidence.evidence_sha256
+    );
+    println!("Evidence: {}", evidence_path.display());
+    if apply {
+        let migration = compliance::apply_ledger_migration(&database, &evidence, actor).await?;
+        println!(
+            "Migration applied: epoch={} start_entry_id={} evidence_sha256={}",
+            migration.epoch.epoch, migration.epoch.start_entry_id, migration.evidence_sha256
+        );
+    } else {
+        println!("Dry run only; pass --apply to append the migration genesis receipt.");
     }
     Ok(())
 }

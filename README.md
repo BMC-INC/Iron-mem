@@ -429,6 +429,7 @@ ironmem sync publish --node ci --op error_solution --payload '{"memory_id":1}' #
 ironmem eval                # Run deterministic memory-quality evals into docs/evals
 ironmem bench longmemeval --data longmemeval_s.json # LongMemEval harness (--full-context baseline, --dry-run keyless smoke)
 ironmem compliance-report   # EU AI Act Art. 12/13 report: ledger chain verification, governance inventory, snapshots
+ironmem ledger-migrate      # Export deterministic fork evidence; add --apply to begin a repaired forward-only epoch
 ironmem lineage <memory-id> # Memory→action lineage: writer, ledger trail, every injection into an agent context
 ironmem compress <id>       # Manually compress a session
 ironmem sweep --compress-idle 30m --min-observations 50 --dry-run # Preview auto-compression
@@ -806,6 +807,15 @@ record-keeping (Art. 12) and transparency (Art. 13) obligations — see
   consent with legal-hold/tombstone/expiry/retention counts) and snapshot
   versions, as Art. 12/13-mapped markdown + JSON. Exits non-zero on a broken
   chain, so it can gate a deploy.
+- **`ironmem ledger-migrate --namespace <name> --out <dir>`** exports the full
+  immutable ledger plus its fork map as deterministic JSON and prints the
+  SHA-256 commitment. It is export-only by default. `--apply` atomically appends
+  a `migration_genesis` receipt and records a new verification epoch; it never
+  edits or deletes historical entries. SQLite appends use `BEGIN IMMEDIATE`,
+  while PostgreSQL uses a namespace-scoped transaction advisory lock, preventing
+  concurrent processes from selecting the same predecessor. Evidence files are
+  written owner-only on Unix; retain them as audit records because a namespace
+  may be migrated only once.
 - **`ironmem lineage <id>`** (also `GET /memory/{id}/lineage`) answers "who
   wrote this, from what, and every agent context it influenced": writer
   identity, trust tier, consent, parent derivation chain, full ledger trail,

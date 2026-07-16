@@ -889,9 +889,12 @@ mod conformance {
 
     /// Stands in for an external vector service (Qdrant/Mem0). In a real adapter
     /// these calls become network calls; the trait surface above does not change.
+    type InProcessVectorRow = (i64, String, String, Vec<f32>);
+
     #[derive(Default, Clone)]
     struct InProcessVectorIndex {
-        rows: Arc<Mutex<Vec<(i64, String, String, Vec<f32>)>>>, // (id, project, model, vector)
+        // (id, project, model, vector)
+        rows: Arc<Mutex<Vec<InProcessVectorRow>>>,
     }
     impl InProcessVectorIndex {
         fn insert(&self, id: i64, project: &str, emb: &Embedding) {

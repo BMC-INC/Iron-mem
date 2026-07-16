@@ -12,6 +12,8 @@ Generate the evidence for everything below with one command:
 
 ```bash
 ironmem compliance-report            # markdown + JSON under docs/compliance/reports/
+ironmem ledger-migrate --namespace local --out <evidence-dir>  # export only
+ironmem ledger-migrate --namespace local --out <evidence-dir> --apply
 curl :37778/compliance/report        # same report as JSON
 ironmem lineage <memory_id>          # per-memory trail
 ```
@@ -22,6 +24,7 @@ ironmem lineage <memory_id>          # per-memory trail
 |---|---|---|
 | Automatic recording of events over the system's lifetime | Every governed memory operation (write, governance update, forget) appends a ledger entry with actor, operation type, payload, and timestamp — automatically, in the same code path as the operation itself | `memory_ledger` table; `db::append_memory_ledger` called from `db::apply_memory_governance` / `db::governed_delete_memory` |
 | Records must support traceability of the system's functioning | Ledger entries are SHA-256 hash-chained per namespace (`prev_hash` → `entry_hash`); the compliance report re-derives every hash, so any edit, deletion, or reordering of history is detected | `governance::ledger_entry_hash`; `compliance::verify_ledger_chain` |
+| Historical concurrency evidence and forward repair | `ledger-migrate` exports every original entry and an explicit fork map, commits the deterministic bundle by SHA-256, then optionally starts a new append-only epoch without rewriting prior history | `compliance::build_ledger_evidence`; `db::append_memory_ledger_migration`; `memory_ledger_epochs` |
 | Logging of periods of use / situations that may result in risk | Every injection of a memory into an agent context is recorded with project, session, rank, and the triggering query — the "memory → action" half of traceability | `injection_events` table; `db::record_injection_events`; surfaced per-memory via `compliance::memory_lineage` |
 | Input data traceability | Every memory carries writer identity, source type, source reference, and (for derived memories) a parent chain back to its origin; verbatim originals are content-addressed and reversible in the CCR blob store | `memory_meta` governance columns; `src/ccr/` |
 | State reconstruction | Versioned brain snapshots record memory/edge counts and a payload hash at a point in time and are restorable | `brain_snapshots`; `ironmem snapshot` / `/snapshots` |
