@@ -6,7 +6,7 @@
 #
 # Implements the handoff run contract (LONGMEMEVAL_HANDOFF_2026-07-15.md):
 # release binary, one worker, unique --out with preserved checkpoints, launch
-# outside any managed PTY via nohup with a durable log and recorded PID/exit
+# outside any managed PTY via launchd with a durable log and recorded PID/exit
 # status. The paid run refuses to start without --authorized.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -85,19 +85,26 @@ if [[ "$MODE" == "canary" ]]; then
 fi
 
 OUT="docs/evals/longmemeval-full-$STAMP"
-LOG="$OUT/console.log"
-PIDFILE="$OUT/run.pid"
-STATUSFILE="$OUT/exit.status"
 mkdir -p "$OUT"
+OUT_ABS="$PWD/$OUT"
+LOG="$OUT_ABS/console.log"
+PIDFILE="$OUT_ABS/run.pid"
+STATUSFILE="$OUT_ABS/exit.status"
+LABELFILE="$OUT_ABS/launchd.label"
+LAUNCH_LABEL="com.execlayer.ironmem.longmemeval.$STAMP"
 echo "== launching full 500-question run =="
 echo "out: $OUT (checkpoints preserved here; identical command resumes)"
-nohup "$SCRIPT_PATH" __record-exit "$STATUSFILE" \
-  caffeinate -i -s "$BIN" bench longmemeval --data "$DATA" --out "$OUT" \
-  > "$LOG" 2>&1 &
-PID=$!
+launchctl submit -l "$LAUNCH_LABEL" -o "$LOG" -e "$LOG" -- \
+  "$SCRIPT_PATH" __record-exit "$STATUSFILE" \
+  /usr/bin/caffeinate -i -s "$PWD/$BIN" bench longmemeval \
+  --data "$PWD/$DATA" --out "$OUT_ABS"
+echo "$LAUNCH_LABEL" > "$LABELFILE"
+PID="$(launchctl print "gui/$(id -u)/$LAUNCH_LABEL" 2>/dev/null \
+  | awk '/pid =/ {print $3; exit}')"
+[[ -n "$PID" ]] || { echo "FATAL: launchd accepted the job but exposed no PID"; exit 2; }
 echo "$PID" > "$PIDFILE"
-disown "$PID"
 echo "pid: $PID (recorded in $PIDFILE)"
+echo "launchd label: $LAUNCH_LABEL (recorded in $LABELFILE)"
 echo "monitor:  tail -f $LOG"
 echo "completion: cat $STATUSFILE (written atomically when the process exits)"
 echo "resume after any interruption: re-run this exact command with the same --out:"
