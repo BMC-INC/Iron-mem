@@ -9,7 +9,29 @@
 # outside any managed PTY via nohup with a durable log and recorded PID/exit
 # status. The paid run refuses to start without --authorized.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "$0")"
+cd "$SCRIPT_DIR/.."
+
+# Internal detached-worker entry point. The parent launcher exits immediately,
+# while this wrapper waits for the benchmark and atomically records its exit
+# code and completion time. A missing status file therefore means the wrapper
+# itself was forcibly terminated before it could report an outcome.
+if [[ "${1:-}" == "__record-exit" ]]; then
+  [[ "$#" -ge 3 ]] || { echo "FATAL: __record-exit needs STATUS_FILE COMMAND..."; exit 2; }
+  STATUS_FILE="$2"
+  shift 2
+  set +e
+  "$@"
+  COMMAND_EXIT=$?
+  STATUS_TMP="${STATUS_FILE}.tmp.$$"
+  {
+    echo "exit_code=$COMMAND_EXIT"
+    echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$STATUS_TMP"
+  mv "$STATUS_TMP" "$STATUS_FILE"
+  exit "$COMMAND_EXIT"
+fi
 
 MODE="${1:-canary}"
 AUTH="${2:-}"
@@ -65,15 +87,18 @@ fi
 OUT="docs/evals/longmemeval-full-$STAMP"
 LOG="$OUT/console.log"
 PIDFILE="$OUT/run.pid"
+STATUSFILE="$OUT/exit.status"
 mkdir -p "$OUT"
 echo "== launching full 500-question run =="
 echo "out: $OUT (checkpoints preserved here; identical command resumes)"
-nohup caffeinate -i -s "$BIN" bench longmemeval --data "$DATA" --out "$OUT" \
+nohup "$SCRIPT_PATH" __record-exit "$STATUSFILE" \
+  caffeinate -i -s "$BIN" bench longmemeval --data "$DATA" --out "$OUT" \
   > "$LOG" 2>&1 &
 PID=$!
 echo "$PID" > "$PIDFILE"
 disown "$PID"
 echo "pid: $PID (recorded in $PIDFILE)"
 echo "monitor:  tail -f $LOG"
+echo "completion: cat $STATUSFILE (written atomically when the process exits)"
 echo "resume after any interruption: re-run this exact command with the same --out:"
 echo "  $BIN bench longmemeval --data $DATA --out $OUT"
