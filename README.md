@@ -360,9 +360,12 @@ dataset, commit, models, embedder, and options to resume without repeating paid
 answer or judge calls. A mismatched configuration is rejected; use a new
 `--out` directory for a fresh run.
 
-Ingestion embeds conversation turns in bounded batches (32 texts per ONNX
-call) with a deterministic id-to-vector mapping that fails visibly on a
-count mismatch, instead of one embedding call per turn.
+Ingestion embeds conversation turns one at a time, on purpose: measured on
+the 5-question canary (CPU ONNX, bge-small), serial embedding runs 32s per
+question vs 79s for naive batch-32 and 35s for length-sorted batch-32 —
+ONNX pads each batch to its longest text, so batching never beat serial
+here. Embedding failures abort the run visibly instead of silently skipping
+vectors, since a partially-embedded store degrades retrieval without error.
 
 For long scored runs, `scripts/run_longmemeval.sh` wraps the harness in a
 durable launcher: preflight (dataset SHA-256, clean tree, disk, battery,
