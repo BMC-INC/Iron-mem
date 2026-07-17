@@ -61,9 +61,10 @@
   `error_solution`, `preference`, `procedural`, `architecture`, `learned_pattern`,
   `project_config`, `profile`). Session-start injection ranks **project ∪ user**
   memories and boosts durable kinds.
-- **Dual-output compression** — session compression writes both a narrative memory
-  and separate searchable `kind=fact` memories, so dates, names, quantities, and
-  direct answers survive summarization.
+- **Local-first session graduation** — deterministic local compression is the
+  default and requires no cloud credential. Optional cloud enrichment can add a
+  narrative plus typed facts, but provider failure always falls back to the
+  local archive instead of stranding observations.
 - **Record-run retrieval stack** — hybrid FTS/vector/graph recall now includes
   routed weighted fusion, source-fact retention, temporal event boosts, multi-hop
   query expansion, deterministic query decomposition, entity alias expansion,
@@ -114,7 +115,7 @@
 - **Valid-time temporal recall:** `remember` accepts an optional `event_at` (an ISO `YYYY-MM-DD` date or a `YYYY-MM-DD..YYYY-MM-DD` range) for when an event actually occurred, distinct from the storage time (`created_at`). Valid-time dates are surfaced through an `event_times` side map on search, list, context, and skim results, powering time-aware retrieval.
 - **Derived (inferred) memories:** reflection can derive new memories from existing ones, governed as `source_type=derived` / `kind=inference` with a `derives` provenance edge and a ledger entry per inference. Derived memories are quarantined from default retrieval until a caller explicitly asks for them, so inferences never silently pollute primary recall.
 - **Opt-in auto-dream trigger:** a thin background watcher (`auto_dream.enabled`, default off, with a `gap_minutes` idle threshold) fires a consolidation and synthesis pass on projects that have gone idle. Every auto-triggered pass is recorded in the governance ledger with a `trigger_reason`, so it stays auditable instead of a black box.
-- **Current verification:** `cargo test --bin ironmem` passes **203 tests** with
+- **Current verification:** `cargo test --bin ironmem` passes **228 tests** with
   **1 ignored benchmark**, MCP stdio cleanliness passes, and the strict
   `local-onnx` clippy gate is clean.
 - **Still zero telemetry. Still local-first. Your data stays yours.**
@@ -350,6 +351,8 @@ An in-repo harness runs [LongMemEval](https://github.com/xiaowu0162/LongMemEval)
 ironmem bench longmemeval --data longmemeval_s.json               # scored run (needs an LLM API key)
 ironmem bench longmemeval --data longmemeval_s.json --full-context # the published baseline column
 ironmem bench longmemeval --data longmemeval_s.json --dry-run      # pipeline smoke test, no API key
+ironmem bench longmemeval --data longmemeval_s.json \
+  --stratified-per-ability 2 --min-accuracy 0.50                    # representative paid gate
 ```
 
 Every report records the answer model, judge model, embedder, and retrieval depth so runs are comparable — scores are only published next to a same-model full-context baseline. Deterministic retrieval-quality regression checks (42 cases across multi-hop, temporal, open-domain, knowledge-update, abstention, governance-parity, entity, and chunk clusters) run via `ironmem eval` and gate CI on every change.
@@ -360,23 +363,25 @@ dataset, commit, models, embedder, and options to resume without repeating paid
 answer or judge calls. A mismatched configuration is rejected; use a new
 `--out` directory for a fresh run.
 
-Ingestion embeds conversation turns one at a time, on purpose: measured on
-the 5-question canary (CPU ONNX, bge-small), serial embedding runs 32s per
-question vs 79s for naive batch-32 and 35s for length-sorted batch-32 —
-ONNX pads each batch to its longest text, so batching never beat serial
-here. Embedding failures abort the run visibly instead of silently skipping
-vectors, since a partially-embedded store degrades retrieval without error.
+The harness indexes one lossless memory per timestamped session and presents
+retrieved sessions chronologically, matching LongMemEval's official
+session-granularity generation contract. This keeps complete dialogue rounds
+together and prevents the retrieval budget from being consumed by isolated
+turns from the same session. The answer prompt extracts relevant information
+before reasoning, and the judge uses LongMemEval's ability-specific rubrics.
+Raw judge verdicts are stored with every checkpoint; anything other than
+exactly `yes` or `no` is a visible harness error rather than a silent incorrect
+score.
 
 For long scored runs, `scripts/run_longmemeval.sh` wraps the harness in a
 durable launcher: preflight (dataset SHA-256, clean tree, disk, battery,
-ADC), a release `local-onnx` build, and either a no-credit timed canary
-(`canary`) or a detached full run (`full --authorized`) owned by macOS
-`launchd` and wrapped by `caffeinate`, with a durable console log, recorded
-PID and launchd label, and a unique
-checkpointed `--out`. The detached wrapper atomically writes `exit.status`
-with the process exit code and completion time; a missing status file means
-the wrapper was forcibly terminated before it could report an outcome. The
-full run refuses to start without `--authorized`.
+ADC), a release `local-onnx` build, a no-credit stratified dry canary
+(`canary`), and a 12-question paid stratified gate
+(`scored-canary --authorized`). A full run (`full --authorized`) is refused
+unless that exact release binary has passed the scored gate. Paid jobs are
+one-shot macOS `launchd` services (`KeepAlive=false`) wrapped by `caffeinate`,
+with a durable console log, recorded PID/label, atomic `exit.status`, and a
+unique checkpointed `--out`.
 
 ---
 
@@ -859,6 +864,9 @@ record-keeping (Art. 12) and transparency (Art. 13) obligations — see
   "port": 37778,
   "provider": "anthropic",
   "model": "claude-sonnet-4-6",
+  "compression": {
+    "mode": "local"
+  },
   "inject_limit": 5,
   "max_observation_bytes": 2048,
   "db_path": "/Users/you/.ironmem/mem.db",
@@ -1008,9 +1016,17 @@ ironmem embed --project .  # scope to one project
 ironmem embed --force      # rebuild the whole index from scratch
 ```
 
-### Provider
+### Compression and Provider
 
-IronMem supports four LLM providers for session compression:
+Session graduation defaults to `"compression": {"mode": "local"}`. It writes a
+deterministic searchable session archive, local chunks/embeddings, and a
+lossless CCR transcript without contacting a provider.
+
+Set the mode to `"cloud_with_local_fallback"` to enrich sessions with an LLM.
+The provider is optional: authentication, quota, or network failure falls back
+to local compression and cannot leave an ended session uncompressed.
+
+Four enrichment providers are supported:
 
 | Provider | `provider` value | Default model | API key env var |
 |----------|-----------------|---------------|-----------------|
@@ -1019,9 +1035,9 @@ IronMem supports four LLM providers for session compression:
 | **Google Gemini** | `"google"` | `gemini-2.0-flash` | `GOOGLE_API_KEY` |
 | **Vertex AI Gemini** | `"vertex"` | `gemini-2.5-flash` | ADC / attached service account |
 
-To switch providers, set `"provider"` in `~/.ironmem/settings.json` and ensure
-the corresponding API key or ADC auth path is available. The `model` field
-overrides the provider's default model.
+To switch enrichment providers, set `"provider"` and `model` in
+`~/.ironmem/settings.json`. Provider credentials are never required in local
+mode.
 
 ### Environment Variables
 
@@ -1128,14 +1144,16 @@ Check that `~/.claude/settings.json` has the hooks registered under the `"hooks"
 ├── mem.db               # SQLite DB: FTS memories, metadata, vectors, graph edges, chunks, CCR blobs
 ├── settings.json        # Configuration
 ├── api_key              # Anthropic API key (chmod 600; keeps it out of your shell env)
-├── current_session      # Active session ID (ephemeral)
+├── claude_sessions/     # Per-Claude-session IronMem mappings (ephemeral)
 └── server.log           # Worker logs
 
 ~/.claude/hooks/         # Auto-installed Claude Code hooks
+├── lib.sh               # Concurrency-safe session state helpers
 ├── session-start.sh     # Injects memories on session start
 ├── post-tool-use.sh     # Records every tool call
-├── stop.sh              # Triggers compression
-└── session-end.sh       # Cleanup
+├── stop.sh              # Graduates one response batch and rotates
+├── session-end.sh       # Rotates safely across PreCompact
+└── session-close.sh     # Closes the mapping on Claude SessionEnd
 ```
 
 **~14,000 lines of Rust.** MCP-native. SQLite or Postgres. Lossless, reversible memory. Temporal graph. Adaptive skim/expand chunks. One binary. No external runtimes.

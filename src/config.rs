@@ -10,6 +10,10 @@ pub struct Config {
     #[serde(default)]
     pub provider: Provider,
     pub model: String,
+    /// Session graduation policy. Defaults to deterministic local compression;
+    /// cloud generation is optional enrichment and always has a local fallback.
+    #[serde(default)]
+    pub compression: CompressionConfig,
     /// Vertex AI (Google Cloud) project for `provider = "vertex"`. ADC auth, so
     /// it bills GCP credit instead of a metered API key. Falls back to the
     /// IRONMEM_VERTEX_PROJECT env var when unset.
@@ -59,6 +63,28 @@ pub struct Config {
     pub auto_compress: AutoCompressConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionMode {
+    #[default]
+    Local,
+    CloudWithLocalFallback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressionConfig {
+    #[serde(default)]
+    pub mode: CompressionMode,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            mode: CompressionMode::Local,
+        }
+    }
 }
 
 /// (W3.1) Iterative multi-hop retrieval. For questions that chain facts across
@@ -691,6 +717,7 @@ impl Default for Config {
             port: 37778,
             provider,
             model: provider.default_model().to_string(),
+            compression: CompressionConfig::default(),
             vertex_project: None,
             vertex_location: default_vertex_location(),
             inject_limit: 5,
@@ -868,6 +895,16 @@ mod tests {
         let back = serde_json::to_string(&cfg).unwrap();
         let cfg2: Config = serde_json::from_str(&back).unwrap();
         assert_eq!(cfg2.embedding.provider, "none");
+    }
+
+    #[test]
+    fn compression_defaults_to_local_without_cloud_credentials() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"port":37778,"provider":"vertex","model":"gemini-2.5-flash",
+                "inject_limit":5,"max_observation_bytes":2048,"db_path":"/tmp/mem.db"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.compression.mode, CompressionMode::Local);
     }
 
     #[test]

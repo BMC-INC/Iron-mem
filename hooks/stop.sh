@@ -1,29 +1,20 @@
 #!/usr/bin/env bash
 # IronMem: stop hook
-# Ends the current session and triggers AI compression.
-# Called when Claude Code session stops.
+# Claude Stop fires after each response, not only when the interactive session
+# closes. Graduate the current batch and immediately rotate to a fresh IronMem
+# session so subsequent turns keep recording.
 # Fails silently.
 
 PORT="${IRONMEM_PORT:-37778}"
-SESSION_FILE="${HOME}/.ironmem/current_session"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=hooks/lib.sh
+source "$SCRIPT_DIR/lib.sh"
 
-if [ ! -f "$SESSION_FILE" ]; then
-  exit 0
-fi
-
-SESSION_ID="$(cat "$SESSION_FILE" 2>/dev/null || echo "")"
-if [ -z "$SESSION_ID" ]; then
-  exit 0
-fi
-
-# End session (triggers compression server-side)
-curl -sf \
-  -X POST \
-  -H "Content-Type: application/json" \
-  -d "{\"session_id\": \"$SESSION_ID\"}" \
-  "http://127.0.0.1:${PORT}/session/end" > /dev/null 2>&1 || true
-
-# Clear session file
-rm -f "$SESSION_FILE"
+HOOK_INPUT="$(cat)"
+CLAUDE_SESSION_ID="$(ironmem_hook_field "$HOOK_INPUT" "session_id")"
+PROJECT_ROOT="$(ironmem_hook_field "$HOOK_INPUT" "cwd")"
+[[ -n "$CLAUDE_SESSION_ID" ]] || exit 0
+[[ -n "$PROJECT_ROOT" ]] || PROJECT_ROOT="$(pwd)"
+ironmem_rotate_session "$CLAUDE_SESSION_ID" "$PROJECT_ROOT" >/dev/null 2>&1 || true
 
 exit 0

@@ -1242,6 +1242,8 @@ pub struct StatusResponse {
     pub governance_cost: serde_json::Value,
     /// Rerank backend and cross-encoder readiness (Wave 4).
     pub rerank: serde_json::Value,
+    /// Session graduation mode. `local` requires no provider credentials.
+    pub compression: serde_json::Value,
 }
 
 async fn get_status(
@@ -1264,6 +1266,10 @@ async fn get_status(
         rerank: serde_json::json!({
             "backend": state.config.rerank.backend,
             "cross_encoder_ready": crate::reranker::is_ready(),
+        }),
+        compression: serde_json::json!({
+            "mode": state.config.compression.mode,
+            "cloud_required": false,
         }),
     }))
 }

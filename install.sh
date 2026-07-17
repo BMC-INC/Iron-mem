@@ -48,7 +48,7 @@ success "Binary installed to $IRONMEM_BIN"
 # ── 4. Install Claude Code hooks ───────────────────────────────────────────────
 mkdir -p "$CLAUDE_HOOKS_DIR"
 
-for src in session-start.sh post-tool-use.sh stop.sh session-end.sh; do
+for src in lib.sh session-start.sh post-tool-use.sh stop.sh session-end.sh session-close.sh; do
   cp "${SCRIPT_DIR}/hooks/${src}" "${CLAUDE_HOOKS_DIR}/${src}"
   chmod +x "${CLAUDE_HOOKS_DIR}/${src}"
   info "  Hook installed: ${CLAUDE_HOOKS_DIR}/${src}"
@@ -66,7 +66,8 @@ if [ ! -f "$CLAUDE_SETTINGS" ]; then
     "SessionStart": [{"type": "command", "command": "${CLAUDE_HOOKS_DIR}/session-start.sh"}],
     "PostToolUse":  [{"type": "command", "command": "${CLAUDE_HOOKS_DIR}/post-tool-use.sh"}],
     "Stop":         [{"type": "command", "command": "${CLAUDE_HOOKS_DIR}/stop.sh"}],
-    "PreCompact":   [{"type": "command", "command": "${CLAUDE_HOOKS_DIR}/session-end.sh"}]
+    "PreCompact":   [{"type": "command", "command": "${CLAUDE_HOOKS_DIR}/session-end.sh"}],
+    "SessionEnd":   [{"type": "command", "command": "${CLAUDE_HOOKS_DIR}/session-close.sh"}]
   }
 }
 EOF
@@ -90,7 +91,8 @@ else:
         "SessionStart": [{"type": "command", "command": f"{hooks_dir}/session-start.sh"}],
         "PostToolUse":  [{"type": "command", "command": f"{hooks_dir}/post-tool-use.sh"}],
         "Stop":         [{"type": "command", "command": f"{hooks_dir}/stop.sh"}],
-        "PreCompact":   [{"type": "command", "command": f"{hooks_dir}/session-end.sh"}]
+        "PreCompact":   [{"type": "command", "command": f"{hooks_dir}/session-end.sh"}],
+        "SessionEnd":   [{"type": "command", "command": f"{hooks_dir}/session-close.sh"}]
     }
     with open(settings_path, 'w') as f:
         json.dump(settings, f, indent=2)
