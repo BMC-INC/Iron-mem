@@ -415,6 +415,12 @@ enum Commands {
         /// Only score the first N questions (cheap iteration runs)
         #[arg(long)]
         limit: Option<usize>,
+        /// Select up to N questions from every ability (representative canary)
+        #[arg(long)]
+        stratified_per_ability: Option<usize>,
+        /// Exit non-zero after reporting if accuracy is below this 0.0–1.0 gate
+        #[arg(long)]
+        min_accuracy: Option<f64>,
         /// Memories retrieved per question
         #[arg(long, default_value = "10")]
         retrieve_k: usize,
@@ -768,6 +774,8 @@ async fn async_main() -> Result<()> {
             data,
             out,
             limit,
+            stratified_per_ability,
+            min_accuracy,
             retrieve_k,
             answer_model,
             judge_model,
@@ -782,6 +790,8 @@ async fn async_main() -> Result<()> {
                     data: std::path::PathBuf::from(data),
                     out_dir: std::path::PathBuf::from(out),
                     limit,
+                    stratified_per_ability,
+                    min_accuracy,
                     retrieve_k,
                     answer_model,
                     judge_model,

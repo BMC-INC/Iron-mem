@@ -5,12 +5,25 @@
 
 set -euo pipefail
 
-IRONMEM_BIN="${HOME}/.ironmem/bin/ironmem"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=hooks/lib.sh
+source "$SCRIPT_DIR/lib.sh"
+
+HOOK_INPUT="$(cat)"
+CLAUDE_SESSION_ID="$(ironmem_hook_field "$HOOK_INPUT" "session_id")"
+HOOK_CWD="$(ironmem_hook_field "$HOOK_INPUT" "cwd")"
+[[ -n "$CLAUDE_SESSION_ID" ]] || exit 0
+
+IRONMEM_BIN="${IRONMEM_BIN:-${HOME}/.ironmem/bin/ironmem}"
 PORT="${IRONMEM_PORT:-37778}"
 LIMIT="${IRONMEM_INJECT_LIMIT:-5}"
 
 # Resolve git root of the current project
-PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+if [[ -n "$HOOK_CWD" && -d "$HOOK_CWD" ]]; then
+  PROJECT_ROOT="$(git -C "$HOOK_CWD" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$HOOK_CWD")"
+else
+  PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+fi
 
 # Fail silently if binary not found
 if [ ! -x "$IRONMEM_BIN" ]; then
@@ -35,15 +48,8 @@ fi
 # Inject memories into IRONMEM.md and update CLAUDE.md
 "$IRONMEM_BIN" inject --project "$PROJECT_ROOT" --limit "$LIMIT" > /dev/null 2>&1 || true
 
-# Start a new session and write the session ID so post-tool-use can record observations
-SESSION_ID=$(curl -sf \
-  -X POST \
-  -H "Content-Type: application/json" \
-  -d "{\"project\": \"$PROJECT_ROOT\"}" \
-  "http://127.0.0.1:${PORT}/session/start" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['session_id'])" 2>/dev/null || echo "")
-
-if [ -n "$SESSION_ID" ]; then
-  echo "$SESSION_ID" > "${HOME}/.ironmem/current_session"
-fi
+# Duplicate lifecycle starts close only this Claude session's prior mapping.
+ironmem_end_session "$CLAUDE_SESSION_ID" >/dev/null 2>&1 || true
+ironmem_start_session "$CLAUDE_SESSION_ID" "$PROJECT_ROOT" >/dev/null 2>&1 || true
 
 exit 0

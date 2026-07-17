@@ -6,7 +6,7 @@
 use anyhow::Result;
 use std::collections::HashSet;
 
-use crate::config::Config;
+use crate::config::{CompressionMode, Config};
 use crate::db::{self, Database};
 use crate::embedder::Embedder;
 use crate::governance::MemoryGovernance;
@@ -27,7 +27,21 @@ pub async fn run(
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
     let observations = db::get_observations_for_session(db, session_id).await?;
-    let result = provider::compress(&observations, cfg).await?;
+    let result = match cfg.compression.mode {
+        CompressionMode::Local => local_compression_result(&observations),
+        CompressionMode::CloudWithLocalFallback => {
+            match provider::compress(&observations, cfg).await {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(
+                        "cloud compression unavailable for session {session_id}; \
+                     graduating with deterministic local compression: {error}"
+                    );
+                    local_compression_result(&observations)
+                }
+            }
+        }
+    };
     let chunk_result = result.clone();
 
     let memory_id = persist(db, embedder, store, &session.project, session_id, result).await?;
@@ -90,6 +104,26 @@ pub async fn run(
         }
     }
     Ok(memory_id)
+}
+
+const LOCAL_SUMMARY_MAX_BYTES: usize = 48_000;
+
+/// Deterministic, credential-free session graduation. The narrative stays
+/// searchable locally, while the complete byte-exact transcript is attached
+/// through CCR and observation chunks immediately after persistence.
+fn local_compression_result(observations: &[db::Observation]) -> CompressionResult {
+    let transcript = build_transcript(observations);
+    CompressionResult {
+        summary: format!(
+            "Local session archive ({} observations)\n{}",
+            observations.len(),
+            crate::strutil::safe_truncate(&transcript, LOCAL_SUMMARY_MAX_BYTES)
+        ),
+        tags: "local-compression session-archive".to_string(),
+        importance: 5,
+        kind: "session".to_string(),
+        ..CompressionResult::default()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1293,6 +1327,73 @@ mod tests {
             .unwrap()
             .is_none());
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn local_compression_requires_no_provider_and_preserves_session_text() {
+        let observations = vec![db::Observation {
+            id: 1,
+            session_id: "session-1".to_string(),
+            project: "/tmp/project".to_string(),
+            tool: "shell".to_string(),
+            input: Some("cargo test".to_string()),
+            output: Some("test result: ok".to_string()),
+            created_at: 1,
+        }];
+
+        let result = local_compression_result(&observations);
+
+        assert_eq!(result.kind, "session");
+        assert!(result.tags.contains("local-compression"));
+        assert!(result.summary.contains("cargo test"));
+        assert!(result.summary.contains("test result: ok"));
+        assert!(result.facts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_mode_graduates_session_without_cloud_authentication() {
+        let path =
+            std::env::temp_dir().join(format!("ironmem-local-cmp-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::new(&path.to_string_lossy()).await.unwrap();
+        db.migrate().await.unwrap();
+        let session = create_session(&db, "/tmp/local-first").await.unwrap();
+        db::insert_observation(
+            &db,
+            &session,
+            "/tmp/local-first",
+            "Bash",
+            Some("cargo test"),
+            Some("test result: ok"),
+            2048,
+        )
+        .await
+        .unwrap();
+        let cfg = Config {
+            provider: crate::provider::Provider::Vertex,
+            vertex_project: Some("must-not-be-called".to_string()),
+            compression: crate::config::CompressionConfig {
+                mode: CompressionMode::Local,
+            },
+            ..Config::default()
+        };
+        let store = crate::vectorstore::BruteForceStore;
+
+        let memory_id = run(&db, None, &store, &cfg, &session).await.unwrap();
+
+        let saved = db::get_memory_by_id(&db, memory_id).await.unwrap().unwrap();
+        assert!(saved.summary.contains("cargo test"));
+        assert!(
+            db::get_session(&db, &session)
+                .await
+                .unwrap()
+                .unwrap()
+                .compressed
+        );
+        assert!(db::get_memory_session_blob(&db, memory_id)
+            .await
+            .unwrap()
+            .is_some());
         let _ = std::fs::remove_file(path);
     }
 }

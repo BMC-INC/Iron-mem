@@ -80,6 +80,12 @@ pub struct BenchOptions {
     pub data: PathBuf,
     pub out_dir: PathBuf,
     pub limit: Option<usize>,
+    /// Select up to N questions from every ability instead of taking a prefix.
+    /// This is the required shape for representative paid canaries.
+    pub stratified_per_ability: Option<usize>,
+    /// Fail the command after writing its report when accuracy is below this
+    /// fraction. Used to make paid canaries a hard gate for full runs.
+    pub min_accuracy: Option<f64>,
     pub retrieve_k: usize,
     pub answer_model: Option<String>,
     pub judge_model: Option<String>,
@@ -99,6 +105,9 @@ pub struct QuestionResult {
     pub gold: String,
     pub hypothesis: String,
     pub correct: bool,
+    /// Raw judge response. Empty for dry runs and harness failures.
+    #[serde(default)]
+    pub judge_verdict: String,
     pub retrieved: usize,
     pub answer_ms: u128,
 }
@@ -113,6 +122,8 @@ struct CheckpointIdentity {
     embedder: String,
     retrieve_k: usize,
     limit: Option<usize>,
+    stratified_per_ability: Option<usize>,
+    min_accuracy_millionths: Option<u32>,
     full_context: bool,
     context_chars: usize,
     dry_run: bool,
@@ -291,8 +302,38 @@ pub fn load_dataset(path: &Path) -> Result<Vec<LmeQuestion>> {
     Ok(questions)
 }
 
+fn select_stratified(questions: &[LmeQuestion], per_ability: usize) -> Vec<LmeQuestion> {
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+    questions
+        .iter()
+        .filter(|question| {
+            let count = counts.entry(question.ability()).or_default();
+            if *count >= per_ability {
+                false
+            } else {
+                *count += 1;
+                true
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
+    if let Some(minimum) = opts.min_accuracy {
+        if !(0.0..=1.0).contains(&minimum) {
+            bail!("--min-accuracy must be between 0.0 and 1.0");
+        }
+    }
     let questions = load_dataset(&opts.data)?;
+    let questions = if let Some(per_ability) = opts.stratified_per_ability {
+        if per_ability == 0 {
+            bail!("--stratified-per-ability must be greater than zero");
+        }
+        select_stratified(&questions, per_ability)
+    } else {
+        questions
+    };
     let take = opts.limit.unwrap_or(questions.len());
     let questions: Vec<LmeQuestion> = questions.into_iter().take(take).collect();
 
@@ -322,7 +363,7 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
     let mut mode = if opts.full_context {
         format!("full-context (first {} chars)", opts.context_chars)
     } else {
-        "memory (direct turn-level ingest + hybrid retrieval)".to_string()
+        "memory (lossless session-level ingest + hybrid retrieval)".to_string()
     };
     if opts.dry_run {
         mode.push_str(" [dry-run: unscored]");
@@ -330,7 +371,7 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
 
     let checkpoint_dir = opts.out_dir.join("longmemeval-checkpoint");
     let checkpoint_identity = CheckpointIdentity {
-        schema: 1,
+        schema: 2,
         dataset_sha256: sha256_file(&opts.data)?,
         commit: git_commit(),
         answer_model: answer_model.clone(),
@@ -338,6 +379,10 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
         embedder: embedder_desc.clone(),
         retrieve_k: opts.retrieve_k,
         limit: opts.limit,
+        stratified_per_ability: opts.stratified_per_ability,
+        min_accuracy_millionths: opts
+            .min_accuracy
+            .map(|value| (value * 1_000_000.0).round() as u32),
         full_context: opts.full_context,
         context_chars: opts.context_chars,
         dry_run: opts.dry_run,
@@ -398,6 +443,7 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
                     gold: question.gold_answer(),
                     hypothesis: format!("[harness error: {e:#}]"),
                     correct: false,
+                    judge_verdict: String::new(),
                     retrieved: 0,
                     answer_ms: 0,
                 }
@@ -468,6 +514,15 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
     );
 
     let _ = std::fs::remove_file(&temp_db);
+    if let Some(minimum) = opts.min_accuracy {
+        if report.accuracy() < minimum {
+            bail!(
+                "LongMemEval accuracy {:.1}% is below required canary gate {:.1}%",
+                report.accuracy() * 100.0,
+                minimum * 100.0
+            );
+        }
+    }
     Ok(report)
 }
 
@@ -489,7 +544,7 @@ async fn run_question(
         // Fresh project per question keeps haystacks isolated inside the
         // shared bench database.
         let project = format!("/bench/longmemeval/{}", question.question_id);
-        ingest_direct(db, embedder, store, &project, question).await?;
+        ingest_sessions(db, embedder, store, &project, question).await?;
         let hits = retrieval::hybrid_search(
             db,
             embedder,
@@ -500,20 +555,25 @@ async fn run_question(
         )
         .await?;
         let retrieved = hits.len();
+        // LongMemEval's reference generation pipeline presents retrieved
+        // sessions chronologically after relevance retrieval.
+        let mut chronological = hits;
+        chronological.sort_by(|a, b| a.summary.cmp(&b.summary));
         let mut context = String::new();
-        for memory in &hits {
+        for memory in &chronological {
             context.push_str(&memory.summary);
-            context.push('\n');
+            context.push_str("\n\n");
         }
         (context, retrieved)
     };
 
-    let (hypothesis, correct) = if opts.dry_run {
-        ("[dry-run: no LLM call]".to_string(), false)
+    let (hypothesis, correct, judge_verdict) = if opts.dry_run {
+        ("[dry-run: no LLM call]".to_string(), false, String::new())
     } else {
         let hypothesis = answer_question(cfg, question, &context, answer_model).await?;
-        let correct = judge_answer(cfg, question, &hypothesis, judge_model).await?;
-        (hypothesis, correct)
+        let (correct, judge_verdict) =
+            judge_answer(cfg, question, &hypothesis, judge_model).await?;
+        (hypothesis, correct, judge_verdict)
     };
     let answer_ms = started.elapsed().as_millis();
 
@@ -524,23 +584,28 @@ async fn run_question(
         gold: question.gold_answer(),
         hypothesis,
         correct,
+        judge_verdict,
         retrieved,
         answer_ms,
     })
 }
 
-/// Turn-level ingestion: each turn becomes one memory stamped with its
-/// session's date. This exercises the real write path (FTS, meta, event time)
-/// without LLM extraction cost; LLM-extraction ingest arrives with the Phase 2
-/// observer and will be a second `--ingest` mode.
-///
-/// Turns embed one at a time on purpose. Measured on the 5-question canary
-/// (2026-07-16, CPU ONNX bge-small): serial 32s/q, naive batch-32 79s/q,
-/// length-sorted batch-32 35s/q — ONNX pads each batch to its longest text,
-/// so batching never beat serial here. Embedding failures are fatal rather
-/// than silently skipped: a partially-embedded store degrades retrieval
-/// scores without any visible error.
-async fn ingest_direct(
+fn session_memory_text(session: &[LmeTurn], date: &str) -> String {
+    let mut text = format!("Session Date: {date}\nSession Content:\n");
+    for turn in session {
+        text.push_str(&turn.role);
+        text.push_str(": ");
+        text.push_str(turn.content.trim());
+        text.push('\n');
+    }
+    text
+}
+
+/// Lossless session-level ingestion, matching the granularity used by the
+/// official LongMemEval retrieval/generation pipeline. Keeping a whole session
+/// together lets one retrieved item carry the dialogue round and prevents a
+/// top-k budget from being consumed by isolated turns from the same session.
+async fn ingest_sessions(
     db: &Database,
     embedder: Option<&dyn Embedder>,
     store: &dyn VectorStore,
@@ -550,31 +615,95 @@ async fn ingest_direct(
     for (i, session) in question.haystack_sessions.iter().enumerate() {
         let date = question.haystack_dates.get(i).cloned().unwrap_or_default();
         let session_id = db::create_session(db, project).await?;
-        for turn in session {
-            let text = if date.is_empty() {
-                format!("{}: {}", turn.role, turn.content)
-            } else {
-                format!("[{}] {}: {}", date, turn.role, turn.content)
-            };
-            let memory_id = db::insert_memory(db, project, &session_id, &text, None).await?;
-            if let Some(event_date) = date.split_whitespace().next() {
-                if !event_date.is_empty() {
-                    let _ = db::set_memory_event_time(db, memory_id, event_date).await;
-                }
-            }
-            if let Some(emb) = embedder {
-                let mut vecs = emb
-                    .embed(&[text])
-                    .await
-                    .with_context(|| format!("embedding ingested turn (memory {memory_id})"))?;
-                let Some(vec) = vecs.pop() else {
-                    bail!("embedder returned no vector for ingested turn (memory {memory_id})");
-                };
-                let _ = store.upsert(db, memory_id, emb.id(), emb.dim(), &vec).await;
+        let text = session_memory_text(session, &date);
+        let memory_id = db::insert_memory(db, project, &session_id, &text, None).await?;
+        if let Some(event_date) = date.split_whitespace().next() {
+            if !event_date.is_empty() {
+                let _ = db::set_memory_event_time(db, memory_id, event_date).await;
             }
         }
+        if let Some(emb) = embedder {
+            let mut vecs = emb
+                .embed(&[text])
+                .await
+                .with_context(|| format!("embedding ingested session (memory {memory_id})"))?;
+            let Some(vec) = vecs.pop() else {
+                bail!("embedder returned no vector for ingested session (memory {memory_id})");
+            };
+            store
+                .upsert(db, memory_id, emb.id(), emb.dim(), &vec)
+                .await
+                .with_context(|| format!("storing session embedding (memory {memory_id})"))?;
+        }
+        db::end_session(db, &session_id).await?;
     }
     Ok(())
+}
+
+fn judge_prompt(question: &LmeQuestion, hypothesis: &str) -> String {
+    let gold = question.gold_answer();
+    if question.ability() == "abstention" {
+        return format!(
+            "I will give you an unanswerable question, an explanation, and a response \
+             from a model. Please answer yes if the model correctly identifies the \
+             question as unanswerable. The model could say that the information is \
+             incomplete, or some other information is given but the asked information \
+             is not.\n\nQuestion: {}\n\nExplanation: {gold}\n\nModel Response: \
+             {hypothesis}\n\nDoes the model correctly identify the question as \
+             unanswerable? Answer yes or no only.",
+            question.question
+        );
+    }
+
+    let rubric = match question.question_type.as_str() {
+        "temporal-reasoning" => {
+            "Please answer yes if the response contains the correct answer. Otherwise, \
+             answer no. If the response is equivalent to the correct answer or contains \
+             all the intermediate steps to get the correct answer, answer yes. If it \
+             contains only a subset of the required information, answer no. Do not \
+             penalize off-by-one errors for numbers of days, weeks, or months."
+        }
+        "knowledge-update" => {
+            "Please answer yes if the response contains the correct answer. Otherwise, \
+             answer no. If the response contains previous information along with an \
+             updated answer, consider it correct as long as the updated answer is the \
+             required answer."
+        }
+        "single-session-preference" => {
+            "Please answer yes if the response satisfies the desired personalized \
+             response. Otherwise, answer no. The response need not reflect every rubric \
+             point; it is correct if it recalls and uses the user's personal information."
+        }
+        _ => {
+            "Please answer yes if the response contains the correct answer. Otherwise, \
+             answer no. If the response is equivalent to the correct answer or contains \
+             all the intermediate steps to get the correct answer, answer yes. If the \
+             response only contains a subset of the information required by the answer, \
+             answer no."
+        }
+    };
+    let answer_label = if question.question_type == "single-session-preference" {
+        "Rubric"
+    } else {
+        "Correct Answer"
+    };
+    format!(
+        "I will give you a question, a correct answer or rubric, and a response from a \
+         model. {rubric}\n\nQuestion: {}\n\n{answer_label}: {gold}\n\nModel \
+         Response: {hypothesis}\n\nIs the model response correct? Answer yes or no only.",
+        question.question
+    )
+}
+
+fn parse_judge_verdict(raw: &str) -> std::result::Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "yes" => Ok(true),
+        "no" => Ok(false),
+        _ => Err(format!(
+            "invalid judge verdict (expected exactly yes or no): {:?}",
+            raw.trim()
+        )),
+    }
 }
 
 fn full_context(question: &LmeQuestion, max_chars: usize) -> String {
@@ -610,7 +739,8 @@ async fn answer_question(
          Today's date: {today}.\n\n\
          Retrieved memory context:\n{context}\n\n\
          Question: {question}\n\n\
-         Answer concisely using only the context above. If the context does not \
+         First extract all relevant information from the retrieved sessions, then \
+         reason over it to answer. Return only the concise final answer. If the context does not \
          contain the information needed, reply exactly: \"{ANSWER_ABSTAIN_MARKER}\".",
         question = question.question,
     );
@@ -622,34 +752,11 @@ async fn judge_answer(
     question: &LmeQuestion,
     hypothesis: &str,
     judge_model: &str,
-) -> Result<bool> {
-    let gold = question.gold_answer();
-    let prompt = if question.ability() == "abstention" {
-        format!(
-            "A memory assistant was asked a question whose answer is NOT present in its \
-             history; the correct behaviour is to say it does not know.\n\
-             Question: {q}\n\
-             Assistant response: {hypothesis}\n\n\
-             Did the assistant correctly abstain (decline to answer / say it does not \
-             know) instead of inventing an answer? Reply with exactly CORRECT or INCORRECT.",
-            q = question.question,
-        )
-    } else {
-        format!(
-            "Grade a memory assistant's answer strictly against the gold answer.\n\
-             Question: {q}\n\
-             Gold answer: {gold}\n\
-             Assistant answer: {hypothesis}\n\n\
-             The assistant answer is correct only if it contains the same specific \
-             information as the gold answer (same entity, date, quantity, or decision); \
-             a vague or topically-adjacent answer is INCORRECT. Reply with exactly \
-             CORRECT or INCORRECT.",
-            q = question.question,
-        )
-    };
+) -> Result<(bool, String)> {
+    let prompt = judge_prompt(question, hypothesis);
     let verdict = provider::complete_with(&prompt, judge_model, cfg).await?;
-    let verdict = verdict.trim().to_uppercase();
-    Ok(verdict.starts_with("CORRECT"))
+    let correct = parse_judge_verdict(&verdict).map_err(anyhow::Error::msg)?;
+    Ok((correct, verdict))
 }
 
 fn git_commit() -> String {
@@ -771,6 +878,83 @@ mod tests {
     }
 
     #[test]
+    fn stratified_selection_covers_every_ability_before_dataset_order() {
+        let mut questions: Vec<LmeQuestion> = serde_json::from_str(SAMPLE).unwrap();
+        questions.push(LmeQuestion {
+            question_id: "q4".to_string(),
+            question_type: "temporal-reasoning".to_string(),
+            question: "Which happened first?".to_string(),
+            answer: serde_json::Value::String("A".to_string()),
+            question_date: None,
+            haystack_dates: vec![],
+            haystack_sessions: vec![],
+        });
+        questions.push(LmeQuestion {
+            question_id: "q5".to_string(),
+            question_type: "single-session-preference".to_string(),
+            question: "What would I like?".to_string(),
+            answer: serde_json::Value::String("B".to_string()),
+            question_date: None,
+            haystack_dates: vec![],
+            haystack_sessions: vec![],
+        });
+
+        let selected = select_stratified(&questions, 1);
+        let abilities: std::collections::BTreeSet<_> =
+            selected.iter().map(|q| q.ability()).collect();
+
+        assert_eq!(selected.len(), 5);
+        assert_eq!(
+            abilities,
+            [
+                "abstention",
+                "information-extraction",
+                "knowledge-update",
+                "preference",
+                "temporal-reasoning",
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[test]
+    fn session_memory_preserves_date_and_all_turns() {
+        let questions: Vec<LmeQuestion> = serde_json::from_str(SAMPLE).unwrap();
+        let text = session_memory_text(&questions[0].haystack_sessions[0], "2023/05/01");
+
+        assert!(text.contains("Session Date: 2023/05/01"));
+        assert!(text.contains("user: I started cello lessons last week."));
+        assert!(text.contains("assistant: That is wonderful."));
+    }
+
+    #[test]
+    fn judge_prompt_matches_official_ability_specific_rules() {
+        let questions: Vec<LmeQuestion> = serde_json::from_str(SAMPLE).unwrap();
+        let regular = judge_prompt(&questions[0], "the cello");
+        assert!(regular.contains("contains the correct answer"));
+        assert!(regular.contains("subset of the information"));
+        assert!(regular.contains("Answer yes or no only"));
+
+        let abstention = judge_prompt(&questions[1], "I don't know");
+        assert!(abstention.contains("correctly identifies the question as unanswerable"));
+
+        let update = judge_prompt(&questions[2], "Lisbon");
+        assert!(update.contains("previous information along with an updated answer"));
+    }
+
+    #[test]
+    fn judge_verdict_rejects_capacity_messages_and_extra_text() {
+        assert_eq!(parse_judge_verdict("yes"), Ok(true));
+        assert_eq!(parse_judge_verdict("NO"), Ok(false));
+        assert!(parse_judge_verdict(
+            "Selected model is at capacity. Please try a different model."
+        )
+        .is_err());
+        assert!(parse_judge_verdict("yes, because it matches").is_err());
+    }
+
+    #[test]
     fn checkpoint_round_trip_survives_an_interrupted_run() {
         let root =
             std::env::temp_dir().join(format!("ironmem-checkpoint-test-{}", uuid::Uuid::new_v4()));
@@ -781,6 +965,7 @@ mod tests {
             gold: "cello".to_string(),
             hypothesis: "cello".to_string(),
             correct: true,
+            judge_verdict: "yes".to_string(),
             retrieved: 3,
             answer_ms: 42,
         };
@@ -805,6 +990,7 @@ mod tests {
             gold: "unanswerable".to_string(),
             hypothesis: "I don't know".to_string(),
             correct: true,
+            judge_verdict: "yes".to_string(),
             retrieved: 0,
             answer_ms: 7,
         };
@@ -822,7 +1008,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("ironmem-checkpoint-test-{}", uuid::Uuid::new_v4()));
         let first = CheckpointIdentity {
-            schema: 1,
+            schema: 2,
             dataset_sha256: "dataset-a".to_string(),
             commit: "abc1234".to_string(),
             answer_model: "answerer".to_string(),
@@ -830,6 +1016,8 @@ mod tests {
             embedder: "embedder".to_string(),
             retrieve_k: 10,
             limit: Some(5),
+            stratified_per_ability: None,
+            min_accuracy_millionths: None,
             full_context: false,
             context_chars: 400_000,
             dry_run: false,
