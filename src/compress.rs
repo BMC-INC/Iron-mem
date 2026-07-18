@@ -10,7 +10,7 @@ use crate::config::{CompressionMode, Config};
 use crate::db::{self, Database};
 use crate::embedder::Embedder;
 use crate::governance::MemoryGovernance;
-use crate::provider::{self, CompressionResult};
+use crate::provider::{self, CompressionResult, MemoryRelation};
 use crate::vectorstore::VectorStore;
 
 /// Compress a session into a memory: summarize via the LLM, persist it, record
@@ -107,6 +107,54 @@ pub async fn run(
 }
 
 const LOCAL_SUMMARY_MAX_BYTES: usize = 48_000;
+const LOCAL_RELATION_MAX_PART_BYTES: usize = 512;
+
+/// Parse only explicit machine-readable relationship markers. Local mode never
+/// infers relationships from prose, but trusted adapters can emit:
+/// `RELATION: source | relation | target`
+fn local_explicit_relations(observations: &[db::Observation]) -> Vec<MemoryRelation> {
+    let mut seen = HashSet::new();
+    let mut relations = Vec::new();
+    for text in observations.iter().flat_map(|observation| {
+        [observation.input.as_deref(), observation.output.as_deref()]
+            .into_iter()
+            .flatten()
+    }) {
+        for line in text.lines() {
+            let Some(marker) = line.trim().strip_prefix("RELATION:") else {
+                continue;
+            };
+            let parts = marker.split('|').map(str::trim).collect::<Vec<_>>();
+            if parts.len() != 3
+                || parts
+                    .iter()
+                    .any(|part| part.is_empty() || part.len() > LOCAL_RELATION_MAX_PART_BYTES)
+                || parts[1].len() > 64
+                || !parts[1].chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+            {
+                continue;
+            }
+            let key = (
+                parts[0].to_string(),
+                parts[1].to_string(),
+                parts[2].to_string(),
+            );
+            if seen.insert(key.clone()) {
+                relations.push(MemoryRelation {
+                    source: key.0,
+                    relation: key.1,
+                    target: key.2,
+                    valid_from: None,
+                    valid_until: None,
+                    confidence: 1.0,
+                });
+            }
+        }
+    }
+    relations
+}
 
 /// Deterministic, credential-free session graduation. The narrative stays
 /// searchable locally, while the complete byte-exact transcript is attached
@@ -122,6 +170,7 @@ fn local_compression_result(observations: &[db::Observation]) -> CompressionResu
         tags: "local-compression session-archive".to_string(),
         importance: 5,
         kind: "session".to_string(),
+        relations: local_explicit_relations(observations),
         ..CompressionResult::default()
     }
 }
@@ -1338,7 +1387,12 @@ mod tests {
             project: "/tmp/project".to_string(),
             tool: "shell".to_string(),
             input: Some("cargo test".to_string()),
-            output: Some("test result: ok".to_string()),
+            output: Some(
+                "test result: ok\n\
+                 RELATION: Run:proof-1 | completed_for | Project:operator-os\n\
+                 RELATION: Project:operator-os | part_of | Repository:BMC-INC/operator-os"
+                    .to_string(),
+            ),
             created_at: 1,
         }];
 
@@ -1349,6 +1403,11 @@ mod tests {
         assert!(result.summary.contains("cargo test"));
         assert!(result.summary.contains("test result: ok"));
         assert!(result.facts.is_empty());
+        assert_eq!(result.relations.len(), 2);
+        assert_eq!(result.relations[0].source, "Run:proof-1");
+        assert_eq!(result.relations[0].relation, "completed_for");
+        assert_eq!(result.relations[0].target, "Project:operator-os");
+        assert_eq!(result.relations[0].confidence, 1.0);
     }
 
     #[tokio::test]
