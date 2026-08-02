@@ -378,6 +378,34 @@ impl IronMemServer {
                 })),
             ),
             Tool::new(
+                "manage_contradiction",
+                "Create, inspect, prefer, or resolve a versioned contradiction set. Mutations require influence_policy:write; reads require influence_policy:read.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "operation": { "type": "string", "enum": ["create", "get", "prefer", "resolve", "obsolete"] },
+                        "id": { "type": "string" },
+                        "namespace": { "type": "string", "description": "Governance namespace (default local)" },
+                        "realm": { "type": "string", "enum": ["project", "user"] },
+                        "project": { "type": "string" },
+                        "claim_key": { "type": "string" },
+                        "cardinality": { "type": "string", "enum": ["single", "set", "ordered", "custom"] },
+                        "members": {
+                            "type": "array", "minItems": 2, "maxItems": 32,
+                            "items": { "type": "object", "properties": {
+                                "memory_id": { "type": "integer" },
+                                "stance": { "type": "string", "enum": ["supports", "contradicts", "competing"] }
+                            }, "required": ["memory_id", "stance"] }
+                        },
+                        "reason": { "type": "string" },
+                        "expected_version": { "type": "integer", "minimum": 1 },
+                        "preferred_memory_id": { "type": "integer" },
+                        "basis": { "type": "string" }
+                    },
+                    "required": ["operation"]
+                })),
+            ),
+            Tool::new(
                 "get_profile",
                 "Get the current user profile (durable cross-project facts + recent activity), if one has been generated.",
                 schema(serde_json::json!({
@@ -1397,6 +1425,105 @@ impl IronMemServer {
         )]))
     }
 
+    async fn handle_manage_contradiction(
+        &self,
+        args: &JsonObject,
+    ) -> Result<CallToolResult, ErrorData> {
+        let operation = args
+            .get("operation")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| ErrorData::invalid_params("missing 'operation'", None))?;
+        let namespace = namespace_arg(args);
+        let result = match operation {
+            "create" => {
+                let request = crate::contradiction::CreateContradictionRequest {
+                    namespace: namespace.clone(),
+                    realm: args
+                        .get("realm")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("project")
+                        .to_string(),
+                    project: args
+                        .get("project")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string),
+                    claim_key: args
+                        .get("claim_key")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| ErrorData::invalid_params("missing 'claim_key'", None))?
+                        .to_string(),
+                    cardinality: args
+                        .get("cardinality")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("single")
+                        .parse()
+                        .map_err(|error: anyhow::Error| {
+                            ErrorData::invalid_params(error.to_string(), None)
+                        })?,
+                    members: serde_json::from_value(
+                        args.get("members")
+                            .cloned()
+                            .ok_or_else(|| ErrorData::invalid_params("missing 'members'", None))?,
+                    )
+                    .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?,
+                    reason: args
+                        .get("reason")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| ErrorData::invalid_params("missing 'reason'", None))?
+                        .to_string(),
+                };
+                crate::contradiction::create(&self.db, &self.policy_principal, &request).await
+            }
+            "get" => {
+                let id = args
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| ErrorData::invalid_params("missing 'id'", None))?;
+                crate::contradiction::get(&self.db, &self.policy_principal, id, &namespace).await
+            }
+            "prefer" | "resolve" | "obsolete" => {
+                let id = args
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| ErrorData::invalid_params("missing 'id'", None))?;
+                let request = crate::contradiction::UpdateContradictionRequest {
+                    expected_version: args
+                        .get("expected_version")
+                        .and_then(|value| value.as_u64())
+                        .ok_or_else(|| {
+                            ErrorData::invalid_params("missing 'expected_version'", None)
+                        })?,
+                    status: match operation {
+                        "prefer" => crate::contradiction::ContradictionStatus::Preferred,
+                        "resolve" => crate::contradiction::ContradictionStatus::Resolved,
+                        _ => crate::contradiction::ContradictionStatus::Obsolete,
+                    },
+                    preferred_memory_id: args
+                        .get("preferred_memory_id")
+                        .and_then(|value| value.as_i64()),
+                    basis: args
+                        .get("basis")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| ErrorData::invalid_params("missing 'basis'", None))?
+                        .to_string(),
+                };
+                crate::contradiction::update(
+                    &self.db,
+                    &self.policy_principal,
+                    id,
+                    &namespace,
+                    &request,
+                )
+                .await
+            }
+            _ => return Err(ErrorData::invalid_params("unknown operation", None)),
+        }
+        .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
     async fn handle_dream_memory(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
         let project = args.get("project").and_then(|v| v.as_str());
         let dry_run = args
@@ -1622,6 +1749,7 @@ impl ServerHandler for IronMemServer {
             "remember" => self.handle_remember(&args).await,
             "get_memory_influence" => self.handle_get_memory_influence(&args).await,
             "set_memory_influence" => self.handle_set_memory_influence(&args).await,
+            "manage_contradiction" => self.handle_manage_contradiction(&args).await,
             "get_profile" => self.handle_get_profile().await,
             "refresh_profile" => self.handle_refresh_profile().await,
             "list_corrections" => self.handle_list_corrections(&args).await,
@@ -1866,11 +1994,17 @@ mod tests {
             .iter()
             .find(|tool| tool.name.as_ref() == "set_memory_influence")
             .expect("set_memory_influence tool registered");
+        let contradiction = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "manage_contradiction")
+            .expect("manage_contradiction tool registered");
         let get_schema = serde_json::to_value(get_policy).unwrap();
         let set_schema = serde_json::to_value(set_policy).unwrap();
+        let contradiction_schema = serde_json::to_value(contradiction).unwrap();
         assert!(get_schema["inputSchema"]["properties"]["memory_id"].is_object());
         assert!(set_schema["inputSchema"]["properties"]["expected_version"].is_object());
         assert!(set_schema["inputSchema"]["properties"]["reason"].is_object());
+        assert!(contradiction_schema["inputSchema"]["properties"]["operation"].is_object());
     }
 
     #[tokio::test]
@@ -1948,6 +2082,62 @@ mod tests {
             "influence_policy_capability_required"
         );
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn manage_contradiction_uses_one_versioned_handler_for_create_get_and_prefer() {
+        let (server, path) = test_server().await;
+        let project = "/tmp/mcp-contradiction";
+        let session = db::create_session(&server.db, project).await.unwrap();
+        let first = db::insert_memory(&server.db, project, &session, "oauth", None)
+            .await
+            .unwrap();
+        let second = db::insert_memory(&server.db, project, &session, "passkey", None)
+            .await
+            .unwrap();
+        let mut create_args = JsonObject::new();
+        create_args.insert("operation".into(), serde_json::json!("create"));
+        create_args.insert("namespace".into(), serde_json::json!("local"));
+        create_args.insert("realm".into(), serde_json::json!("project"));
+        create_args.insert("project".into(), serde_json::json!(project));
+        create_args.insert("claim_key".into(), serde_json::json!("project.auth.mode"));
+        create_args.insert("cardinality".into(), serde_json::json!("single"));
+        create_args.insert("reason".into(), serde_json::json!("MCP contradiction test"));
+        create_args.insert(
+            "members".into(),
+            serde_json::json!([
+                {"memory_id": first, "stance": "competing"},
+                {"memory_id": second, "stance": "competing"}
+            ]),
+        );
+        let created: serde_json::Value = serde_json::from_str(&result_text(
+            &server
+                .handle_manage_contradiction(&create_args)
+                .await
+                .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(created["members"].as_array().unwrap().len(), 2);
+        let id = created["id"].as_str().unwrap();
+
+        let mut prefer_args = JsonObject::new();
+        prefer_args.insert("operation".into(), serde_json::json!("prefer"));
+        prefer_args.insert("id".into(), serde_json::json!(id));
+        prefer_args.insert("namespace".into(), serde_json::json!("local"));
+        prefer_args.insert("expected_version".into(), serde_json::json!(1));
+        prefer_args.insert("preferred_memory_id".into(), serde_json::json!(second));
+        prefer_args.insert("basis".into(), serde_json::json!("passing runtime"));
+        let preferred: serde_json::Value = serde_json::from_str(&result_text(
+            &server
+                .handle_manage_contradiction(&prefer_args)
+                .await
+                .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(preferred["status"], "preferred");
+        assert_eq!(preferred["version"], 2);
+        assert_eq!(preferred["members"].as_array().unwrap().len(), 2);
         let _ = std::fs::remove_file(path);
     }
 

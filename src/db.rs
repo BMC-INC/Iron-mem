@@ -837,6 +837,55 @@ async fn migrate_influence_policy(db: &Database) -> Result<()> {
     Ok(())
 }
 
+async fn migrate_contradictions(db: &Database) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS contradiction_sets (
+            id TEXT PRIMARY KEY,
+            namespace TEXT NOT NULL,
+            realm TEXT NOT NULL,
+            project TEXT,
+            claim_key TEXT NOT NULL,
+            claim_schema_version BIGINT NOT NULL,
+            cardinality TEXT NOT NULL,
+            preferred_memory_id BIGINT,
+            status TEXT NOT NULL DEFAULT 'unresolved',
+            resolution_basis TEXT,
+            resolved_by TEXT,
+            version BIGINT NOT NULL DEFAULT 1,
+            created_at BIGINT NOT NULL,
+            updated_at BIGINT NOT NULL
+        )",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_contradiction_claim
+         ON contradiction_sets(namespace, realm, COALESCE(project, ''), claim_key)",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS contradiction_members (
+            contradiction_set_id TEXT NOT NULL,
+            memory_id BIGINT NOT NULL,
+            stance TEXT NOT NULL DEFAULT 'competing',
+            created_at BIGINT NOT NULL,
+            PRIMARY KEY(contradiction_set_id, memory_id),
+            FOREIGN KEY(contradiction_set_id) REFERENCES contradiction_sets(id) ON DELETE CASCADE,
+            FOREIGN KEY(memory_id) REFERENCES memory_meta(memory_id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_contradiction_members_memory
+         ON contradiction_members(memory_id, contradiction_set_id)",
+    )
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
 impl Database {
     pub async fn new(url: &str) -> Result<Self> {
         register_sqlite_vec();
@@ -1234,6 +1283,7 @@ impl Database {
         // explicit row read as version-1 permissive policy, so migration changes
         // neither retrieval scores nor legacy behavior.
         migrate_influence_policy(self).await?;
+        migrate_contradictions(self).await?;
 
         match self.backend {
             Backend::Sqlite => {
@@ -3556,8 +3606,28 @@ pub async fn influence_contexts_for(
                 derivation_depth,
                 evidence_root_count,
                 record_hash: row.try_get("record_hash").ok().flatten(),
+                unresolved_contradiction_set_ids: Vec::new(),
             },
         );
+    }
+    let membership_rows = sqlx::query(&format!(
+        "SELECT cm.memory_id, cm.contradiction_set_id
+           FROM contradiction_members cm
+           JOIN contradiction_sets cs ON cs.id = cm.contradiction_set_id
+          WHERE cs.namespace = $1 AND cs.status = 'unresolved'
+            AND cm.memory_id IN ({in_list})
+          ORDER BY cm.memory_id, cm.contradiction_set_id"
+    ))
+    .bind(&namespace)
+    .fetch_all(&db.pool)
+    .await?;
+    for row in membership_rows {
+        let memory_id: i64 = row.get("memory_id");
+        if let Some(context) = contexts.get_mut(&memory_id) {
+            context
+                .unresolved_contradiction_set_ids
+                .push(row.get("contradiction_set_id"));
+        }
     }
     Ok(contexts)
 }
@@ -3702,6 +3772,7 @@ pub struct InfluenceEventInfo {
     pub project: String,
     pub namespace: String,
     pub purpose_authority: String,
+    pub confirmation_receipt_id: Option<String>,
     pub task_type: String,
     pub action_risk: String,
     pub decision: String,
@@ -3718,7 +3789,7 @@ pub async fn influence_events_for_memory(
 ) -> Result<Vec<InfluenceEventInfo>> {
     let rows = sqlx::query(
         "SELECT decision_id, request_id, memory_id, project, namespace,
-                purpose_authority, task_type, action_risk, decision,
+                purpose_authority, confirmation_receipt_id, task_type, action_risk, decision,
                 reason_codes, policy_version, evaluator_version, created_at
            FROM memory_influence_events
           WHERE memory_id = $1
@@ -3737,6 +3808,7 @@ pub async fn influence_events_for_memory(
             project: row.get("project"),
             namespace: row.get("namespace"),
             purpose_authority: row.get("purpose_authority"),
+            confirmation_receipt_id: row.try_get("confirmation_receipt_id").ok().flatten(),
             task_type: row.get("task_type"),
             action_risk: row.get("action_risk"),
             decision: row.get("decision"),
@@ -3747,6 +3819,44 @@ pub async fn influence_events_for_memory(
             created_at: row.get("created_at"),
         })
         .collect())
+}
+
+pub async fn influence_compliance_status(db: &Database) -> Result<serde_json::Value> {
+    let policy_rows = sqlx::query(
+        "SELECT COALESCE(p.state, 'eligible') AS state, COUNT(*) AS count
+           FROM memory_meta mm LEFT JOIN memory_influence_policy p ON p.memory_id=mm.memory_id
+          WHERE mm.tombstoned_at IS NULL GROUP BY COALESCE(p.state, 'eligible')",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    let mut policy_states = std::collections::BTreeMap::new();
+    for row in policy_rows {
+        policy_states.insert(row.get::<String, _>("state"), row.get::<i64, _>("count"));
+    }
+    let depth_row = sqlx::query(
+        "SELECT COUNT(*) AS count
+           FROM memory_meta mm JOIN memory_influence_policy p ON p.memory_id=mm.memory_id
+          WHERE p.maximum_derivation_depth IS NOT NULL
+            AND mm.derivation_depth > p.maximum_derivation_depth",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    let high_risk_row = sqlx::query(
+        "SELECT COUNT(DISTINCT e.decision_id) AS count
+           FROM memory_influence_events e
+           JOIN contradiction_members cm ON cm.memory_id=e.memory_id
+           JOIN contradiction_sets cs ON cs.id=cm.contradiction_set_id
+          WHERE cs.status='unresolved' AND e.action_risk IN ('high','critical')",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    Ok(serde_json::json!({
+        "policy_states": policy_states,
+        "influence_events": influence_event_status(db).await?,
+        "high_risk_requests_with_unresolved_contradictions": high_risk_row.get::<i64, _>("count"),
+        "memories_exceeding_policy_derivation_depth": depth_row.get::<i64, _>("count"),
+        "contradictions": contradiction_status(db).await?,
+    }))
 }
 
 async fn influence_policy_record_on_connection(
@@ -3983,6 +4093,558 @@ pub async fn restore_memory_influence_policy(
     .execute(&db.pool)
     .await?;
     Ok(())
+}
+
+async fn validate_contradiction_members(
+    db: &Database,
+    request: &crate::contradiction::CreateContradictionRequest,
+    namespace: &str,
+) -> Result<()> {
+    let ids = request
+        .members
+        .iter()
+        .map(|member| member.memory_id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let memory_id_column = match db.backend {
+        Backend::Sqlite => "m.rowid",
+        Backend::Postgres => "m.id",
+    };
+    let rows = sqlx::query(&format!(
+        "SELECT mm.memory_id, mm.namespace, mm.scope, m.project
+           FROM memory_meta mm JOIN memories m ON {memory_id_column} = mm.memory_id
+          WHERE mm.memory_id IN ({ids})"
+    ))
+    .fetch_all(&db.pool)
+    .await?;
+    if rows.len() != request.members.len() {
+        return Err(anyhow::Error::new(PolicyError::InvalidPolicy(
+            "one or more contradiction members do not exist".to_string(),
+        )));
+    }
+    for row in rows {
+        let member_namespace: String = row.get("namespace");
+        let scope: String = row.get("scope");
+        let project: String = row.get("project");
+        if member_namespace != namespace {
+            return Err(anyhow::Error::new(PolicyError::InvalidPolicy(
+                "contradiction members must share the requested namespace".to_string(),
+            )));
+        }
+        match request.realm.as_str() {
+            "user" if scope != "user" => {
+                return Err(anyhow::Error::new(PolicyError::InvalidPolicy(
+                    "user-realm contradiction members must have user scope".to_string(),
+                )))
+            }
+            "project" if request.project.as_deref() != Some(project.as_str()) => {
+                return Err(anyhow::Error::new(PolicyError::InvalidPolicy(
+                    "project-realm contradiction members must share the project".to_string(),
+                )))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+async fn contradiction_set_on_connection(
+    connection: &mut sqlx::AnyConnection,
+    id: &str,
+    namespace: &str,
+) -> Result<crate::contradiction::ContradictionSet> {
+    let row = sqlx::query(
+        "SELECT id, namespace, realm, project, claim_key, claim_schema_version,
+                cardinality, preferred_memory_id, status, resolution_basis,
+                resolved_by, version, created_at, updated_at
+           FROM contradiction_sets WHERE id = $1 AND namespace = $2",
+    )
+    .bind(id)
+    .bind(namespace)
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| anyhow::Error::new(PolicyError::ContradictionNotFound { id: id.to_string() }))?;
+    let member_rows = sqlx::query(
+        "SELECT memory_id, stance FROM contradiction_members
+          WHERE contradiction_set_id = $1 ORDER BY memory_id",
+    )
+    .bind(id)
+    .fetch_all(&mut *connection)
+    .await?;
+    Ok(crate::contradiction::ContradictionSet {
+        id: row.get("id"),
+        namespace: row.get("namespace"),
+        realm: row.get("realm"),
+        project: row.try_get("project").ok().flatten(),
+        claim_key: row.get("claim_key"),
+        claim_schema_version: u32::try_from(row.get::<i64, _>("claim_schema_version"))?,
+        cardinality: row.get::<String, _>("cardinality").parse()?,
+        preferred_memory_id: row.try_get("preferred_memory_id").ok().flatten(),
+        status: row.get::<String, _>("status").parse()?,
+        resolution_basis: row.try_get("resolution_basis").ok().flatten(),
+        resolved_by: row.try_get("resolved_by").ok().flatten(),
+        version: u64::try_from(row.get::<i64, _>("version"))?,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        members: member_rows
+            .into_iter()
+            .map(|member| {
+                Ok(crate::contradiction::ContradictionMember {
+                    memory_id: member.get("memory_id"),
+                    stance: member.get::<String, _>("stance").parse()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+async fn create_contradiction_set_on_connection(
+    connection: &mut sqlx::AnyConnection,
+    principal: &PolicyPrincipal,
+    request: &crate::contradiction::CreateContradictionRequest,
+    namespace: &str,
+    claim_key: &str,
+) -> Result<crate::contradiction::ContradictionSet> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO contradiction_sets(
+            id, namespace, realm, project, claim_key, claim_schema_version,
+            cardinality, status, version, created_at, updated_at
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,'unresolved',1,$8,$9)",
+    )
+    .bind(&id)
+    .bind(namespace)
+    .bind(&request.realm)
+    .bind(&request.project)
+    .bind(claim_key)
+    .bind(i64::from(crate::contradiction::CLAIM_SCHEMA_VERSION))
+    .bind(request.cardinality.to_string())
+    .bind(now)
+    .bind(now)
+    .execute(&mut *connection)
+    .await?;
+    for member in &request.members {
+        sqlx::query(
+            "INSERT INTO contradiction_members(contradiction_set_id, memory_id, stance, created_at)
+             VALUES($1,$2,$3,$4)",
+        )
+        .bind(&id)
+        .bind(member.memory_id)
+        .bind(member.stance.to_string())
+        .bind(now)
+        .execute(&mut *connection)
+        .await?;
+    }
+    let payload = serde_json::json!({
+        "contradiction_set_id": id,
+        "claim_key": claim_key,
+        "claim_schema_version": crate::contradiction::CLAIM_SCHEMA_VERSION,
+        "cardinality": request.cardinality,
+        "realm": request.realm,
+        "project": request.project,
+        "member_ids": request.members.iter().map(|member| member.memory_id).collect::<Vec<_>>(),
+        "reason": request.reason.trim(),
+    });
+    append_memory_ledger_on_connection(
+        connection,
+        namespace,
+        request.members.first().map(|member| member.memory_id),
+        "contradiction_create",
+        Some(&principal.actor),
+        &payload.to_string(),
+        None,
+    )
+    .await?;
+    contradiction_set_on_connection(connection, &id, namespace).await
+}
+
+pub async fn create_contradiction_set(
+    db: &Database,
+    principal: &PolicyPrincipal,
+    request: &crate::contradiction::CreateContradictionRequest,
+    namespace: &str,
+    claim_key: &str,
+) -> Result<crate::contradiction::ContradictionSet> {
+    validate_contradiction_members(db, request, namespace).await?;
+    match db.backend {
+        Backend::Sqlite => {
+            let _guard = sqlite_ledger_write_lock().lock().await;
+            let mut connection = db.pool.acquire().await?;
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *connection)
+                .await?;
+            match create_contradiction_set_on_connection(
+                &mut connection,
+                principal,
+                request,
+                namespace,
+                claim_key,
+            )
+            .await
+            {
+                Ok(set) => {
+                    sqlx::query("COMMIT").execute(&mut *connection).await?;
+                    Ok(set)
+                }
+                Err(error) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    Err(error)
+                }
+            }
+        }
+        Backend::Postgres => {
+            let mut tx = db.pool.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(namespace)
+                .execute(&mut *tx)
+                .await?;
+            let set = create_contradiction_set_on_connection(
+                &mut tx, principal, request, namespace, claim_key,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(set)
+        }
+    }
+}
+
+pub async fn get_contradiction_set(
+    db: &Database,
+    id: &str,
+    namespace: &str,
+) -> Result<crate::contradiction::ContradictionSet> {
+    let mut connection = db.pool.acquire().await?;
+    contradiction_set_on_connection(&mut connection, id, namespace).await
+}
+
+pub async fn contradiction_sets_for_memory(
+    db: &Database,
+    memory_id: i64,
+    namespace: &str,
+) -> Result<Vec<crate::contradiction::ContradictionSet>> {
+    let rows = sqlx::query(
+        "SELECT cs.id
+           FROM contradiction_sets cs
+           JOIN contradiction_members cm ON cm.contradiction_set_id=cs.id
+          WHERE cm.memory_id=$1 AND cs.namespace=$2
+          ORDER BY cs.updated_at DESC, cs.id",
+    )
+    .bind(memory_id)
+    .bind(normalize_namespace(namespace))
+    .fetch_all(&db.pool)
+    .await?;
+    let mut sets = Vec::with_capacity(rows.len());
+    let mut connection = db.pool.acquire().await?;
+    for row in rows {
+        sets.push(
+            contradiction_set_on_connection(
+                &mut connection,
+                &row.get::<String, _>("id"),
+                namespace,
+            )
+            .await?,
+        );
+    }
+    Ok(sets)
+}
+
+pub async fn contradiction_status(db: &Database) -> Result<serde_json::Value> {
+    let rows =
+        sqlx::query("SELECT status, COUNT(*) AS count FROM contradiction_sets GROUP BY status")
+            .fetch_all(&db.pool)
+            .await?;
+    let mut statuses = std::collections::BTreeMap::new();
+    for row in rows {
+        statuses.insert(row.get::<String, _>("status"), row.get::<i64, _>("count"));
+    }
+    Ok(serde_json::json!({
+        "total": statuses.values().sum::<i64>(),
+        "unresolved": statuses.get("unresolved").copied().unwrap_or(0),
+        "statuses": statuses,
+    }))
+}
+
+pub async fn delete_project_contradiction_sets(db: &Database, project: &str) -> Result<()> {
+    sqlx::query("DELETE FROM contradiction_sets WHERE realm='project' AND project=$1")
+        .bind(project)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn restore_contradiction_set(
+    db: &Database,
+    set: &crate::contradiction::ContradictionSet,
+    id_map: &std::collections::HashMap<i64, i64>,
+) -> Result<bool> {
+    let members = set
+        .members
+        .iter()
+        .filter_map(|member| {
+            id_map
+                .get(&member.memory_id)
+                .copied()
+                .map(|memory_id| (memory_id, member.stance))
+        })
+        .collect::<Vec<_>>();
+    if members.len() < 2 {
+        return Ok(false);
+    }
+    let preferred = set
+        .preferred_memory_id
+        .and_then(|memory_id| id_map.get(&memory_id).copied());
+    sqlx::query(
+        "INSERT INTO contradiction_sets(
+            id, namespace, realm, project, claim_key, claim_schema_version,
+            cardinality, preferred_memory_id, status, resolution_basis,
+            resolved_by, version, created_at, updated_at
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         ON CONFLICT(id) DO UPDATE SET preferred_memory_id=excluded.preferred_memory_id,
+            status=excluded.status, resolution_basis=excluded.resolution_basis,
+            resolved_by=excluded.resolved_by, version=excluded.version,
+            updated_at=excluded.updated_at",
+    )
+    .bind(&set.id)
+    .bind(&set.namespace)
+    .bind(&set.realm)
+    .bind(&set.project)
+    .bind(&set.claim_key)
+    .bind(i64::from(set.claim_schema_version))
+    .bind(set.cardinality.to_string())
+    .bind(preferred)
+    .bind(set.status.to_string())
+    .bind(&set.resolution_basis)
+    .bind(&set.resolved_by)
+    .bind(i64::try_from(set.version)?)
+    .bind(set.created_at)
+    .bind(set.updated_at)
+    .execute(&db.pool)
+    .await?;
+    for (memory_id, stance) in members {
+        sqlx::query(
+            "INSERT INTO contradiction_members(contradiction_set_id,memory_id,stance,created_at)
+             VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+        )
+        .bind(&set.id)
+        .bind(memory_id)
+        .bind(stance.to_string())
+        .bind(set.created_at)
+        .execute(&db.pool)
+        .await?;
+    }
+    Ok(true)
+}
+
+async fn update_contradiction_set_on_connection(
+    connection: &mut sqlx::AnyConnection,
+    principal: &PolicyPrincipal,
+    id: &str,
+    namespace: &str,
+    request: &crate::contradiction::UpdateContradictionRequest,
+) -> Result<crate::contradiction::ContradictionSet> {
+    let current = contradiction_set_on_connection(connection, id, namespace).await?;
+    if current.version != request.expected_version {
+        return Err(anyhow::Error::new(PolicyError::VersionConflict {
+            expected: request.expected_version,
+            actual: current.version,
+        }));
+    }
+    if matches!(
+        request.status,
+        crate::contradiction::ContradictionStatus::Preferred
+            | crate::contradiction::ContradictionStatus::Resolved
+    ) && request.preferred_memory_id.is_none()
+    {
+        return Err(anyhow::Error::new(PolicyError::InvalidPolicy(
+            "preferred and resolved states require a preferred memory".to_string(),
+        )));
+    }
+    if let Some(preferred) = request.preferred_memory_id {
+        if !current
+            .members
+            .iter()
+            .any(|member| member.memory_id == preferred)
+        {
+            return Err(anyhow::Error::new(PolicyError::InvalidPolicy(
+                "preferred memory must be a contradiction-set member".to_string(),
+            )));
+        }
+    }
+    let next_version = current
+        .version
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("version overflow"))?;
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "UPDATE contradiction_sets
+            SET preferred_memory_id=$1, status=$2, resolution_basis=$3,
+                resolved_by=$4, version=$5, updated_at=$6
+          WHERE id=$7 AND namespace=$8",
+    )
+    .bind(request.preferred_memory_id)
+    .bind(request.status.to_string())
+    .bind(request.basis.trim())
+    .bind(&principal.actor)
+    .bind(i64::try_from(next_version)?)
+    .bind(now)
+    .bind(id)
+    .bind(namespace)
+    .execute(&mut *connection)
+    .await?;
+    let payload = serde_json::json!({
+        "contradiction_set_id": id,
+        "old_status": current.status,
+        "new_status": request.status,
+        "old_version": current.version,
+        "new_version": next_version,
+        "preferred_memory_id": request.preferred_memory_id,
+        "basis": request.basis.trim(),
+    });
+    append_memory_ledger_on_connection(
+        connection,
+        namespace,
+        request
+            .preferred_memory_id
+            .or_else(|| current.members.first().map(|member| member.memory_id)),
+        "contradiction_update",
+        Some(&principal.actor),
+        &payload.to_string(),
+        None,
+    )
+    .await?;
+    contradiction_set_on_connection(connection, id, namespace).await
+}
+
+pub async fn update_contradiction_set(
+    db: &Database,
+    principal: &PolicyPrincipal,
+    id: &str,
+    namespace: &str,
+    request: &crate::contradiction::UpdateContradictionRequest,
+) -> Result<crate::contradiction::ContradictionSet> {
+    match db.backend {
+        Backend::Sqlite => {
+            let _guard = sqlite_ledger_write_lock().lock().await;
+            let mut connection = db.pool.acquire().await?;
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *connection)
+                .await?;
+            match update_contradiction_set_on_connection(
+                &mut connection,
+                principal,
+                id,
+                namespace,
+                request,
+            )
+            .await
+            {
+                Ok(set) => {
+                    sqlx::query("COMMIT").execute(&mut *connection).await?;
+                    Ok(set)
+                }
+                Err(error) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    Err(error)
+                }
+            }
+        }
+        Backend::Postgres => {
+            let mut tx = db.pool.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(namespace)
+                .execute(&mut *tx)
+                .await?;
+            let set =
+                update_contradiction_set_on_connection(&mut tx, principal, id, namespace, request)
+                    .await?;
+            tx.commit().await?;
+            Ok(set)
+        }
+    }
+}
+
+pub async fn ensure_graph_contradiction_set(
+    db: &Database,
+    namespace: &str,
+    realm: &str,
+    project: Option<&str>,
+    claim_key: &str,
+    memory_ids: &[i64],
+) -> Result<String> {
+    let namespace = normalize_namespace(namespace);
+    let now = Utc::now().timestamp();
+    let proposed_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO contradiction_sets(
+            id, namespace, realm, project, claim_key, claim_schema_version,
+            cardinality, status, version, created_at, updated_at
+         ) VALUES($1,$2,$3,$4,$5,$6,'single','unresolved',1,$7,$8)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&proposed_id)
+    .bind(&namespace)
+    .bind(realm)
+    .bind(project)
+    .bind(claim_key)
+    .bind(i64::from(crate::contradiction::CLAIM_SCHEMA_VERSION))
+    .bind(now)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    let row = sqlx::query(
+        "SELECT id FROM contradiction_sets
+          WHERE namespace=$1 AND realm=$2 AND COALESCE(project, '')=COALESCE($3, '')
+            AND claim_key=$4",
+    )
+    .bind(&namespace)
+    .bind(realm)
+    .bind(project)
+    .bind(claim_key)
+    .fetch_one(&db.pool)
+    .await?;
+    let id: String = row.get("id");
+    let mut inserted = 0_u64;
+    for memory_id in memory_ids {
+        inserted += sqlx::query(
+            "INSERT INTO contradiction_members(contradiction_set_id, memory_id, stance, created_at)
+             VALUES($1,$2,'competing',$3) ON CONFLICT DO NOTHING",
+        )
+        .bind(&id)
+        .bind(memory_id)
+        .bind(now)
+        .execute(&db.pool)
+        .await?
+        .rows_affected();
+    }
+    if inserted > 0 {
+        sqlx::query(
+            "UPDATE contradiction_sets SET status='unresolved', preferred_memory_id=NULL,
+                    resolution_basis=NULL, resolved_by=NULL, version=version+1, updated_at=$1
+              WHERE id=$2 AND id<>$3",
+        )
+        .bind(now)
+        .bind(&id)
+        .bind(&proposed_id)
+        .execute(&db.pool)
+        .await?;
+        let payload = serde_json::json!({
+            "contradiction_set_id": id,
+            "claim_key": claim_key,
+            "member_ids": memory_ids,
+            "detector": "graph_reconciliation_v1",
+        });
+        append_memory_ledger(
+            db,
+            &namespace,
+            memory_ids.first().copied(),
+            "contradiction_detected",
+            Some("ironmem:graph-reconciler"),
+            &payload.to_string(),
+        )
+        .await?;
+    }
+    Ok(id)
 }
 
 pub async fn append_memory_ledger(
@@ -4810,6 +5472,7 @@ async fn reconcile_inserted_memory_edge(
     target_norm: &str,
     observed_at: i64,
 ) -> Result<()> {
+    detect_graph_contradiction(db, edge, source_norm, relation_norm, target_norm).await?;
     sqlx::query(
         "UPDATE memory_edges
          SET superseded_by = $1, superseded_reason = 'duplicate'
@@ -4857,6 +5520,71 @@ async fn reconcile_inserted_memory_edge(
         .await?;
     }
 
+    Ok(())
+}
+
+async fn detect_graph_contradiction(
+    db: &Database,
+    edge: &NewMemoryEdge,
+    source_norm: &str,
+    relation_norm: &str,
+    target_norm: &str,
+) -> Result<()> {
+    if crate::contradiction::relation_cardinality(relation_norm)
+        != Some(crate::contradiction::ClaimCardinality::Single)
+        || edge.valid_until.is_some()
+    {
+        return Ok(());
+    }
+    let owner = sqlx::query("SELECT namespace, scope FROM memory_meta WHERE memory_id=$1")
+        .bind(edge.memory_id)
+        .fetch_optional(&db.pool)
+        .await?;
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    let namespace: String = owner.get("namespace");
+    let scope: String = owner.get("scope");
+    let rows = sqlx::query(
+        "SELECT DISTINCT me.memory_id
+           FROM memory_edges me
+           JOIN memory_meta mm ON mm.memory_id = me.memory_id
+          WHERE me.project=$1 AND me.source_norm=$2 AND me.relation_norm=$3
+            AND me.target_norm<>$4 AND me.superseded_by IS NULL
+            AND mm.namespace=$5 AND mm.scope=$6",
+    )
+    .bind(&edge.project)
+    .bind(source_norm)
+    .bind(relation_norm)
+    .bind(target_norm)
+    .bind(&namespace)
+    .bind(&scope)
+    .fetch_all(&db.pool)
+    .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut memory_ids = rows
+        .into_iter()
+        .map(|row| row.get::<i64, _>("memory_id"))
+        .collect::<BTreeSet<_>>();
+    memory_ids.insert(edge.memory_id);
+    let claim_key =
+        crate::contradiction::canonical_claim_key(&format!("{}.{}", source_norm, relation_norm))?;
+    let (realm, project) = if scope == "user" {
+        ("user", None)
+    } else {
+        ("project", Some(edge.project.as_str()))
+    };
+    ensure_graph_contradiction_set(
+        db,
+        &namespace,
+        realm,
+        project,
+        &claim_key,
+        &memory_ids.into_iter().collect::<Vec<_>>(),
+    )
+    .await?;
     Ok(())
 }
 
