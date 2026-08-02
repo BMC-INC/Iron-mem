@@ -11,6 +11,10 @@ use crate::governance::{
     new_evidence_root_id, normalize_namespace, sha256_hex, source_type_str, trust_tier_str,
     MemoryGovernance, DEFAULT_NAMESPACE,
 };
+use crate::influence::{
+    MemoryInfluencePolicy, MemoryInfluencePolicyRecord, PolicyError, PolicyMutationRequest,
+    PolicyPrincipal, StoredInfluencePolicy,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Backend {
@@ -326,6 +330,8 @@ pub struct EvidenceInventory {
 const EVIDENCE_ROOT_MIGRATION_ID: &str = "2026-08-01-evidence-roots-v1";
 const EVIDENCE_ROOT_MIGRATION_VERSION: u32 = 1;
 const EVIDENCE_ROOT_BACKFILL_BATCH: i64 = 256;
+const INFLUENCE_POLICY_MIGRATION_ID: &str = "2026-08-02-influence-policy-v1";
+const INFLUENCE_POLICY_MIGRATION_VERSION: u32 = 1;
 
 async fn add_memory_meta_column(db: &Database, column_sql: &str) -> Result<()> {
     match db.backend {
@@ -732,6 +738,52 @@ async fn migrate_evidence_roots(db: &Database) -> Result<()> {
     Ok(())
 }
 
+async fn migrate_influence_policy(db: &Database) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_influence_policy (
+            memory_id BIGINT PRIMARY KEY,
+            version BIGINT NOT NULL DEFAULT 1,
+            state TEXT NOT NULL DEFAULT 'eligible',
+            allowed_task_types TEXT NOT NULL DEFAULT '[]',
+            denied_task_types TEXT NOT NULL DEFAULT '[]',
+            maximum_action_risk TEXT NOT NULL DEFAULT 'critical',
+            requires_original_source BIGINT NOT NULL DEFAULT 0,
+            requires_human_confirmation BIGINT NOT NULL DEFAULT 0,
+            maximum_derivation_depth BIGINT,
+            updated_by TEXT,
+            updated_at BIGINT NOT NULL,
+            FOREIGN KEY(memory_id) REFERENCES memory_meta(memory_id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_influence_state
+         ON memory_influence_policy(state, memory_id)",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let now = Utc::now().timestamp();
+    let report = serde_json::json!({
+        "version": INFLUENCE_POLICY_MIGRATION_VERSION,
+        "default_policy": "implicit_permissive",
+        "backfilled_rows": 0,
+    });
+    sqlx::query(
+        "INSERT INTO schema_migrations(migration_id, version, status, cursor, report, updated_at)
+         VALUES($1, $2, 'complete', 0, $3, $4)
+         ON CONFLICT(migration_id) DO NOTHING",
+    )
+    .bind(INFLUENCE_POLICY_MIGRATION_ID)
+    .bind(INFLUENCE_POLICY_MIGRATION_VERSION as i64)
+    .bind(report.to_string())
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
 impl Database {
     pub async fn new(url: &str) -> Result<Self> {
         register_sqlite_vec();
@@ -1124,6 +1176,11 @@ impl Database {
         // evidence root and derivation depth. The migration owns its durable
         // cursor/report and remains restart-safe on large legacy databases.
         migrate_evidence_roots(self).await?;
+
+        // Governed influence phase 2: policies are sparse. Memories without an
+        // explicit row read as version-1 permissive policy, so migration changes
+        // neither retrieval scores nor legacy behavior.
+        migrate_influence_policy(self).await?;
 
         match self.backend {
             Backend::Sqlite => {
@@ -3303,6 +3360,329 @@ pub async fn apply_memory_governance(
         &payload.to_string(),
     )
     .await
+}
+
+fn influence_policy_record_from_row(row: sqlx::any::AnyRow) -> Result<MemoryInfluencePolicyRecord> {
+    let memory_id: i64 = row.get("memory_id");
+    let namespace: String = row.get("namespace");
+    let version: Option<i64> = row.try_get("policy_version").ok().flatten();
+    let Some(version) = version else {
+        return Ok(MemoryInfluencePolicyRecord {
+            memory_id,
+            namespace,
+            policy: MemoryInfluencePolicy::default(),
+            explicit: false,
+            updated_by: None,
+            updated_at: None,
+        });
+    };
+    let state: String = row.get("policy_state");
+    let allowed_task_types: String = row.get("allowed_task_types");
+    let denied_task_types: String = row.get("denied_task_types");
+    let maximum_action_risk: String = row.get("maximum_action_risk");
+    let requires_original_source = row.get::<i64, _>("requires_original_source") != 0;
+    let requires_human_confirmation = row.get::<i64, _>("requires_human_confirmation") != 0;
+    let maximum_derivation_depth: Option<i64> =
+        row.try_get("maximum_derivation_depth").ok().flatten();
+    let policy = MemoryInfluencePolicy::from_storage(StoredInfluencePolicy {
+        version,
+        state: &state,
+        allowed_task_types: &allowed_task_types,
+        denied_task_types: &denied_task_types,
+        maximum_action_risk: &maximum_action_risk,
+        requires_original_source,
+        requires_human_confirmation,
+        maximum_derivation_depth,
+    })
+    .map_err(anyhow::Error::new)?;
+    Ok(MemoryInfluencePolicyRecord {
+        memory_id,
+        namespace,
+        policy,
+        explicit: true,
+        updated_by: row.try_get("updated_by").ok().flatten(),
+        updated_at: row.try_get("policy_updated_at").ok().flatten(),
+    })
+}
+
+const INFLUENCE_POLICY_SELECT: &str = "SELECT mm.memory_id, mm.namespace,
+            p.version AS policy_version,
+            p.state AS policy_state,
+            p.allowed_task_types,
+            p.denied_task_types,
+            p.maximum_action_risk,
+            p.requires_original_source,
+            p.requires_human_confirmation,
+            p.maximum_derivation_depth,
+            p.updated_by,
+            p.updated_at AS policy_updated_at
+     FROM memory_meta mm
+     LEFT JOIN memory_influence_policy p ON p.memory_id = mm.memory_id
+     WHERE mm.memory_id = $1 AND mm.namespace = $2";
+
+pub async fn get_memory_influence_policy(
+    db: &Database,
+    memory_id: i64,
+    namespace: &str,
+) -> Result<MemoryInfluencePolicyRecord> {
+    let namespace = normalize_namespace(namespace);
+    let row = sqlx::query(INFLUENCE_POLICY_SELECT)
+        .bind(memory_id)
+        .bind(&namespace)
+        .fetch_optional(&db.pool)
+        .await?;
+    row.map(influence_policy_record_from_row)
+        .transpose()?
+        .ok_or_else(|| {
+            anyhow::Error::new(PolicyError::MemoryNotFound {
+                memory_id,
+                namespace,
+            })
+        })
+}
+
+pub async fn get_explicit_memory_influence_policy(
+    db: &Database,
+    memory_id: i64,
+    namespace: &str,
+) -> Result<Option<MemoryInfluencePolicyRecord>> {
+    let record = get_memory_influence_policy(db, memory_id, namespace).await?;
+    Ok(record.explicit.then_some(record))
+}
+
+async fn influence_policy_record_on_connection(
+    connection: &mut sqlx::AnyConnection,
+    memory_id: i64,
+    namespace: &str,
+) -> Result<MemoryInfluencePolicyRecord> {
+    let row = sqlx::query(INFLUENCE_POLICY_SELECT)
+        .bind(memory_id)
+        .bind(namespace)
+        .fetch_optional(&mut *connection)
+        .await?;
+    row.map(influence_policy_record_from_row)
+        .transpose()?
+        .ok_or_else(|| {
+            anyhow::Error::new(PolicyError::MemoryNotFound {
+                memory_id,
+                namespace: namespace.to_string(),
+            })
+        })
+}
+
+async fn update_memory_influence_policy_on_connection(
+    connection: &mut sqlx::AnyConnection,
+    memory_id: i64,
+    namespace: &str,
+    principal: &PolicyPrincipal,
+    request: &PolicyMutationRequest,
+) -> Result<MemoryInfluencePolicyRecord> {
+    let current = influence_policy_record_on_connection(connection, memory_id, namespace).await?;
+    if current.policy.version != request.expected_version {
+        return Err(anyhow::Error::new(PolicyError::VersionConflict {
+            expected: request.expected_version,
+            actual: current.policy.version,
+        }));
+    }
+    let mut next = request
+        .patch
+        .apply(&current.policy)
+        .map_err(anyhow::Error::new)?;
+    if next == current.policy {
+        return Err(anyhow::Error::new(PolicyError::NoChange));
+    }
+    next.version = current.policy.version.checked_add(1).ok_or_else(|| {
+        anyhow::Error::new(PolicyError::InvalidPolicy(
+            "policy version overflow".to_string(),
+        ))
+    })?;
+    let version = i64::try_from(next.version).map_err(|_| {
+        anyhow::Error::new(PolicyError::InvalidPolicy(
+            "policy version exceeds storage range".to_string(),
+        ))
+    })?;
+    let maximum_derivation_depth = next.maximum_derivation_depth.map(i64::from);
+    let allowed_task_types = serde_json::to_string(&next.allowed_task_types)?;
+    let denied_task_types = serde_json::to_string(&next.denied_task_types)?;
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO memory_influence_policy(
+            memory_id, version, state, allowed_task_types, denied_task_types,
+            maximum_action_risk, requires_original_source,
+            requires_human_confirmation, maximum_derivation_depth,
+            updated_by, updated_at
+         ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT(memory_id) DO UPDATE SET
+            version = excluded.version,
+            state = excluded.state,
+            allowed_task_types = excluded.allowed_task_types,
+            denied_task_types = excluded.denied_task_types,
+            maximum_action_risk = excluded.maximum_action_risk,
+            requires_original_source = excluded.requires_original_source,
+            requires_human_confirmation = excluded.requires_human_confirmation,
+            maximum_derivation_depth = excluded.maximum_derivation_depth,
+            updated_by = excluded.updated_by,
+            updated_at = excluded.updated_at",
+    )
+    .bind(memory_id)
+    .bind(version)
+    .bind(next.state.to_string())
+    .bind(&allowed_task_types)
+    .bind(&denied_task_types)
+    .bind(next.maximum_action_risk.to_string())
+    .bind(if next.requires_original_source {
+        1_i64
+    } else {
+        0_i64
+    })
+    .bind(if next.requires_human_confirmation {
+        1_i64
+    } else {
+        0_i64
+    })
+    .bind(maximum_derivation_depth)
+    .bind(&principal.actor)
+    .bind(now)
+    .execute(&mut *connection)
+    .await?;
+
+    let payload = serde_json::json!({
+        "actor": principal.actor,
+        "authority": principal.authority,
+        "new_policy": next,
+        "new_version": version,
+        "old_policy": current.policy,
+        "old_version": request.expected_version,
+        "reason": request.reason.trim(),
+        "request_id": request.request_id.trim(),
+    });
+    append_memory_ledger_on_connection(
+        connection,
+        namespace,
+        Some(memory_id),
+        "influence_policy_update",
+        Some(&principal.actor),
+        &payload.to_string(),
+        None,
+    )
+    .await?;
+
+    Ok(MemoryInfluencePolicyRecord {
+        memory_id,
+        namespace: namespace.to_string(),
+        policy: next,
+        explicit: true,
+        updated_by: Some(principal.actor.clone()),
+        updated_at: Some(now),
+    })
+}
+
+pub async fn update_memory_influence_policy(
+    db: &Database,
+    memory_id: i64,
+    namespace: &str,
+    principal: &PolicyPrincipal,
+    request: &PolicyMutationRequest,
+) -> Result<MemoryInfluencePolicyRecord> {
+    request.validate().map_err(anyhow::Error::new)?;
+    let namespace = normalize_namespace(namespace);
+    match db.backend {
+        Backend::Sqlite => {
+            let _write_guard = sqlite_ledger_write_lock().lock().await;
+            let mut connection = db.pool.acquire().await?;
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *connection)
+                .await?;
+            match update_memory_influence_policy_on_connection(
+                &mut connection,
+                memory_id,
+                &namespace,
+                principal,
+                request,
+            )
+            .await
+            {
+                Ok(record) => {
+                    sqlx::query("COMMIT").execute(&mut *connection).await?;
+                    Ok(record)
+                }
+                Err(error) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    Err(error)
+                }
+            }
+        }
+        Backend::Postgres => {
+            let mut transaction = db.pool.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(&namespace)
+                .execute(&mut *transaction)
+                .await?;
+            let record = update_memory_influence_policy_on_connection(
+                &mut transaction,
+                memory_id,
+                &namespace,
+                principal,
+                request,
+            )
+            .await?;
+            transaction.commit().await?;
+            Ok(record)
+        }
+    }
+}
+
+pub async fn restore_memory_influence_policy(
+    db: &Database,
+    memory_id: i64,
+    policy: &MemoryInfluencePolicy,
+    updated_by: Option<&str>,
+    updated_at: Option<i64>,
+) -> Result<()> {
+    anyhow::ensure!(policy.version >= 1, "cannot restore policy version zero");
+    let allowed_task_types = serde_json::to_string(&policy.allowed_task_types)?;
+    let denied_task_types = serde_json::to_string(&policy.denied_task_types)?;
+    sqlx::query(
+        "INSERT INTO memory_influence_policy(
+            memory_id, version, state, allowed_task_types, denied_task_types,
+            maximum_action_risk, requires_original_source,
+            requires_human_confirmation, maximum_derivation_depth,
+            updated_by, updated_at
+         ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT(memory_id) DO UPDATE SET
+            version = excluded.version,
+            state = excluded.state,
+            allowed_task_types = excluded.allowed_task_types,
+            denied_task_types = excluded.denied_task_types,
+            maximum_action_risk = excluded.maximum_action_risk,
+            requires_original_source = excluded.requires_original_source,
+            requires_human_confirmation = excluded.requires_human_confirmation,
+            maximum_derivation_depth = excluded.maximum_derivation_depth,
+            updated_by = excluded.updated_by,
+            updated_at = excluded.updated_at",
+    )
+    .bind(memory_id)
+    .bind(i64::try_from(policy.version)?)
+    .bind(policy.state.to_string())
+    .bind(allowed_task_types)
+    .bind(denied_task_types)
+    .bind(policy.maximum_action_risk.to_string())
+    .bind(if policy.requires_original_source {
+        1_i64
+    } else {
+        0_i64
+    })
+    .bind(if policy.requires_human_confirmation {
+        1_i64
+    } else {
+        0_i64
+    })
+    .bind(policy.maximum_derivation_depth.map(i64::from))
+    .bind(updated_by)
+    .bind(updated_at.unwrap_or_else(|| Utc::now().timestamp()))
+    .execute(&db.pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn append_memory_ledger(
@@ -6013,6 +6393,10 @@ pub async fn get_memories_by_kind(
 pub async fn delete_memory_meta(db: &Database, memory_id: i64) -> Result<()> {
     // Explicit child-first cleanup keeps this correct even when a SQLite
     // connection has foreign-key enforcement disabled.
+    sqlx::query("DELETE FROM memory_influence_policy WHERE memory_id = $1")
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
     sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id = $1")
         .bind(memory_id)
         .execute(&db.pool)
@@ -7963,6 +8347,144 @@ mod tests {
         let ledger = memory_ledger_for_memory(&db, id).await?;
         assert!(ledger.iter().any(|e| e.op_type == "remember"));
         assert!(ledger.iter().any(|e| e.op_type == "forget"));
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn influence_policy_is_sparse_versioned_ledgered_and_legal_hold_safe() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = create_session(&db, "/tmp/policy").await?;
+        let memory_id = insert_memory(
+            &db,
+            "/tmp/policy",
+            &session,
+            "policy-controlled memory",
+            None,
+        )
+        .await?;
+        let mut governance = crate::governance::MemoryGovernance::explicit();
+        governance.legal_hold = true;
+        apply_memory_governance(
+            &db,
+            memory_id,
+            "project",
+            "fact",
+            &governance,
+            Some("test"),
+            "remember",
+        )
+        .await?;
+
+        let count: i64 = sqlx::query("SELECT COUNT(*) AS count FROM memory_influence_policy")
+            .fetch_one(&db.pool)
+            .await?
+            .get("count");
+        assert_eq!(count, 0, "permissive defaults must stay implicit");
+        let default = get_memory_influence_policy(&db, memory_id, "local").await?;
+        assert!(!default.explicit);
+        assert!(default.policy.is_permissive());
+
+        let principal = PolicyPrincipal::local_operator("operator:test");
+        let first_request = PolicyMutationRequest {
+            expected_version: 1,
+            patch: crate::influence::MemoryInfluencePolicyPatch {
+                state: Some(crate::influence::InfluenceState::Blocked),
+                denied_task_types: Some(vec!["Deploy Prod".to_string()]),
+                ..Default::default()
+            },
+            reason: "prevent action use while evidence is reviewed".to_string(),
+            request_id: "policy-test-1".to_string(),
+        };
+        let updated =
+            update_memory_influence_policy(&db, memory_id, "local", &principal, &first_request)
+                .await?;
+        assert_eq!(updated.policy.version, 2);
+        assert_eq!(
+            updated.policy.state,
+            crate::influence::InfluenceState::Blocked
+        );
+        assert_eq!(updated.policy.denied_task_types, ["deploy_prod"]);
+
+        let ledger = memory_ledger_for_memory(&db, memory_id).await?;
+        let transition = ledger
+            .iter()
+            .find(|entry| entry.op_type == "influence_policy_update")
+            .expect("policy transition ledger entry");
+        let payload: serde_json::Value = serde_json::from_str(&transition.payload)?;
+        assert_eq!(payload["old_version"], 1);
+        assert_eq!(payload["new_version"], 2);
+        assert_eq!(payload["authority"], "local_operator");
+        assert_eq!(payload["request_id"], "policy-test-1");
+
+        let stale = update_memory_influence_policy(
+            &db,
+            memory_id,
+            "local",
+            &principal,
+            &PolicyMutationRequest {
+                expected_version: 1,
+                patch: crate::influence::MemoryInfluencePolicyPatch {
+                    state: Some(crate::influence::InfluenceState::Eligible),
+                    ..Default::default()
+                },
+                reason: "stale writer".to_string(),
+                request_id: "policy-test-stale".to_string(),
+            },
+        )
+        .await
+        .expect_err("stale policy update must fail");
+        assert!(matches!(
+            crate::influence::policy_error(&stale),
+            Some(PolicyError::VersionConflict {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        assert_eq!(
+            get_memory_influence_policy(&db, memory_id, "local")
+                .await?
+                .policy
+                .state,
+            crate::influence::InfluenceState::Blocked
+        );
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn influence_policy_cleanup_is_explicitly_child_first() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = create_session(&db, "/tmp/policy-cleanup").await?;
+        let memory_id =
+            insert_memory(&db, "/tmp/policy-cleanup", &session, "cleanup policy", None).await?;
+        update_memory_influence_policy(
+            &db,
+            memory_id,
+            "local",
+            &PolicyPrincipal::local_operator("operator:test"),
+            &PolicyMutationRequest {
+                expected_version: 1,
+                patch: crate::influence::MemoryInfluencePolicyPatch {
+                    state: Some(crate::influence::InfluenceState::Blocked),
+                    ..Default::default()
+                },
+                reason: "cleanup test".to_string(),
+                request_id: "policy-cleanup".to_string(),
+            },
+        )
+        .await?;
+        delete_memory_meta(&db, memory_id).await?;
+        let count: i64 = sqlx::query(
+            "SELECT COUNT(*) AS count FROM memory_influence_policy WHERE memory_id = $1",
+        )
+        .bind(memory_id)
+        .fetch_one(&db.pool)
+        .await?
+        .get("count");
+        assert_eq!(count, 0);
 
         let _ = std::fs::remove_file(path);
         Ok(())
