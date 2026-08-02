@@ -6,6 +6,7 @@ mod compliance;
 mod compress;
 mod config;
 mod context;
+mod contradiction;
 mod corrections;
 mod db;
 #[cfg(test)]
@@ -246,6 +247,58 @@ enum InfluenceCommands {
 }
 
 #[derive(Subcommand)]
+enum ContradictionCommands {
+    /// Create an unresolved contradiction set without deleting either claim
+    Create {
+        #[arg(long)]
+        claim_key: String,
+        /// Comma-separated memory ids
+        #[arg(long, value_delimiter = ',', num_args = 2..)]
+        members: Vec<i64>,
+        #[arg(long, default_value = "single")]
+        cardinality: String,
+        #[arg(long, default_value = "project")]
+        realm: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "local")]
+        namespace: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Show a contradiction set and every competing member
+    Show {
+        id: String,
+        #[arg(long, default_value = "local")]
+        namespace: String,
+    },
+    /// Mark one member preferred while preserving all competing evidence
+    Prefer {
+        id: String,
+        #[arg(long)]
+        memory: i64,
+        #[arg(long)]
+        expected_version: u64,
+        #[arg(long)]
+        basis: String,
+        #[arg(long, default_value = "local")]
+        namespace: String,
+    },
+    /// Resolve a contradiction in favor of one preserved member
+    Resolve {
+        id: String,
+        #[arg(long)]
+        memory: i64,
+        #[arg(long)]
+        expected_version: u64,
+        #[arg(long)]
+        basis: String,
+        #[arg(long, default_value = "local")]
+        namespace: String,
+    },
+}
+
+#[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Start the ironmem worker server
@@ -407,6 +460,12 @@ enum Commands {
     Influence {
         #[command(subcommand)]
         action: InfluenceCommands,
+    },
+
+    /// Create, inspect, prefer, or resolve competing memory claims
+    Contradiction {
+        #[command(subcommand)]
+        action: ContradictionCommands,
     },
 
     /// Show the user profile (durable cross-project facts + recent activity)
@@ -886,6 +945,7 @@ async fn async_main() -> Result<()> {
             reason,
         } => run_forget(&cfg, memory_id, &actor, reason.as_deref()).await?,
         Commands::Influence { action } => run_influence(&cfg, action).await?,
+        Commands::Contradiction { action } => run_contradiction(&cfg, action).await?,
         Commands::Profile { refresh } => run_profile(&cfg, refresh).await?,
         Commands::Corrections {
             project,
@@ -1511,6 +1571,87 @@ async fn run_influence(cfg: &config::Config, action: InfluenceCommands) -> Resul
             );
         }
     }
+    Ok(())
+}
+
+async fn run_contradiction(cfg: &config::Config, action: ContradictionCommands) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    let principal = influence::PolicyPrincipal::local_operator("ironmem:cli");
+    let set = match action {
+        ContradictionCommands::Create {
+            claim_key,
+            members,
+            cardinality,
+            realm,
+            project,
+            namespace,
+            reason,
+        } => {
+            let request = contradiction::CreateContradictionRequest {
+                namespace,
+                realm,
+                project,
+                claim_key,
+                cardinality: cardinality.parse()?,
+                members: members
+                    .into_iter()
+                    .map(|memory_id| contradiction::ContradictionMember {
+                        memory_id,
+                        stance: contradiction::MemberStance::Competing,
+                    })
+                    .collect(),
+                reason,
+            };
+            contradiction::create(&database, &principal, &request).await?
+        }
+        ContradictionCommands::Show { id, namespace } => {
+            contradiction::get(&database, &principal, &id, &namespace).await?
+        }
+        ContradictionCommands::Prefer {
+            id,
+            memory,
+            expected_version,
+            basis,
+            namespace,
+        } => {
+            contradiction::update(
+                &database,
+                &principal,
+                &id,
+                &namespace,
+                &contradiction::UpdateContradictionRequest {
+                    expected_version,
+                    status: contradiction::ContradictionStatus::Preferred,
+                    preferred_memory_id: Some(memory),
+                    basis,
+                },
+            )
+            .await?
+        }
+        ContradictionCommands::Resolve {
+            id,
+            memory,
+            expected_version,
+            basis,
+            namespace,
+        } => {
+            contradiction::update(
+                &database,
+                &principal,
+                &id,
+                &namespace,
+                &contradiction::UpdateContradictionRequest {
+                    expected_version,
+                    status: contradiction::ContradictionStatus::Resolved,
+                    preferred_memory_id: Some(memory),
+                    basis,
+                },
+            )
+            .await?
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&set)?);
     Ok(())
 }
 

@@ -105,6 +105,7 @@ pub struct MemoryLineage {
     pub ledger: Vec<db::MemoryLedgerEntry>,
     pub injections: Vec<db::InjectionEventInfo>,
     pub influence_events: Vec<db::InfluenceEventInfo>,
+    pub contradiction_sets: Vec<crate::contradiction::ContradictionSet>,
 }
 
 pub async fn memory_lineage(db: &Database, memory_id: i64) -> Result<MemoryLineage> {
@@ -161,6 +162,11 @@ pub async fn memory_lineage(db: &Database, memory_id: i64) -> Result<MemoryLinea
         ledger: db::memory_ledger_for_memory(db, memory_id).await?,
         injections: db::injection_events_for_memory(db, memory_id, 200).await?,
         influence_events: db::influence_events_for_memory(db, memory_id, 200).await?,
+        contradiction_sets: if let Some(meta) = &meta {
+            db::contradiction_sets_for_memory(db, memory_id, &meta.namespace).await?
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -183,6 +189,7 @@ pub struct ComplianceReport {
     pub evidence_migration_status: Option<String>,
     pub evidence_migration: Option<db::EvidenceRootMigrationReport>,
     pub snapshots: Vec<SnapshotInfo>,
+    pub influence: serde_json::Value,
 }
 
 impl ComplianceReport {
@@ -302,6 +309,13 @@ impl ComplianceReport {
             }
         }
 
+        out.push_str("\n## Governed influence\n\n");
+        out.push_str("Policy-state inventory, allow and denial receipts, unresolved contradiction exposure, and derivation-limit findings are reported without storing raw recall queries or intended actions.\n\n");
+        out.push_str(&format!(
+            "```json\n{}\n```\n",
+            serde_json::to_string_pretty(&self.influence).unwrap_or_else(|_| "{}".to_string())
+        ));
+
         out.push_str(
             "\n## Controls in force\n\n\
              - PII/PHI writes fail closed without granted consent (`MemoryGovernance::validate`).\n\
@@ -335,6 +349,7 @@ pub async fn generate(db: &Database) -> Result<ComplianceReport> {
             created_at: s.created_at,
         })
         .collect();
+    let influence = db::influence_compliance_status(db).await?;
     Ok(ComplianceReport {
         generated_at: Utc::now().to_rfc3339(),
         chains,
@@ -345,6 +360,7 @@ pub async fn generate(db: &Database) -> Result<ComplianceReport> {
             .map(|(status, _)| status.clone()),
         evidence_migration: evidence_migration.map(|(_, report)| report),
         snapshots,
+        influence,
     })
 }
 

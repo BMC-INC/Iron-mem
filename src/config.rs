@@ -85,6 +85,16 @@ pub enum InfluenceMode {
     Strict,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContradictionHighRiskMode {
+    #[default]
+    Annotate,
+    RequireSource,
+    RequireConfirmation,
+    Deny,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfluenceConfig {
     #[serde(default)]
@@ -105,6 +115,8 @@ pub struct InfluenceConfig {
     pub high_risk_requires_source: bool,
     #[serde(default)]
     pub critical_risk_requires_confirmation: bool,
+    #[serde(default)]
+    pub contradiction_high_risk_mode: ContradictionHighRiskMode,
     /// Protected file containing the trusted-runtime HMAC key. Never inline key material.
     #[serde(default)]
     pub attestation_key_file: Option<String>,
@@ -125,6 +137,7 @@ impl Default for InfluenceConfig {
             confirmation_replay_protection: true,
             high_risk_requires_source: false,
             critical_risk_requires_confirmation: false,
+            contradiction_high_risk_mode: ContradictionHighRiskMode::Annotate,
             attestation_key_file: None,
             confirmation_key_file: None,
         }
@@ -1044,6 +1057,10 @@ mod tests {
         assert_eq!(cfg.influence.mode, InfluenceMode::Advisory);
         assert!(!cfg.influence.require_purpose);
         assert!(cfg.influence.record_denials);
+        assert_eq!(
+            cfg.influence.contradiction_high_risk_mode,
+            ContradictionHighRiskMode::Annotate
+        );
     }
 
     #[test]

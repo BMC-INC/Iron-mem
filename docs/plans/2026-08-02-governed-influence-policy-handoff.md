@@ -2,10 +2,10 @@
 
 **Updated:** 2026-08-02
 **Source plan:** PR #38, `docs/plans/2026-07-31-governed-memory-influence-plan.md`
-**Active worktree:** `/Users/kingjames/Projects/Iron-mem-pr38-policy`
-**Active branch:** `agent/governed-influence-policy`
-**Stack base:** `agent/governed-influence-evidence-roots` at `10c20feeb3dc93ed71bc5bc8703c528874feda22` (draft PR #39)
-**State:** Phase 2 is published as draft PR #40. The local-extraction prerequisite is implemented in draft PR #41 and the preserved live backlog has been recovered successfully. Phase 3 may resume after revalidating the stacked PR state.
+**Active worktree:** `/Users/kingjames/Projects/Iron-mem-pr38-contradictions-eval`
+**Active branch:** `agent/governed-influence-contradictions-eval`
+**Stack base:** Phase 3 PR #42 at `5a1a88becfe049b505c7837cb78db13cf9e0891e`
+**State:** PRs #38-#41 are merged. Phase 3 PR #42 is open and all eight checks are green. Phases 4 and 5 are implemented together on the active stacked branch and await final publication/CI. Do not merge either open PR until both are green and the user gives the final merge instruction.
 
 ## Delivery boundary
 
@@ -226,29 +226,24 @@ Runbook: `docs/plans/2026-08-02-offline-extraction-recovery-runbook.md` in PR #4
 
 ### Phase 3: purpose and shared egress gate
 
-- add advisory wire-purpose and verified-purpose types
-- implement local-operator and trusted-runtime attestations
-- add scoped, expiring, replay-protected human-confirmation receipts
-- implement deny-overrides-allow task evaluation and strict risk handling
-- route every content-bearing surface through one evaluator
-- add influence-event receipts and exact-source expansion controls
+- Completed in PR #42; all eight GitHub checks are green.
+- Every REST, MCP, CLI, Workbench, source-expansion, and file-injection content path uses the shared gate.
+- Audit receipts store hashes rather than raw queries/actions; confirmations and attestations are scope-bound and replay-protected.
 
 ### Phase 4: contradiction sets
 
-- add contradiction schema and versioned claim cardinality
-- implement deterministic creation, reconciliation, management APIs, and retrieval annotation
+- Implemented on `agent/governed-influence-contradictions-eval` together with Phase 5.
+- Includes versioned schema/cardinality, project and user realms, deterministic graph conflict detection, atomic ledgered management, REST/MCP/CLI surfaces, snapshot preservation, and evaluator annotation.
 
 ### Phase 5: evaluation and Workbench
 
-- add the counterfactual influence evaluation cluster
-- add Workbench simulation and evidence controls
-- finish compliance, lineage, status metrics, and performance/relevance gates
+- Implemented on the same combined branch.
+- Includes the deterministic counterfactual CI cluster, read-only Workbench simulation, policy/roots/contradiction/event evidence controls, compliance and lineage extensions, p50/p99 metrics, and permissive-relevance/unauthorized-release gates.
+- Local verification at this checkpoint: 275 passed, 0 failed, 1 ignored plus MCP stdio; strict clippy, diff check, and embedded JavaScript syntax check passed.
 
 ## Workspace safety
 
 - The removed Desktop checkout is not a source of truth and must not be used.
-- Continue Phase 2 only in `/Users/kingjames/Projects/Iron-mem-pr38-policy`.
-- PR #39 remains in `/Users/kingjames/Projects/Iron-mem-pr38-implementation`; do not mix its worktree with this branch.
-- Do not implement the extraction recovery in the Phase 2 worktree or append it to PR #40.
-- Create a dedicated Projects worktree and branch for the recovery PR. Because complete recovered child provenance depends on Phase 1 evidence roots, use `agent/governed-influence-evidence-roots` as the stack base while PR #39 is unmerged, then re-evaluate and simplify the PR bases after PR #39 lands.
-- Before creating that worktree, re-check `origin`, PR #39, PR #40, and all branch SHAs rather than trusting this snapshot as current.
+- Phase 3 remains in `/Users/kingjames/Projects/Iron-mem-pr38-egress`; Phases 4+5 remain in `/Users/kingjames/Projects/Iron-mem-pr38-contradictions-eval`.
+- PR #42 is deliberately open with auto-merge disabled. Publish the cumulative combined PR against `main`, let both PRs turn green, and merge only at the very end in dependency order.
+- Do not repeat the completed live extraction backfill unless receipt-backed status proves the database changed and new candidates exist.

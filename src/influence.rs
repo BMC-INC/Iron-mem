@@ -404,6 +404,9 @@ pub enum PolicyError {
         memory_id: i64,
         namespace: String,
     },
+    ContradictionNotFound {
+        id: String,
+    },
     NamespaceDenied {
         namespace: String,
         actor: String,
@@ -424,6 +427,7 @@ impl PolicyError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::MemoryNotFound { .. } => "memory_not_found",
+            Self::ContradictionNotFound { .. } => "contradiction_not_found",
             Self::NamespaceDenied { .. } => "namespace_denied",
             Self::CapabilityRequired { .. } => "influence_policy_capability_required",
             Self::VersionConflict { .. } => "policy_version_conflict",
@@ -450,6 +454,9 @@ impl fmt::Display for PolicyError {
                 formatter,
                 "memory {memory_id} was not found in namespace '{namespace}'"
             ),
+            Self::ContradictionNotFound { id } => {
+                write!(formatter, "contradiction set '{id}' was not found")
+            }
             Self::NamespaceDenied { namespace, actor } => write!(
                 formatter,
                 "actor '{actor}' may not access namespace '{namespace}'"

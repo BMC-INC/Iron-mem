@@ -16,6 +16,8 @@ pub struct SnapshotPayload {
     pub evidence: Vec<SnapshotMemoryEvidence>,
     #[serde(default)]
     pub influence_policies: Vec<SnapshotMemoryInfluencePolicy>,
+    #[serde(default)]
+    pub contradiction_sets: Vec<crate::contradiction::ContradictionSet>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,10 +43,12 @@ pub struct RestoreReport {
     pub memories_in_snapshot: usize,
     pub edges_in_snapshot: usize,
     pub influence_policies_in_snapshot: usize,
+    pub contradiction_sets_in_snapshot: usize,
     pub dry_run: bool,
     pub restored_memories: usize,
     pub restored_edges: usize,
     pub restored_influence_policies: usize,
+    pub restored_contradiction_sets: usize,
 }
 
 pub async fn create(
@@ -59,6 +63,7 @@ pub async fn create(
     let edges = db::all_memory_edges(db, project).await?;
     let mut evidence = Vec::with_capacity(memories.len());
     let mut influence_policies = Vec::new();
+    let mut contradiction_sets = std::collections::BTreeMap::new();
     for memory in &memories {
         let meta = db::get_memory_meta_full(db, memory.id).await?;
         if let Some(record) =
@@ -71,6 +76,9 @@ pub async fn create(
                 updated_at: record.updated_at,
             });
         }
+        for set in db::contradiction_sets_for_memory(db, memory.id, &meta.namespace).await? {
+            contradiction_sets.entry(set.id.clone()).or_insert(set);
+        }
         if let Some(evidence_root_id) = meta.evidence_root_id {
             evidence.push(SnapshotMemoryEvidence {
                 memory_id: memory.id,
@@ -82,12 +90,13 @@ pub async fn create(
         }
     }
     let payload = SnapshotPayload {
-        version: 3,
+        version: 4,
         project: project.map(ToOwned::to_owned),
         memories: memories.clone(),
         edges: edges.clone(),
         evidence,
         influence_policies,
+        contradiction_sets: contradiction_sets.into_values().collect(),
     };
     let bytes = serde_json::to_vec_pretty(&payload)?;
     let blob = crate::ccr::store_blob(db, &bytes, Some("json")).await?;
@@ -128,10 +137,12 @@ pub async fn restore(db: &Database, snapshot_id: &str, dry_run: bool) -> Result<
         memories_in_snapshot: payload.memories.len(),
         edges_in_snapshot: payload.edges.len(),
         influence_policies_in_snapshot: payload.influence_policies.len(),
+        contradiction_sets_in_snapshot: payload.contradiction_sets.len(),
         dry_run,
         restored_memories: 0,
         restored_edges: 0,
         restored_influence_policies: 0,
+        restored_contradiction_sets: 0,
     };
     if dry_run {
         return Ok(report);
@@ -139,6 +150,7 @@ pub async fn restore(db: &Database, snapshot_id: &str, dry_run: bool) -> Result<
 
     let project = payload.project.as_deref();
     if let Some(p) = project {
+        db::delete_project_contradiction_sets(db, p).await?;
         let existing = db::memory_ids_for_project(db, p).await?;
         for id in existing {
             let _ = db::decref_memory_session_blob(db, id).await;
@@ -195,6 +207,11 @@ pub async fn restore(db: &Database, snapshot_id: &str, dry_run: bool) -> Result<
         )
         .await?;
         report.restored_influence_policies += 1;
+    }
+    for set in &payload.contradiction_sets {
+        if db::restore_contradiction_set(db, set, &id_map).await? {
+            report.restored_contradiction_sets += 1;
+        }
     }
     for edge in &payload.edges {
         let new_edge = db::NewMemoryEdge {
@@ -274,13 +291,38 @@ mod tests {
             },
         )
         .await?;
+        crate::contradiction::create(
+            &db,
+            &crate::influence::PolicyPrincipal::local_operator("snapshot:test"),
+            &crate::contradiction::CreateContradictionRequest {
+                namespace: "local".into(),
+                realm: "project".into(),
+                project: Some(project.into()),
+                claim_key: "snapshot.test.claim".into(),
+                cardinality: crate::contradiction::ClaimCardinality::Single,
+                members: vec![
+                    crate::contradiction::ContradictionMember {
+                        memory_id: parent,
+                        stance: crate::contradiction::MemberStance::Competing,
+                    },
+                    crate::contradiction::ContradictionMember {
+                        memory_id: child,
+                        stance: crate::contradiction::MemberStance::Competing,
+                    },
+                ],
+                reason: "snapshot contradiction preservation".into(),
+            },
+        )
+        .await?;
 
         let snapshot = create(&db, Some("evidence"), Some(project)).await?;
         let payload = load_payload(&db, &snapshot.id).await?;
-        assert_eq!(payload.version, 3);
+        assert_eq!(payload.version, 4);
         assert_eq!(payload.evidence.len(), 2);
         assert_eq!(payload.influence_policies.len(), 1);
-        restore(&db, &snapshot.id, false).await?;
+        assert_eq!(payload.contradiction_sets.len(), 1);
+        let report = restore(&db, &snapshot.id, false).await?;
+        assert_eq!(report.restored_contradiction_sets, 1);
 
         let restored = db::get_recent_memories(&db, project, 10).await?;
         let child = restored
@@ -296,6 +338,9 @@ mod tests {
         assert!(meta.parent_memory_id.is_some());
         let restored_policy = db::get_memory_influence_policy(&db, child.id, "local").await?;
         assert_eq!(restored_policy.policy, policy.policy);
+        let restored_sets = db::contradiction_sets_for_memory(&db, child.id, "local").await?;
+        assert_eq!(restored_sets.len(), 1);
+        assert_eq!(restored_sets[0].members.len(), 2);
 
         let _ = std::fs::remove_file(path);
         Ok(())

@@ -21,6 +21,7 @@ pub struct CandidatePolicyContext {
     pub derivation_depth: u32,
     pub evidence_root_count: usize,
     pub record_hash: Option<String>,
+    pub unresolved_contradiction_set_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -325,10 +326,23 @@ pub fn evaluate(
         decision = InfluenceDecisionKind::Deny;
     }
 
+    let has_high_risk_contradiction = !candidate.unresolved_contradiction_set_ids.is_empty()
+        && purpose.action_risk >= crate::influence::ActionRisk::High;
+    if decision != InfluenceDecisionKind::Deny
+        && has_high_risk_contradiction
+        && config.contradiction_high_risk_mode == crate::config::ContradictionHighRiskMode::Deny
+    {
+        reasons.push("unresolved_contradiction".to_string());
+        decision = InfluenceDecisionKind::Deny;
+    }
+
     let source_required = policy.requires_original_source
         || purpose.require_source_backing
         || (config.high_risk_requires_source
-            && purpose.action_risk >= crate::influence::ActionRisk::High);
+            && purpose.action_risk >= crate::influence::ActionRisk::High)
+        || (has_high_risk_contradiction
+            && config.contradiction_high_risk_mode
+                == crate::config::ContradictionHighRiskMode::RequireSource);
     if decision != InfluenceDecisionKind::Deny && source_required {
         reasons.push("source_expansion_required".to_string());
         decision = if consumer.exact_source_expansion {
@@ -340,7 +354,10 @@ pub fn evaluate(
 
     let confirmation_required = policy.requires_human_confirmation
         || (config.critical_risk_requires_confirmation
-            && purpose.action_risk == crate::influence::ActionRisk::Critical);
+            && purpose.action_risk == crate::influence::ActionRisk::Critical)
+        || (has_high_risk_contradiction
+            && config.contradiction_high_risk_mode
+                == crate::config::ContradictionHighRiskMode::RequireConfirmation);
     if decision != InfluenceDecisionKind::Deny && confirmation_required && !confirmation_valid {
         reasons.push("human_confirmation_required".to_string());
         decision = InfluenceDecisionKind::RequireHumanConfirmation;
@@ -359,7 +376,7 @@ pub fn evaluate(
         config_hash: config_hash(config),
         evidence_root_count: candidate.evidence_root_count,
         derivation_depth: candidate.derivation_depth,
-        contradiction_set_ids: Vec::new(),
+        contradiction_set_ids: candidate.unresolved_contradiction_set_ids.clone(),
     };
     crate::metrics::record(crate::metrics::GovOp::InfluenceEval, started.elapsed());
     result
@@ -414,6 +431,7 @@ mod tests {
             derivation_depth: 2,
             evidence_root_count: 1,
             record_hash: None,
+            unresolved_contradiction_set_ids: Vec::new(),
         }
     }
 
@@ -504,11 +522,47 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_contradictions_are_annotated_and_high_risk_mode_is_enforced() {
+        let mut candidate = candidate(MemoryInfluencePolicy::default());
+        candidate.unresolved_contradiction_set_ids = vec!["set-1".into()];
+        let annotated = evaluate(
+            &candidate,
+            &purpose("deploy", ActionRisk::High),
+            ConsumerCapabilities::default(),
+            false,
+            &InfluenceConfig::default(),
+        );
+        assert_eq!(annotated.decision, InfluenceDecisionKind::Allow);
+        assert_eq!(annotated.contradiction_set_ids, vec!["set-1"]);
+
+        let config = InfluenceConfig {
+            contradiction_high_risk_mode:
+                crate::config::ContradictionHighRiskMode::RequireConfirmation,
+            ..Default::default()
+        };
+        let guarded = evaluate(
+            &candidate,
+            &purpose("deploy", ActionRisk::High),
+            ConsumerCapabilities::default(),
+            false,
+            &config,
+        );
+        assert_eq!(
+            guarded.decision,
+            InfluenceDecisionKind::RequireHumanConfirmation
+        );
+        assert!(guarded
+            .reason_codes
+            .contains(&"human_confirmation_required".to_string()));
+    }
+
+    #[test]
     fn evaluator_is_bounded_well_below_the_local_latency_budget() {
         let candidate = candidate(MemoryInfluencePolicy::default());
         let purpose = purpose("answer", ActionRisk::None);
-        let started = std::time::Instant::now();
-        for _ in 0..1_000 {
+        let mut samples = Vec::with_capacity(2_000);
+        for _ in 0..2_000 {
+            let started = std::time::Instant::now();
             let decision = evaluate(
                 &candidate,
                 &purpose,
@@ -517,8 +571,13 @@ mod tests {
                 &InfluenceConfig::default(),
             );
             assert_eq!(decision.decision, InfluenceDecisionKind::Allow);
+            samples.push(started.elapsed().as_nanos());
         }
-        assert!(started.elapsed().as_micros() / 1_000 < 1_000);
+        samples.sort_unstable();
+        let p50 = samples[samples.len() / 2];
+        let p99 = samples[(samples.len() * 99) / 100];
+        assert!(p50 < 1_000_000, "p50 was {p50}ns");
+        assert!(p99 < 5_000_000, "p99 was {p99}ns");
     }
 
     #[tokio::test]

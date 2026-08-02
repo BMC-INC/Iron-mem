@@ -1190,6 +1190,7 @@
       ["Namespace", evidence.metadata.namespace],
       ["Source", evidence.metadata.source_type],
       ["Source ref", evidence.metadata.source_ref || "Not recorded"],
+      ["Evidence root", evidence.metadata.evidence_root_id || "Not recorded"],
       ["Importance", Number(evidence.metadata.importance).toFixed(2)],
       ["Legal hold", evidence.metadata.legal_hold ? "Active" : "None"]
     ];
@@ -1199,6 +1200,107 @@
       metadata.appendChild(item);
     }
     metaSection.appendChild(metadata);
+
+    const influenceSection = make("section", "panel-section");
+    influenceSection.append(make("h2", "panel-title", "Influence controls"));
+    if (evidence.influence_policy) {
+      const policy = evidence.influence_policy.policy;
+      const policyMeta = make("div", "metadata");
+      const policyItems = [
+        ["State", policy.state.replace(/_/g, " ")],
+        ["Policy version", String(policy.version)],
+        ["Maximum risk", policy.maximum_action_risk],
+        ["Independent roots", String(evidence.independent_root_count)],
+        ["Derivation depth", String(evidence.metadata.derivation_depth)],
+        ["Original source", policy.requires_original_source ? "Required" : "Optional"],
+        ["Confirmation", policy.requires_human_confirmation ? "Required" : "Not required"]
+      ];
+      for (const [label, value] of policyItems) {
+        const item = make("div", "metadata-item");
+        item.append(make("span", "", label), make("strong", "", value));
+        policyMeta.appendChild(item);
+      }
+      influenceSection.appendChild(policyMeta);
+      const allow = policy.allowed_task_types.length ? policy.allowed_task_types.join(", ") : "Any task";
+      const deny = policy.denied_task_types.length ? policy.denied_task_types.join(", ") : "None";
+      influenceSection.append(make("p", "trace-empty", `Allowed: ${allow} / Denied: ${deny}`));
+    } else {
+      influenceSection.append(make("p", "trace-empty", "Influence-policy details require policy-read access."));
+    }
+
+    const contradictionSection = make("section", "panel-section");
+    contradictionSection.append(make("h2", "panel-title", `Contradictions (${evidence.contradiction_sets.length})`));
+    if (!evidence.contradiction_sets.length) {
+      contradictionSection.append(make("p", "trace-empty", "No competing claim set includes this memory."));
+    }
+    for (const set of evidence.contradiction_sets) {
+      const item = make("article", "evidence-chunk");
+      item.append(make("div", "chunk-title", set.claim_key));
+      item.append(make("div", "chunk-meta", `${set.status} / ${set.cardinality} / version ${set.version}`));
+      item.append(make("p", "trace-empty", `Members: ${set.members.map((member) => member.memory_id).join(", ")}${set.preferred_memory_id ? ` / preferred ${set.preferred_memory_id}` : ""}`));
+      contradictionSection.appendChild(item);
+    }
+
+    const simulationSection = make("section", "panel-section");
+    simulationSection.append(make("h2", "panel-title", "Influence simulation"));
+    simulationSection.append(make("p", "trace-empty", "Simulation is read-only. It never mints a confirmation receipt or authorizes a real action."));
+    const task = make("input", "input");
+    task.placeholder = "Task type, for example deploy";
+    task.value = "answer";
+    const action = make("input", "input");
+    action.placeholder = "Intended action (optional)";
+    const risk = make("select", "select");
+    for (const value of ["none", "low", "medium", "high", "critical"]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value;
+      risk.appendChild(option);
+    }
+    const requireSource = document.createElement("input");
+    requireSource.type = "checkbox";
+    const sourceLabel = make("label", "toggle-row");
+    sourceLabel.append(make("span", "", "Require exact source"), requireSource);
+    const simulate = make("button", "btn primary", "Simulate decision");
+    simulate.type = "button";
+    const simulationResult = make("div", "");
+    simulate.addEventListener("click", async () => {
+      simulate.disabled = true;
+      try {
+        const result = await request(`/api/memories/${evidence.memory.id}/influence/simulate`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            namespace: evidence.metadata.namespace,
+            task_type: task.value,
+            intended_action: action.value || null,
+            action_risk: risk.value,
+            require_source_backing: requireSource.checked,
+            reasoning_only_channel: true,
+            exact_source_expansion: true
+          })
+        });
+        clear(simulationResult);
+        const decision = result.decision;
+        simulationResult.append(make("p", "summary", decision.decision.replace(/_/g, " ")));
+        simulationResult.append(make("p", "trace-empty", decision.reason_codes.length ? decision.reason_codes.join(", ") : "No restrictions triggered"));
+        simulationResult.append(make("div", "chunk-meta", `${decision.purpose.authority} / policy ${decision.policy_version} / ${decision.evaluator_version}`));
+      } catch (error) {
+        clear(simulationResult);
+        simulationResult.append(make("div", "error-box", error.message));
+      } finally {
+        simulate.disabled = false;
+      }
+    });
+    simulationSection.append(task, action, risk, sourceLabel, simulate, simulationResult);
+
+    const eventSection = make("section", "panel-section");
+    eventSection.append(make("h2", "panel-title", `Recent influence events (${evidence.influence_events.length})`));
+    if (!evidence.influence_events.length) eventSection.append(make("p", "trace-empty", "No authorized influence receipts are visible."));
+    for (const event of evidence.influence_events) {
+      const item = make("div", "node-edge");
+      item.textContent = `${event.decision.replace(/_/g, " ")} / ${event.task_type} / ${event.reason_codes.join(", ") || "allowed"}`;
+      eventSection.appendChild(item);
+    }
 
     const chunkSection = make("section", "panel-section");
     chunkSection.append(make("h2", "panel-title", `Structured evidence (${evidence.chunks.length})`));
@@ -1223,9 +1325,9 @@
       const list = make("div", "node-edge-list");
       for (const edge of evidence.graph_edges) list.append(make("div", "node-edge", `${edge.source} -> ${edge.relation.replace(/_/g, " ")} -> ${edge.target}`));
       graphSection.appendChild(list);
-      target.append(memorySection, metaSection, chunkSection, sourceSection, graphSection);
+      target.append(memorySection, metaSection, influenceSection, contradictionSection, simulationSection, eventSection, chunkSection, sourceSection, graphSection);
     } else {
-      target.append(memorySection, metaSection, chunkSection, sourceSection);
+      target.append(memorySection, metaSection, influenceSection, contradictionSection, simulationSection, eventSection, chunkSection, sourceSection);
     }
   }
 
