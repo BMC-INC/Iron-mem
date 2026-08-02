@@ -1230,6 +1230,7 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+        crate::recovery::migrate(self).await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS memory_ledger_epochs (
                 namespace          TEXT NOT NULL,

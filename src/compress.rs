@@ -27,17 +27,18 @@ pub async fn run(
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
 
     let observations = db::get_observations_for_session(db, session_id).await?;
+    let local_result = local_compression_result(&observations);
     let result = match cfg.compression.mode {
-        CompressionMode::Local => local_compression_result(&observations),
+        CompressionMode::Local => local_result,
         CompressionMode::CloudWithLocalFallback => {
             match provider::compress(&observations, cfg).await {
-                Ok(result) => result,
+                Ok(cloud_result) => enrich_local_result(local_result, cloud_result),
                 Err(error) => {
                     tracing::warn!(
                         "cloud compression unavailable for session {session_id}; \
                      graduating with deterministic local compression: {error}"
                     );
-                    local_compression_result(&observations)
+                    local_result
                 }
             }
         }
@@ -63,6 +64,19 @@ pub async fn run(
             .await
             {
                 tracing::warn!("memory skim store failed (memory {memory_id}): {e}");
+            }
+            if let Some(hash) = hash.as_deref() {
+                if let Err(error) = crate::recovery::record_compression(
+                    db,
+                    memory_id,
+                    hash,
+                    observations.len(),
+                    &chunk_result,
+                )
+                .await
+                {
+                    tracing::warn!("extraction receipt failed (memory {memory_id}): {error}");
+                }
             }
         }
         Err(e) => {
@@ -104,6 +118,40 @@ pub async fn run(
         }
     }
     Ok(memory_id)
+}
+
+fn enrich_local_result(
+    mut local: CompressionResult,
+    cloud: CompressionResult,
+) -> CompressionResult {
+    let mut facts = local
+        .facts
+        .iter()
+        .map(|v| v.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    for fact in cloud.facts {
+        if facts.insert(fact.to_ascii_lowercase()) {
+            local.facts.push(fact);
+        }
+    }
+    let mut procedures = local
+        .procedures
+        .iter()
+        .map(|v| v.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    for procedure in cloud.procedures {
+        if procedures.insert(procedure.to_ascii_lowercase()) {
+            local.procedures.push(procedure);
+        }
+    }
+    local.summary = cloud.summary;
+    local.tags = cloud.tags;
+    local.importance = cloud.importance;
+    local.kind = cloud.kind;
+    local.event_time = cloud.event_time;
+    local.entities = cloud.entities;
+    local.relations.extend(cloud.relations);
+    local
 }
 
 const LOCAL_SUMMARY_MAX_BYTES: usize = 48_000;
@@ -161,6 +209,7 @@ fn local_explicit_relations(observations: &[db::Observation]) -> Vec<MemoryRelat
 /// through CCR and observation chunks immediately after persistence.
 fn local_compression_result(observations: &[db::Observation]) -> CompressionResult {
     let transcript = build_transcript(observations);
+    let extraction = crate::local_extractor::extract(observations);
     CompressionResult {
         summary: format!(
             "Local session archive ({} observations)\n{}",
@@ -170,6 +219,8 @@ fn local_compression_result(observations: &[db::Observation]) -> CompressionResu
         tags: "local-compression session-archive".to_string(),
         importance: 5,
         kind: "session".to_string(),
+        facts: extraction.facts,
+        procedures: extraction.procedures,
         relations: local_explicit_relations(observations),
         ..CompressionResult::default()
     }
@@ -1402,12 +1453,35 @@ mod tests {
         assert!(result.tags.contains("local-compression"));
         assert!(result.summary.contains("cargo test"));
         assert!(result.summary.contains("test result: ok"));
-        assert!(result.facts.is_empty());
+        assert_eq!(
+            result.facts,
+            vec!["Command `cargo test` completed successfully."]
+        );
         assert_eq!(result.relations.len(), 2);
         assert_eq!(result.relations[0].source, "Run:proof-1");
         assert_eq!(result.relations[0].relation, "completed_for");
         assert_eq!(result.relations[0].target, "Project:operator-os");
         assert_eq!(result.relations[0].confidence, 1.0);
+    }
+
+    #[test]
+    fn cloud_enrichment_preserves_local_extraction_and_deduplicates() {
+        let local = CompressionResult {
+            summary: "local".into(),
+            facts: vec!["Local fact".into()],
+            procedures: vec!["Local rule".into()],
+            ..Default::default()
+        };
+        let cloud = CompressionResult {
+            summary: "enriched".into(),
+            facts: vec!["local FACT".into(), "Cloud fact".into()],
+            procedures: vec!["Cloud rule".into()],
+            ..Default::default()
+        };
+        let result = enrich_local_result(local, cloud);
+        assert_eq!(result.summary, "enriched");
+        assert_eq!(result.facts, vec!["Local fact", "Cloud fact"]);
+        assert_eq!(result.procedures, vec!["Local rule", "Cloud rule"]);
     }
 
     #[tokio::test]
