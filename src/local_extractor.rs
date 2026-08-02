@@ -158,6 +158,7 @@ fn is_natural_language_tool(tool: &str) -> bool {
         || lower.contains("approvedmemory")
         || lower.contains("askuser")
         || lower.contains("sendmessage")
+        || lower == "archive"
         || lower == "remember"
 }
 

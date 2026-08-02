@@ -22,6 +22,7 @@ mod metrics;
 mod observer;
 mod profile;
 mod provider;
+mod recovery;
 mod reflection;
 mod reranker;
 mod retrieval;
@@ -351,6 +352,28 @@ enum Commands {
         /// Session ID to compress
         session_id: String,
     },
+
+    /// Recover locally extracted facts/procedures from preserved session transcripts
+    ExtractionBackfill {
+        /// Report candidates and extraction yield without writing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Resume strictly after this parent memory id
+        #[arg(long, default_value_t = 0)]
+        after_memory_id: i64,
+        /// Process at most this many archived or uncompressed sessions
+        #[arg(short, long, default_value_t = 5)]
+        limit: i64,
+        /// Require at least this many observations (useful for a long-session canary)
+        #[arg(long, default_value_t = 1)]
+        min_observations: i64,
+        /// Restrict recovery to one project
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// Show extraction yield, zero-yield streak, failures, and recovery progress
+    ExtractionStatus,
 
     /// Sweep idle/large sessions into memories or run due dream consolidation
     Sweep {
@@ -743,6 +766,47 @@ async fn async_main() -> Result<()> {
             dry_run,
         } => run_graph_backfill(&cfg, project.as_deref(), all, limit, dry_run).await?,
         Commands::Compress { session_id } => run_compress_cmd(&cfg, &session_id).await?,
+        Commands::ExtractionBackfill {
+            dry_run,
+            after_memory_id,
+            limit,
+            min_observations,
+            project,
+        } => {
+            let database = db::Database::new(&cfg.effective_database_url()).await?;
+            database.migrate().await?;
+            let (embedder, store): (
+                Option<std::sync::Arc<dyn embedder::Embedder>>,
+                std::sync::Arc<dyn vectorstore::VectorStore>,
+            ) = if dry_run {
+                (None, std::sync::Arc::new(vectorstore::BruteForceStore))
+            } else {
+                vectorstore::build_semantic(&database, &cfg).await
+            };
+            let report = recovery::backfill(
+                &database,
+                embedder.as_deref(),
+                store.as_ref(),
+                &cfg,
+                &recovery::BackfillOptions {
+                    dry_run,
+                    after_memory_id: after_memory_id.max(0),
+                    limit: limit.max(1),
+                    min_observations: min_observations.max(1),
+                    project,
+                },
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Commands::ExtractionStatus => {
+            let database = db::Database::new(&cfg.effective_database_url()).await?;
+            database.migrate().await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&recovery::status(&database).await?)?
+            );
+        }
         Commands::Sweep {
             compress_idle,
             min_observations,

@@ -1244,6 +1244,8 @@ pub struct StatusResponse {
     pub rerank: serde_json::Value,
     /// Session graduation mode. `local` requires no provider credentials.
     pub compression: serde_json::Value,
+    /// Receipt-backed local extraction yield and recovery state.
+    pub extraction: crate::recovery::ExtractionStatus,
 }
 
 async fn get_status(
@@ -1253,6 +1255,9 @@ async fn get_status(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let extraction = crate::recovery::status(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(StatusResponse {
         ok: true,
         sessions: stats.total_sessions,
@@ -1271,6 +1276,7 @@ async fn get_status(
             "mode": state.config.compression.mode,
             "cloud_required": false,
         }),
+        extraction,
     }))
 }
 
