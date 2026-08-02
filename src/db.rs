@@ -763,6 +763,59 @@ async fn migrate_influence_policy(db: &Database) -> Result<()> {
     )
     .execute(&db.pool)
     .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS influence_replay_nonces (
+            token_kind TEXT NOT NULL,
+            issuer TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            expires_at BIGINT NOT NULL,
+            consumed_at BIGINT NOT NULL,
+            PRIMARY KEY(token_kind, issuer, nonce)
+        )",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_influence_replay_expiry
+         ON influence_replay_nonces(expires_at)",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_influence_events (
+            id TEXT PRIMARY KEY,
+            decision_id TEXT NOT NULL UNIQUE,
+            request_id TEXT NOT NULL,
+            memory_id BIGINT NOT NULL,
+            project TEXT NOT NULL,
+            namespace TEXT NOT NULL,
+            agent_id TEXT,
+            purpose_authority TEXT NOT NULL,
+            attestation_id TEXT,
+            confirmation_receipt_id TEXT,
+            task_type TEXT NOT NULL,
+            intended_action_hash TEXT,
+            action_risk TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            reason_codes TEXT NOT NULL,
+            policy_version BIGINT NOT NULL,
+            evaluator_version TEXT NOT NULL,
+            config_hash TEXT NOT NULL,
+            purpose_hash TEXT NOT NULL,
+            query_hash TEXT,
+            memory_record_hash TEXT,
+            created_at BIGINT NOT NULL
+        )",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_influence_events_memory
+         ON memory_influence_events(namespace, memory_id, created_at)",
+    )
+    .execute(&db.pool)
+    .await?;
 
     let now = Utc::now().timestamp();
     let report = serde_json::json!({
@@ -3362,7 +3415,9 @@ pub async fn apply_memory_governance(
     .await
 }
 
-fn influence_policy_record_from_row(row: sqlx::any::AnyRow) -> Result<MemoryInfluencePolicyRecord> {
+fn influence_policy_record_from_row(
+    row: &sqlx::any::AnyRow,
+) -> Result<MemoryInfluencePolicyRecord> {
     let memory_id: i64 = row.get("memory_id");
     let namespace: String = row.get("namespace");
     let version: Option<i64> = row.try_get("policy_version").ok().flatten();
@@ -3431,7 +3486,8 @@ pub async fn get_memory_influence_policy(
         .bind(&namespace)
         .fetch_optional(&db.pool)
         .await?;
-    row.map(influence_policy_record_from_row)
+    row.as_ref()
+        .map(influence_policy_record_from_row)
         .transpose()?
         .ok_or_else(|| {
             anyhow::Error::new(PolicyError::MemoryNotFound {
@@ -3450,6 +3506,249 @@ pub async fn get_explicit_memory_influence_policy(
     Ok(record.explicit.then_some(record))
 }
 
+/// Batch-load every policy and lineage field required by the shared egress
+/// evaluator. One query avoids an N+1 policy lookup after ranking.
+pub async fn influence_contexts_for(
+    db: &Database,
+    memory_ids: &[i64],
+    namespace: &str,
+) -> Result<std::collections::HashMap<i64, crate::egress::CandidatePolicyContext>> {
+    let mut contexts = std::collections::HashMap::new();
+    if memory_ids.is_empty() {
+        return Ok(contexts);
+    }
+    let in_list = memory_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT mm.memory_id, mm.namespace, mm.derivation_depth, mm.record_hash,
+                (SELECT COUNT(DISTINCT mer.evidence_root_id)
+                   FROM memory_evidence_roots mer
+                  WHERE mer.memory_id = mm.memory_id) AS evidence_root_count,
+                p.version AS policy_version, p.state AS policy_state,
+                p.allowed_task_types, p.denied_task_types, p.maximum_action_risk,
+                p.requires_original_source, p.requires_human_confirmation,
+                p.maximum_derivation_depth, p.updated_by,
+                p.updated_at AS policy_updated_at
+           FROM memory_meta mm
+           LEFT JOIN memory_influence_policy p ON p.memory_id = mm.memory_id
+          WHERE mm.namespace = $1 AND mm.memory_id IN ({in_list})"
+    );
+    let namespace = normalize_namespace(namespace);
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql)
+        .bind(&namespace)
+        .fetch_all(&db.pool)
+        .await?;
+    for row in rows {
+        let record = influence_policy_record_from_row(&row)?;
+        let derivation_depth =
+            u32::try_from(row.try_get::<i64, _>("derivation_depth").unwrap_or(0))
+                .unwrap_or(u32::MAX);
+        let evidence_root_count =
+            usize::try_from(row.try_get::<i64, _>("evidence_root_count").unwrap_or(0))
+                .unwrap_or(usize::MAX);
+        contexts.insert(
+            record.memory_id,
+            crate::egress::CandidatePolicyContext {
+                record,
+                derivation_depth,
+                evidence_root_count,
+                record_hash: row.try_get("record_hash").ok().flatten(),
+            },
+        );
+    }
+    Ok(contexts)
+}
+
+pub async fn claim_influence_nonce(
+    db: &Database,
+    token_kind: &str,
+    issuer: &str,
+    nonce: &str,
+    request_id: &str,
+    expires_at: i64,
+) -> Result<()> {
+    let now = Utc::now().timestamp();
+    sqlx::query("DELETE FROM influence_replay_nonces WHERE expires_at < $1")
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+    let inserted = sqlx::query(
+        "INSERT INTO influence_replay_nonces(
+            token_kind, issuer, nonce, request_id, expires_at, consumed_at
+         ) VALUES($1, $2, $3, $4, $5, $6)
+         ON CONFLICT(token_kind, issuer, nonce) DO NOTHING",
+    )
+    .bind(token_kind)
+    .bind(issuer)
+    .bind(nonce)
+    .bind(request_id)
+    .bind(expires_at)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    if inserted.rows_affected() != 1 {
+        anyhow::bail!("{}_replayed", token_kind);
+    }
+    Ok(())
+}
+
+pub async fn record_influence_decisions(
+    db: &Database,
+    decisions: &[crate::egress::InfluenceDecision],
+    contexts: &std::collections::HashMap<i64, crate::egress::CandidatePolicyContext>,
+    record_denials: bool,
+    query_hash: Option<&str>,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let now = Utc::now().timestamp();
+    for decision in decisions {
+        if !record_denials
+            && matches!(
+                decision.decision,
+                crate::egress::InfluenceDecisionKind::Deny
+                    | crate::egress::InfluenceDecisionKind::RequireHumanConfirmation
+            )
+        {
+            continue;
+        }
+        let purpose_hash = crate::purpose::purpose_hash(&decision.purpose);
+        let intended_action_hash = decision
+            .purpose
+            .intended_action
+            .as_ref()
+            .map(|value| format!("{:x}", Sha256::digest(value.as_bytes())));
+        let authority = serde_json::to_value(decision.purpose.authority)?
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
+        let decision_kind = serde_json::to_value(decision.decision)?
+            .as_str()
+            .unwrap_or("deny")
+            .to_string();
+        sqlx::query(
+            "INSERT INTO memory_influence_events(
+                id, decision_id, request_id, memory_id, project, namespace,
+                agent_id, purpose_authority, attestation_id,
+                confirmation_receipt_id, task_type, intended_action_hash,
+                action_risk, decision, reason_codes, policy_version,
+                evaluator_version, config_hash, purpose_hash, query_hash,
+                memory_record_hash, created_at
+             ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+             ON CONFLICT(decision_id) DO NOTHING",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&decision.decision_id)
+        .bind(&decision.request_id)
+        .bind(decision.memory_id)
+        .bind(&decision.purpose.project)
+        .bind(&decision.purpose.namespace)
+        .bind(&decision.purpose.subject_agent_id)
+        .bind(authority)
+        .bind(&decision.purpose.attestation_id)
+        .bind(&decision.purpose.confirmation_receipt_id)
+        .bind(&decision.purpose.task_type)
+        .bind(intended_action_hash)
+        .bind(decision.purpose.action_risk.to_string())
+        .bind(decision_kind)
+        .bind(serde_json::to_string(&decision.reason_codes)?)
+        .bind(i64::try_from(decision.policy_version)?)
+        .bind(&decision.evaluator_version)
+        .bind(&decision.config_hash)
+        .bind(purpose_hash)
+        .bind(query_hash)
+        .bind(
+            contexts
+                .get(&decision.memory_id)
+                .and_then(|context| context.record_hash.as_deref()),
+        )
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+    }
+    Ok(())
+}
+
+pub async fn influence_event_status(db: &Database) -> Result<serde_json::Value> {
+    let rows = sqlx::query(
+        "SELECT decision, reason_codes FROM memory_influence_events ORDER BY created_at DESC",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    let mut decisions = std::collections::BTreeMap::<String, i64>::new();
+    let mut denials = std::collections::BTreeMap::<String, i64>::new();
+    for row in rows {
+        let decision: String = row.get("decision");
+        *decisions.entry(decision).or_default() += 1;
+        let reasons: String = row.get("reason_codes");
+        for reason in serde_json::from_str::<Vec<String>>(&reasons).unwrap_or_default() {
+            *denials.entry(reason).or_default() += 1;
+        }
+    }
+    Ok(serde_json::json!({
+        "total_decisions": decisions.values().sum::<i64>(),
+        "decisions": decisions,
+        "reason_codes": denials,
+    }))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InfluenceEventInfo {
+    pub decision_id: String,
+    pub request_id: String,
+    pub memory_id: i64,
+    pub project: String,
+    pub namespace: String,
+    pub purpose_authority: String,
+    pub task_type: String,
+    pub action_risk: String,
+    pub decision: String,
+    pub reason_codes: Vec<String>,
+    pub policy_version: i64,
+    pub evaluator_version: String,
+    pub created_at: i64,
+}
+
+pub async fn influence_events_for_memory(
+    db: &Database,
+    memory_id: i64,
+    limit: i64,
+) -> Result<Vec<InfluenceEventInfo>> {
+    let rows = sqlx::query(
+        "SELECT decision_id, request_id, memory_id, project, namespace,
+                purpose_authority, task_type, action_risk, decision,
+                reason_codes, policy_version, evaluator_version, created_at
+           FROM memory_influence_events
+          WHERE memory_id = $1
+          ORDER BY created_at DESC, decision_id DESC LIMIT $2",
+    )
+    .bind(memory_id)
+    .bind(limit.max(1))
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| InfluenceEventInfo {
+            decision_id: row.get("decision_id"),
+            request_id: row.get("request_id"),
+            memory_id: row.get("memory_id"),
+            project: row.get("project"),
+            namespace: row.get("namespace"),
+            purpose_authority: row.get("purpose_authority"),
+            task_type: row.get("task_type"),
+            action_risk: row.get("action_risk"),
+            decision: row.get("decision"),
+            reason_codes: serde_json::from_str(&row.get::<String, _>("reason_codes"))
+                .unwrap_or_default(),
+            policy_version: row.get("policy_version"),
+            evaluator_version: row.get("evaluator_version"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
 async fn influence_policy_record_on_connection(
     connection: &mut sqlx::AnyConnection,
     memory_id: i64,
@@ -3460,7 +3759,8 @@ async fn influence_policy_record_on_connection(
         .bind(namespace)
         .fetch_optional(&mut *connection)
         .await?;
-    row.map(influence_policy_record_from_row)
+    row.as_ref()
+        .map(influence_policy_record_from_row)
         .transpose()?
         .ok_or_else(|| {
             anyhow::Error::new(PolicyError::MemoryNotFound {
@@ -5096,6 +5396,65 @@ pub async fn get_memory_chunk(db: &Database, chunk_id: &str) -> Result<Option<Me
     Ok(row.map(memory_chunk_from_row))
 }
 
+pub async fn memory_ids_for_original_reference(
+    db: &Database,
+    observation_id: Option<i64>,
+    memory_id: Option<i64>,
+    hash: Option<&str>,
+    chunk_id: Option<&str>,
+) -> Result<Vec<i64>> {
+    let mut ids = std::collections::BTreeSet::new();
+    if let Some(memory_id) = memory_id {
+        ids.insert(memory_id);
+    }
+    if let Some(chunk_id) = chunk_id {
+        if let Some(chunk) = get_memory_chunk(db, chunk_id).await? {
+            ids.insert(chunk.memory_id);
+        }
+    }
+    let id_col = match db.backend {
+        Backend::Sqlite => "rowid",
+        Backend::Postgres => "id",
+    };
+    if let Some(observation_id) = observation_id {
+        let sql = format!(
+            "SELECT m.{id_col} AS memory_id
+               FROM observations o
+               JOIN memories m ON m.session_id = o.session_id
+              WHERE o.id = $1"
+        );
+        for row in sqlx::query(&sql)
+            .bind(observation_id)
+            .fetch_all(&db.pool)
+            .await?
+        {
+            ids.insert(row.get("memory_id"));
+        }
+    }
+    if let Some(hash) = hash {
+        for row in sqlx::query(
+            "SELECT memory_id FROM memory_meta WHERE session_blob = $1
+             UNION SELECT memory_id FROM memory_chunks WHERE source_hash = $1",
+        )
+        .bind(hash)
+        .fetch_all(&db.pool)
+        .await?
+        {
+            ids.insert(row.get("memory_id"));
+        }
+        let sql = format!(
+            "SELECT m.{id_col} AS memory_id
+               FROM observations o
+               JOIN memories m ON m.session_id = o.session_id
+              WHERE o.output_blob = $1"
+        );
+        for row in sqlx::query(&sql).bind(hash).fetch_all(&db.pool).await? {
+            ids.insert(row.get("memory_id"));
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
 pub async fn chunks_for_memories(
     db: &Database,
     memory_ids: &[i64],
@@ -6694,6 +7053,52 @@ pub async fn get_memory_by_id_in_namespace(
         tags: r.try_get("tags").ok().flatten(),
         created_at: r.get("created_at"),
     }))
+}
+
+pub async fn memories_by_ids_in_namespace(
+    db: &Database,
+    ids: &[i64],
+    namespace: &str,
+) -> Result<Vec<Memory>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let in_list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let id_col = match db.backend {
+        Backend::Sqlite => "rowid",
+        Backend::Postgres => "id",
+    };
+    let namespace = normalize_namespace(namespace);
+    let now = Utc::now().timestamp();
+    let sql = format!(
+        "SELECT m.{id_col} AS id, m.project, m.session_id, m.summary, m.tags, m.created_at
+           FROM memories m
+           LEFT JOIN memory_meta mm ON mm.memory_id = m.{id_col}
+          WHERE m.{id_col} IN ({in_list})
+            AND COALESCE(mm.namespace, 'local') = $1
+            AND mm.tombstoned_at IS NULL
+            AND (mm.expires_at IS NULL OR mm.expires_at > $2)"
+    );
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql)
+        .bind(namespace)
+        .bind(now)
+        .fetch_all(&db.pool)
+        .await?;
+    let by_id = rows
+        .into_iter()
+        .map(|row| {
+            let memory = Memory {
+                id: row.get("id"),
+                project: row.get("project"),
+                session_id: row.get("session_id"),
+                summary: row.get("summary"),
+                tags: row.try_get("tags").ok().flatten(),
+                created_at: row.get("created_at"),
+            };
+            (memory.id, memory)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
 }
 
 /// All memory ids + their text (for `embed --force` full re-index).

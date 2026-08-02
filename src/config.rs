@@ -72,6 +72,67 @@ pub struct Config {
     pub auto_compress: AutoCompressConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+    /// Purpose-bound memory egress. Disabled and permissive by default.
+    #[serde(default)]
+    pub influence: InfluenceConfig,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InfluenceMode {
+    #[default]
+    Advisory,
+    Strict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfluenceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: InfluenceMode,
+    #[serde(default)]
+    pub require_purpose: bool,
+    #[serde(default)]
+    pub require_trusted_attestation: bool,
+    #[serde(default = "default_true")]
+    pub record_denials: bool,
+    #[serde(default = "default_true")]
+    pub fail_closed_on_policy_error: bool,
+    #[serde(default = "default_true")]
+    pub confirmation_replay_protection: bool,
+    #[serde(default)]
+    pub high_risk_requires_source: bool,
+    #[serde(default)]
+    pub critical_risk_requires_confirmation: bool,
+    /// Protected file containing the trusted-runtime HMAC key. Never inline key material.
+    #[serde(default)]
+    pub attestation_key_file: Option<String>,
+    /// Protected file containing the confirmation-receipt HMAC key.
+    #[serde(default)]
+    pub confirmation_key_file: Option<String>,
+}
+
+impl Default for InfluenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: InfluenceMode::Advisory,
+            require_purpose: false,
+            require_trusted_attestation: false,
+            record_denials: true,
+            fail_closed_on_policy_error: true,
+            confirmation_replay_protection: true,
+            high_risk_requires_source: false,
+            critical_risk_requires_confirmation: false,
+            attestation_key_file: None,
+            confirmation_key_file: None,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -756,11 +817,49 @@ impl Default for Config {
             auto_dream: AutoDreamConfig::default(),
             auto_compress: AutoCompressConfig::default(),
             scheduler: SchedulerConfig::default(),
+            influence: InfluenceConfig::default(),
         }
     }
 }
 
 impl Config {
+    fn apply_influence_runtime(&mut self) -> Result<()> {
+        fn env_bool(name: &str) -> Result<Option<bool>> {
+            let Ok(value) = std::env::var(name) else {
+                return Ok(None);
+            };
+            match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Ok(Some(true)),
+                "0" | "false" | "no" | "off" => Ok(Some(false)),
+                _ => anyhow::bail!("{name} must be a boolean"),
+            }
+        }
+        if let Some(value) = env_bool("IRONMEM_INFLUENCE_ENABLED")? {
+            self.influence.enabled = value;
+        }
+        if let Some(value) = env_bool("IRONMEM_INFLUENCE_REQUIRE_PURPOSE")? {
+            self.influence.require_purpose = value;
+        }
+        if let Some(value) = env_bool("IRONMEM_INFLUENCE_RECORD_DENIALS")? {
+            self.influence.record_denials = value;
+        }
+        if let Some(value) = env_bool("IRONMEM_INFLUENCE_FAIL_CLOSED")? {
+            self.influence.fail_closed_on_policy_error = value;
+        }
+        if let Ok(mode) = std::env::var("IRONMEM_INFLUENCE_MODE") {
+            self.influence.mode = match mode.trim().to_ascii_lowercase().as_str() {
+                "advisory" => InfluenceMode::Advisory,
+                "strict" => InfluenceMode::Strict,
+                _ => anyhow::bail!("IRONMEM_INFLUENCE_MODE must be advisory or strict"),
+            };
+        }
+        if self.influence.mode == InfluenceMode::Strict {
+            self.influence.require_purpose = true;
+            self.influence.require_trusted_attestation = true;
+            self.influence.fail_closed_on_policy_error = true;
+        }
+        Ok(())
+    }
     /// Whether iterative multi-hop retrieval is active. `IRONMEM_MULTI_HOP_ENABLED`
     /// (0/1/true/false/on/off) overrides the configured default at runtime.
     pub fn multi_hop_enabled(&self) -> bool {
@@ -835,13 +934,15 @@ pub fn settings_path() -> PathBuf {
 
 pub fn load() -> Result<Config> {
     let path = settings_path();
-    if !path.exists() {
+    let mut config = if !path.exists() {
         let config = Config::default();
         save(&config)?;
-        return Ok(config);
-    }
-    let raw = std::fs::read_to_string(&path)?;
-    let config: Config = serde_json::from_str(&raw)?;
+        config
+    } else {
+        let raw = std::fs::read_to_string(&path)?;
+        serde_json::from_str(&raw)?
+    };
+    config.apply_influence_runtime()?;
     Ok(config)
 }
 
@@ -934,5 +1035,27 @@ mod tests {
         assert_eq!(cfg.scheduler.sweep_interval_minutes, 15);
         assert_eq!(cfg.scheduler.dream_interval_hours, 24);
         assert_eq!(cfg.scheduler.launchd_label, "com.execlayer.ironmem.sleep");
+    }
+
+    #[test]
+    fn influence_defaults_are_legacy_permissive() {
+        let cfg: Config = serde_json::from_str(BASE).unwrap();
+        assert!(!cfg.influence.enabled);
+        assert_eq!(cfg.influence.mode, InfluenceMode::Advisory);
+        assert!(!cfg.influence.require_purpose);
+        assert!(cfg.influence.record_denials);
+    }
+
+    #[test]
+    fn strict_influence_implies_fail_closed_requirements() {
+        let raw = BASE.replace(
+            "\"db_path\": \"/tmp/mem.db\"",
+            "\"db_path\": \"/tmp/mem.db\", \"influence\": { \"enabled\": true, \"mode\": \"strict\" }",
+        );
+        let mut cfg: Config = serde_json::from_str(&raw).unwrap();
+        cfg.apply_influence_runtime().unwrap();
+        assert!(cfg.influence.require_purpose);
+        assert!(cfg.influence.require_trusted_attestation);
+        assert!(cfg.influence.fail_closed_on_policy_error);
     }
 }

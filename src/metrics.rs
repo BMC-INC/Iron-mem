@@ -22,10 +22,12 @@ pub enum GovOp {
     GovernedWrite,
     /// Governed delete: the tombstone UPDATE.
     TombstoneWrite,
+    /// Deterministic per-candidate influence policy evaluation.
+    InfluenceEval,
 }
 
 impl GovOp {
-    const COUNT: usize = 5;
+    const COUNT: usize = 6;
 
     fn idx(self) -> usize {
         match self {
@@ -34,6 +36,7 @@ impl GovOp {
             GovOp::NamespaceResolve => 2,
             GovOp::GovernedWrite => 3,
             GovOp::TombstoneWrite => 4,
+            GovOp::InfluenceEval => 5,
         }
     }
 
@@ -44,6 +47,7 @@ impl GovOp {
             2 => "namespace_resolve",
             3 => "governed_write",
             4 => "tombstone_write",
+            5 => "influence_eval",
             _ => "unknown",
         }
     }
@@ -67,6 +71,7 @@ impl OpStat {
 
 // One fixed slot per GovOp — no allocation, no lock, no map lookup on the hot path.
 static STATS: [OpStat; GovOp::COUNT] = [
+    OpStat::new(),
     OpStat::new(),
     OpStat::new(),
     OpStat::new(),
