@@ -33,6 +33,15 @@ pub struct Config {
     pub mcp_sse_port: u16,
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Administrative capabilities granted to the shared-token Streamable HTTP
+    /// MCP endpoint. Stdio MCP is a local-operator channel; remote/shared MCP
+    /// receives no influence-policy authority unless explicitly configured.
+    #[serde(default)]
+    pub mcp_capabilities: Vec<String>,
+    /// Namespace allowlist for shared-token MCP administrative capabilities.
+    /// Empty means all namespaces, but only after a capability is granted.
+    #[serde(default)]
+    pub mcp_namespaces: Vec<String>,
     #[serde(default)]
     pub embedding: EmbeddingConfig,
     #[serde(default)]
@@ -423,6 +432,11 @@ pub struct AgentKeyConfig {
     pub agent_id: String,
     #[serde(default)]
     pub namespaces: Vec<String>,
+    /// Administrative capabilities are independent of namespace read/write.
+    /// Influence policy uses `influence_policy:read` and
+    /// `influence_policy:write`; neither is implied by namespace access.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 fn default_chunk_fusion_weight() -> usize {
@@ -727,6 +741,8 @@ impl Default for Config {
             mcp_transport: default_mcp_transport(),
             mcp_sse_port: default_mcp_sse_port(),
             auth_token: None,
+            mcp_capabilities: Vec::new(),
+            mcp_namespaces: Vec::new(),
             embedding: EmbeddingConfig::default(),
             rerank: RerankConfig::default(),
             llm_retry: LlmRetryConfig::default(),

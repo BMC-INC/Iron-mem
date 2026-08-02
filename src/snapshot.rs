@@ -14,6 +14,8 @@ pub struct SnapshotPayload {
     pub edges: Vec<MemoryEdge>,
     #[serde(default)]
     pub evidence: Vec<SnapshotMemoryEvidence>,
+    #[serde(default)]
+    pub influence_policies: Vec<SnapshotMemoryInfluencePolicy>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -26,13 +28,23 @@ pub struct SnapshotMemoryEvidence {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct SnapshotMemoryInfluencePolicy {
+    pub memory_id: i64,
+    pub policy: crate::influence::MemoryInfluencePolicy,
+    pub updated_by: Option<String>,
+    pub updated_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RestoreReport {
     pub snapshot_id: String,
     pub memories_in_snapshot: usize,
     pub edges_in_snapshot: usize,
+    pub influence_policies_in_snapshot: usize,
     pub dry_run: bool,
     pub restored_memories: usize,
     pub restored_edges: usize,
+    pub restored_influence_policies: usize,
 }
 
 pub async fn create(
@@ -46,8 +58,19 @@ pub async fn create(
     };
     let edges = db::all_memory_edges(db, project).await?;
     let mut evidence = Vec::with_capacity(memories.len());
+    let mut influence_policies = Vec::new();
     for memory in &memories {
         let meta = db::get_memory_meta_full(db, memory.id).await?;
+        if let Some(record) =
+            db::get_explicit_memory_influence_policy(db, memory.id, &meta.namespace).await?
+        {
+            influence_policies.push(SnapshotMemoryInfluencePolicy {
+                memory_id: memory.id,
+                policy: record.policy,
+                updated_by: record.updated_by,
+                updated_at: record.updated_at,
+            });
+        }
         if let Some(evidence_root_id) = meta.evidence_root_id {
             evidence.push(SnapshotMemoryEvidence {
                 memory_id: memory.id,
@@ -59,11 +82,12 @@ pub async fn create(
         }
     }
     let payload = SnapshotPayload {
-        version: 2,
+        version: 3,
         project: project.map(ToOwned::to_owned),
         memories: memories.clone(),
         edges: edges.clone(),
         evidence,
+        influence_policies,
     };
     let bytes = serde_json::to_vec_pretty(&payload)?;
     let blob = crate::ccr::store_blob(db, &bytes, Some("json")).await?;
@@ -103,9 +127,11 @@ pub async fn restore(db: &Database, snapshot_id: &str, dry_run: bool) -> Result<
         snapshot_id: snapshot_id.to_string(),
         memories_in_snapshot: payload.memories.len(),
         edges_in_snapshot: payload.edges.len(),
+        influence_policies_in_snapshot: payload.influence_policies.len(),
         dry_run,
         restored_memories: 0,
         restored_edges: 0,
+        restored_influence_policies: 0,
     };
     if dry_run {
         return Ok(report);
@@ -155,6 +181,20 @@ pub async fn restore(db: &Database, snapshot_id: &str, dry_run: bool) -> Result<
             &evidence.roots,
         )
         .await?;
+    }
+    for stored_policy in &payload.influence_policies {
+        let Some(new_id) = id_map.get(&stored_policy.memory_id).copied() else {
+            continue;
+        };
+        db::restore_memory_influence_policy(
+            db,
+            new_id,
+            &stored_policy.policy,
+            stored_policy.updated_by.as_deref(),
+            stored_policy.updated_at,
+        )
+        .await?;
+        report.restored_influence_policies += 1;
     }
     for edge in &payload.edges {
         let new_edge = db::NewMemoryEdge {
@@ -217,11 +257,29 @@ mod tests {
             .await?
             .evidence_root_id
             .expect("child root");
+        let policy = db::update_memory_influence_policy(
+            &db,
+            child,
+            "local",
+            &crate::influence::PolicyPrincipal::local_operator("snapshot:test"),
+            &crate::influence::PolicyMutationRequest {
+                expected_version: 1,
+                patch: crate::influence::MemoryInfluencePolicyPatch {
+                    state: Some(crate::influence::InfluenceState::ReasoningOnly),
+                    requires_original_source: Some(true),
+                    ..Default::default()
+                },
+                reason: "snapshot policy preservation".to_string(),
+                request_id: "snapshot-policy-test".to_string(),
+            },
+        )
+        .await?;
 
         let snapshot = create(&db, Some("evidence"), Some(project)).await?;
         let payload = load_payload(&db, &snapshot.id).await?;
-        assert_eq!(payload.version, 2);
+        assert_eq!(payload.version, 3);
         assert_eq!(payload.evidence.len(), 2);
+        assert_eq!(payload.influence_policies.len(), 1);
         restore(&db, &snapshot.id, false).await?;
 
         let restored = db::get_recent_memories(&db, project, 10).await?;
@@ -236,6 +294,8 @@ mod tests {
         );
         assert_eq!(meta.derivation_depth, 1);
         assert!(meta.parent_memory_id.is_some());
+        let restored_policy = db::get_memory_influence_policy(&db, child.id, "local").await?;
+        assert_eq!(restored_policy.policy, policy.policy);
 
         let _ = std::fs::remove_file(path);
         Ok(())
