@@ -44,6 +44,13 @@ pub fn extract(observations: &[Observation]) -> LocalExtraction {
                     &mut seen_facts,
                     format!("Command `{command}` completed successfully."),
                 );
+                if is_verification_command(&command) {
+                    push_unique(
+                        &mut procedures,
+                        &mut seen_procedures,
+                        format!("Use `{command}` to verify this project."),
+                    );
+                }
             }
         }
 
@@ -214,6 +221,25 @@ fn clean_command(input: &str) -> Option<String> {
     Some(command.to_string())
 }
 
+fn is_verification_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    [
+        " test",
+        "test ",
+        "cargo test",
+        "cargo clippy",
+        "npm run lint",
+        "pnpm lint",
+        "npm run build",
+        "pnpm build",
+        "cargo build",
+        "pytest",
+        "ruff check",
+    ]
+    .iter()
+    .any(|signal| lower.contains(signal))
+}
+
 fn extract_path(input: &str) -> Option<String> {
     input
         .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ':' | ',' | '{' | '}'))
@@ -302,6 +328,10 @@ mod tests {
             .facts
             .contains(&"Modified `src/compress.rs` during the session.".into()));
         assert_eq!(result.facts.len(), 2);
+        assert_eq!(
+            result.procedures,
+            vec!["Use `cargo test --all-targets` to verify this project."]
+        );
     }
 
     #[test]

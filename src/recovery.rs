@@ -83,8 +83,9 @@ pub async fn status(db: &Database) -> Result<ExtractionStatus> {
         .iter()
         .take_while(|r| r.get::<i64, _>("fact_count") + r.get::<i64, _>("procedure_count") == 0)
         .count() as i64;
-    let archived_candidates_remaining =
-        archived_candidates(db, 0, i64::MAX, 1, None).await?.len() as i64;
+    let archived_candidates_remaining = archived_candidates(db, 0, i64::MAX, 1, 0, None)
+        .await?
+        .len() as i64;
     let uncompressed_sessions_remaining = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM sessions s WHERE s.compressed = 0 AND EXISTS
          (SELECT 1 FROM observations o WHERE o.session_id = s.id)",
@@ -132,6 +133,7 @@ pub async fn record_compression(
 pub struct BackfillOptions {
     pub dry_run: bool,
     pub after_memory_id: i64,
+    pub since_timestamp: i64,
     pub limit: i64,
     pub min_observations: i64,
     pub project: Option<String>,
@@ -180,6 +182,7 @@ pub async fn backfill(
         options.after_memory_id,
         options.limit,
         options.min_observations,
+        options.since_timestamp,
         options.project.as_deref(),
     )
     .await?;
@@ -277,6 +280,7 @@ pub async fn backfill(
             db,
             remaining,
             options.min_observations,
+            options.since_timestamp,
             options.project.as_deref(),
         )
         .await?;
@@ -303,6 +307,7 @@ async fn archived_candidates(
     after: i64,
     limit: i64,
     min_obs: i64,
+    since_timestamp: i64,
     project: Option<&str>,
 ) -> Result<Vec<Candidate>> {
     let id = if db.backend == Backend::Sqlite {
@@ -316,15 +321,20 @@ async fn archived_candidates(
          FROM memories m JOIN memory_meta mm ON mm.memory_id = {id}
          WHERE {id} > $1 AND mm.kind = 'session' AND mm.session_blob IS NOT NULL
            AND ($2 IS NULL OR m.project = $2)
-           AND (SELECT COUNT(*) FROM observations o WHERE o.session_id = m.session_id) >= $3
+           AND LOWER(m.project) NOT LIKE '%locomo%'
+           AND LOWER(m.project) NOT LIKE '%longmemeval%'
+           AND LOWER(m.project) NOT LIKE '%benchmark%'
+           AND m.created_at >= $3
+           AND (SELECT COUNT(*) FROM observations o WHERE o.session_id = m.session_id) >= $4
            AND NOT EXISTS (SELECT 1 FROM extraction_receipts er
                WHERE er.source_memory_id = {id} AND er.transcript_hash = mm.session_blob
-                 AND er.extractor_version = $4 AND er.status = 'complete')
-         ORDER BY {id} ASC LIMIT $5"
+                 AND er.extractor_version = $5 AND er.status = 'complete')
+         ORDER BY {id} ASC LIMIT $6"
     );
     let rows = sqlx::query(&sql)
         .bind(after)
         .bind(project)
+        .bind(since_timestamp)
         .bind(min_obs)
         .bind(EXTRACTOR_VERSION)
         .bind(limit)
@@ -346,15 +356,21 @@ async fn uncompressed_candidates(
     db: &Database,
     limit: i64,
     min_obs: i64,
+    since_timestamp: i64,
     project: Option<&str>,
 ) -> Result<Vec<db::Session>> {
     let rows = sqlx::query(
         "SELECT s.id, s.project, s.started_at, s.ended_at, s.compressed FROM sessions s
          WHERE s.compressed = 0 AND ($1 IS NULL OR s.project = $1)
-           AND (SELECT COUNT(*) FROM observations o WHERE o.session_id = s.id) >= $2
-         ORDER BY s.started_at ASC LIMIT $3",
+           AND LOWER(s.project) NOT LIKE '%locomo%'
+           AND LOWER(s.project) NOT LIKE '%longmemeval%'
+           AND LOWER(s.project) NOT LIKE '%benchmark%'
+           AND s.started_at >= $2
+           AND (SELECT COUNT(*) FROM observations o WHERE o.session_id = s.id) >= $3
+         ORDER BY s.started_at ASC LIMIT $4",
     )
     .bind(project)
+    .bind(since_timestamp)
     .bind(min_obs)
     .bind(limit)
     .fetch_all(&db.pool)
@@ -629,6 +645,7 @@ mod tests {
         let options = BackfillOptions {
             dry_run: true,
             after_memory_id: 0,
+            since_timestamp: 0,
             limit: 5,
             min_observations: 1,
             project: None,
@@ -636,7 +653,7 @@ mod tests {
         let dry = backfill(&db, None, &BruteForceStore, &Config::default(), &options).await?;
         assert_eq!(dry.scanned, 1);
         assert_eq!(dry.facts, 1);
-        assert_eq!(dry.procedures, 1);
+        assert_eq!(dry.procedures, 2);
         assert_eq!(status(&db).await?.completed, 0);
 
         let applied = backfill(
@@ -658,7 +675,7 @@ mod tests {
         .bind(parent)
         .fetch_one(&db.pool)
         .await?;
-        assert_eq!(child_count, 2);
+        assert_eq!(child_count, 3);
         for row in sqlx::query("SELECT memory_id FROM memory_meta WHERE parent_memory_id = $1")
             .bind(parent)
             .fetch_all(&db.pool)
@@ -689,7 +706,7 @@ mod tests {
             .bind(parent)
             .fetch_one(&db.pool)
             .await?,
-            2
+            3
         );
         let _ = std::fs::remove_file(path);
         Ok(())

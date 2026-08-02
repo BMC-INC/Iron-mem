@@ -361,6 +361,9 @@ enum Commands {
         /// Resume strictly after this parent memory id
         #[arg(long, default_value_t = 0)]
         after_memory_id: i64,
+        /// Only include sessions started at or after this Unix timestamp
+        #[arg(long, default_value_t = 0)]
+        since_timestamp: i64,
         /// Process at most this many archived or uncompressed sessions
         #[arg(short, long, default_value_t = 5)]
         limit: i64,
@@ -769,6 +772,7 @@ async fn async_main() -> Result<()> {
         Commands::ExtractionBackfill {
             dry_run,
             after_memory_id,
+            since_timestamp,
             limit,
             min_observations,
             project,
@@ -778,7 +782,7 @@ async fn async_main() -> Result<()> {
             let (embedder, store): (
                 Option<std::sync::Arc<dyn embedder::Embedder>>,
                 std::sync::Arc<dyn vectorstore::VectorStore>,
-            ) = if dry_run {
+            ) = if dry_run || !matches!(cfg.embedding.provider.as_str(), "ollama" | "onnx") {
                 (None, std::sync::Arc::new(vectorstore::BruteForceStore))
             } else {
                 vectorstore::build_semantic(&database, &cfg).await
@@ -791,6 +795,7 @@ async fn async_main() -> Result<()> {
                 &recovery::BackfillOptions {
                     dry_run,
                     after_memory_id: after_memory_id.max(0),
+                    since_timestamp: since_timestamp.max(0),
                     limit: limit.max(1),
                     min_observations: min_observations.max(1),
                     project,
