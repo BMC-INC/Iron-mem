@@ -93,6 +93,13 @@ pub struct MemoryLineage {
     pub retention_policy_id: Option<String>,
     pub legal_hold: bool,
     pub tombstoned_at: Option<i64>,
+    /// Primary root used for fast policy and lineage lookup.
+    pub evidence_root_id: Option<String>,
+    /// Number of derivation steps from the primary source record.
+    pub derivation_depth: u32,
+    /// Primary and supporting independent evidence roots.
+    pub evidence_roots: Vec<db::MemoryEvidenceRoot>,
+    pub independent_root_count: usize,
     /// Derivation chain: parent memory ids walked to the root (nearest first).
     pub parent_chain: Vec<i64>,
     pub ledger: Vec<db::MemoryLedgerEntry>,
@@ -123,6 +130,11 @@ pub async fn memory_lineage(db: &Database, memory_id: i64) -> Result<MemoryLinea
             .and_then(|m| m.parent_memory_id);
     }
 
+    let evidence_roots = if meta.is_some() {
+        db::memory_evidence_roots(db, memory_id).await?
+    } else {
+        Vec::new()
+    };
     Ok(MemoryLineage {
         memory_id,
         summary: memory.as_ref().map(|m| m.summary.clone()),
@@ -137,6 +149,13 @@ pub async fn memory_lineage(db: &Database, memory_id: i64) -> Result<MemoryLinea
         retention_policy_id: meta.as_ref().and_then(|m| m.retention_policy_id.clone()),
         legal_hold: meta.as_ref().map(|m| m.legal_hold).unwrap_or(false),
         tombstoned_at: meta.as_ref().and_then(|m| m.tombstoned_at),
+        evidence_root_id: meta.as_ref().and_then(|m| m.evidence_root_id.clone()),
+        derivation_depth: meta
+            .as_ref()
+            .map(|m| m.derivation_depth)
+            .unwrap_or_default(),
+        independent_root_count: evidence_roots.len(),
+        evidence_roots,
         parent_chain,
         ledger: db::memory_ledger_for_memory(db, memory_id).await?,
         injections: db::injection_events_for_memory(db, memory_id, 200).await?,
@@ -158,6 +177,9 @@ pub struct ComplianceReport {
     pub generated_at: String,
     pub chains: Vec<ChainVerification>,
     pub inventory: Vec<db::GovernanceInventoryRow>,
+    pub evidence: db::EvidenceInventory,
+    pub evidence_migration_status: Option<String>,
+    pub evidence_migration: Option<db::EvidenceRootMigrationReport>,
     pub snapshots: Vec<SnapshotInfo>,
 }
 
@@ -230,6 +252,35 @@ impl ComplianceReport {
             ));
         }
 
+        out.push_str("\n## Independent evidence lineage\n\n");
+        out.push_str(&format!(
+            "- live memory records: `{}`\n\
+             - independent evidence roots: `{}`\n\
+             - direct records: `{}`\n\
+             - derived records: `{}`\n\
+             - maximum derivation depth: `{}`\n\
+             - records missing roots: `{}`\n\n",
+            self.evidence.memories,
+            self.evidence.independent_roots,
+            self.evidence.direct_memories,
+            self.evidence.derived_memories,
+            self.evidence.maximum_derivation_depth,
+            self.evidence.missing_roots,
+        ));
+        if let Some(status) = &self.evidence_migration_status {
+            out.push_str(&format!("- evidence migration status: `{status}`\n"));
+        }
+        if let Some(migration) = &self.evidence_migration {
+            out.push_str(&format!(
+                "- migration roots backfilled: `{}`\n\
+                 - migration broken-parent repairs: `{}`\n\
+                 - migration cycle findings: `{}`\n\n",
+                migration.roots_backfilled,
+                migration.broken_parent_memory_ids.len(),
+                migration.cycle_memory_ids.len(),
+            ));
+        }
+
         out.push_str("\n## Versioned memory state (snapshots)\n\n");
         if self.snapshots.is_empty() {
             out.push_str("No brain snapshots recorded.\n");
@@ -268,6 +319,8 @@ pub async fn generate(db: &Database) -> Result<ComplianceReport> {
         chains.push(verify_current_ledger_epoch(db, &namespace).await?);
     }
     let inventory = db::governance_inventory(db).await?;
+    let evidence = db::evidence_inventory(db).await?;
+    let evidence_migration = db::evidence_root_migration_report(db).await?;
     let snapshots = db::list_brain_snapshots(db, 100)
         .await?
         .into_iter()
@@ -284,6 +337,11 @@ pub async fn generate(db: &Database) -> Result<ComplianceReport> {
         generated_at: Utc::now().to_rfc3339(),
         chains,
         inventory,
+        evidence,
+        evidence_migration_status: evidence_migration
+            .as_ref()
+            .map(|(status, _)| status.clone()),
+        evidence_migration: evidence_migration.map(|(_, report)| report),
         snapshots,
     })
 }
@@ -602,6 +660,58 @@ mod tests {
         assert!(db::latest_memory_ledger_epoch(&db, "legacy")
             .await?
             .is_none());
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lineage_reports_primary_and_supporting_evidence() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = db::create_session(&db, "/tmp/lineage").await?;
+        let first = db::insert_memory(&db, "/tmp/lineage", &session, "source a", None).await?;
+        let second = db::insert_memory(&db, "/tmp/lineage", &session, "source b", None).await?;
+        for id in [first, second] {
+            db::apply_memory_governance(
+                &db,
+                id,
+                "project",
+                "fact",
+                &crate::governance::MemoryGovernance::explicit(),
+                Some("test"),
+                "remember",
+            )
+            .await?;
+        }
+        let derived = db::insert_memory(&db, "/tmp/lineage", &session, "derived", None).await?;
+        db::apply_memory_governance(
+            &db,
+            derived,
+            "project",
+            "inference",
+            &crate::governance::MemoryGovernance::derived_from(first),
+            Some("test"),
+            "derive",
+        )
+        .await?;
+        db::add_supporting_evidence_from_memories(&db, derived, &[first, second]).await?;
+
+        let lineage = memory_lineage(&db, derived).await?;
+        assert_eq!(lineage.parent_chain, vec![first]);
+        assert_eq!(lineage.derivation_depth, 1);
+        assert_eq!(lineage.independent_root_count, 2);
+        assert_eq!(lineage.evidence_roots[0].role, "primary");
+        assert_eq!(
+            lineage.evidence_root_id,
+            Some(lineage.evidence_roots[0].evidence_root_id.clone())
+        );
+
+        let report = generate(&db).await?;
+        assert_eq!(report.evidence.memories, 3);
+        assert_eq!(report.evidence.independent_roots, 2);
+        assert!(report
+            .to_markdown()
+            .contains("Independent evidence lineage"));
 
         let _ = std::fs::remove_file(path);
         Ok(())

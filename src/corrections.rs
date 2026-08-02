@@ -166,6 +166,23 @@ async fn store_correction(
     let id = db::insert_memory(db, project, session_id, &text, Some("error_solution fix")).await?;
     db::upsert_memory_meta(db, id, 0.8).await?; // fixes are valuable to recall
     db::set_memory_scope_kind(db, id, "project", "error_solution").await?;
+    let governance = crate::governance::MemoryGovernance {
+        source_type: crate::governance::MemorySourceType::ToolOutput,
+        trust_tier: crate::governance::TrustTier::Medium,
+        writer_identity: Some("ironmem:correction-miner".to_string()),
+        source_ref: Some(format!("session:{session_id}:correction")),
+        ..crate::governance::MemoryGovernance::default()
+    };
+    db::apply_memory_governance(
+        db,
+        id,
+        "project",
+        "error_solution",
+        &governance,
+        Some("ironmem:correction-miner"),
+        "derive",
+    )
+    .await?;
 
     if let Some(emb) = embedder {
         match emb.embed(std::slice::from_ref(&text)).await {
