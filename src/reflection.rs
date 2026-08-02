@@ -379,6 +379,7 @@ pub async fn synthesize(
                 governance,
             )
             .await?;
+            db::add_supporting_evidence_from_memories(db, id, &source_ids).await?;
             report.derived_ids.push(id);
             report.derived += 1;
 

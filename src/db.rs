@@ -3,12 +3,13 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::governance::{
-    classification_str, consent_state_str, ledger_entry_hash, memory_record_hash,
-    normalize_namespace, source_type_str, trust_tier_str, MemoryGovernance, DEFAULT_NAMESPACE,
+    classification_str, consent_state_str, evidence_root_id, ledger_entry_hash, memory_record_hash,
+    new_evidence_root_id, normalize_namespace, sha256_hex, source_type_str, trust_tier_str,
+    MemoryGovernance, DEFAULT_NAMESPACE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -293,6 +294,39 @@ pub struct SyncEvent {
     pub applied_at: Option<i64>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct MemoryEvidenceRoot {
+    pub evidence_root_id: String,
+    pub role: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct EvidenceRootMigrationReport {
+    pub version: u32,
+    pub meta_rows_created: usize,
+    pub roots_backfilled: usize,
+    pub inherited_roots: usize,
+    pub new_roots: usize,
+    pub broken_parent_memory_ids: Vec<i64>,
+    pub cycle_memory_ids: Vec<i64>,
+    pub last_memory_id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct EvidenceInventory {
+    pub memories: i64,
+    pub independent_roots: i64,
+    pub direct_memories: i64,
+    pub derived_memories: i64,
+    pub maximum_derivation_depth: i64,
+    pub missing_roots: i64,
+}
+
+const EVIDENCE_ROOT_MIGRATION_ID: &str = "2026-08-01-evidence-roots-v1";
+const EVIDENCE_ROOT_MIGRATION_VERSION: u32 = 1;
+const EVIDENCE_ROOT_BACKFILL_BATCH: i64 = 256;
+
 async fn add_memory_meta_column(db: &Database, column_sql: &str) -> Result<()> {
     match db.backend {
         Backend::Sqlite => {
@@ -308,6 +342,393 @@ async fn add_memory_meta_column(db: &Database, column_sql: &str) -> Result<()> {
             .await?;
         }
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct EvidenceMetaRow {
+    memory_id: i64,
+    namespace: String,
+    source_type: String,
+    source_ref: Option<String>,
+    parent_memory_id: Option<i64>,
+    record_hash: Option<String>,
+    evidence_root_id: Option<String>,
+    derivation_depth: i64,
+}
+
+fn root_for_meta(row: &EvidenceMetaRow) -> String {
+    // Legacy rows can predate record_hash. The memory id is then the durable,
+    // backend-independent source reference; its hash is only a compatibility
+    // fallback for already-stored records, never the normal write path.
+    let legacy_ref = format!("legacy-memory:{}", row.memory_id);
+    let source_ref = row.source_ref.as_deref().unwrap_or(&legacy_ref);
+    let legacy_hash = sha256_hex(format!("ironmem:legacy-record:{}", row.memory_id).as_bytes());
+    evidence_root_id(
+        &row.namespace,
+        &row.source_type,
+        Some(source_ref),
+        row.record_hash.as_deref().unwrap_or(&legacy_hash),
+    )
+}
+
+async fn load_evidence_meta(db: &Database, memory_id: i64) -> Result<Option<EvidenceMetaRow>> {
+    let row = sqlx::query(
+        "SELECT memory_id, namespace, source_type, source_ref, parent_memory_id, record_hash,
+                evidence_root_id, derivation_depth
+         FROM memory_meta WHERE memory_id = $1",
+    )
+    .bind(memory_id)
+    .fetch_optional(&db.pool)
+    .await?;
+    Ok(row.map(|row| EvidenceMetaRow {
+        memory_id: row.get("memory_id"),
+        namespace: row
+            .try_get::<Option<String>, _>("namespace")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| DEFAULT_NAMESPACE.to_string()),
+        source_type: row
+            .try_get::<Option<String>, _>("source_type")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "derived".to_string()),
+        source_ref: row
+            .try_get::<Option<String>, _>("source_ref")
+            .ok()
+            .flatten(),
+        parent_memory_id: row
+            .try_get::<Option<i64>, _>("parent_memory_id")
+            .ok()
+            .flatten(),
+        record_hash: row
+            .try_get::<Option<String>, _>("record_hash")
+            .ok()
+            .flatten(),
+        evidence_root_id: row
+            .try_get::<Option<String>, _>("evidence_root_id")
+            .ok()
+            .flatten()
+            .filter(|root| !root.is_empty()),
+        derivation_depth: row.try_get::<i64, _>("derivation_depth").unwrap_or(0),
+    }))
+}
+
+async fn persist_primary_evidence_root(
+    db: &Database,
+    memory_id: i64,
+    evidence_root: &str,
+    derivation_depth: i64,
+    created_at: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE memory_meta
+         SET evidence_root_id = $1, derivation_depth = $2
+         WHERE memory_id = $3",
+    )
+    .bind(evidence_root)
+    .bind(derivation_depth)
+    .bind(memory_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id = $1 AND role = 'primary'")
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO memory_evidence_roots(memory_id, evidence_root_id, role, created_at)
+         VALUES($1, $2, 'primary', $3)
+         ON CONFLICT(memory_id, evidence_root_id) DO UPDATE SET role = 'primary'",
+    )
+    .bind(memory_id)
+    .bind(evidence_root)
+    .bind(created_at)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+async fn resolve_missing_evidence_root(
+    db: &Database,
+    start_memory_id: i64,
+    report: &mut EvidenceRootMigrationReport,
+) -> Result<bool> {
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor = start_memory_id;
+
+    let (root, mut depth) = loop {
+        if !seen.insert(cursor) {
+            let mut cycle: Vec<i64> = chain
+                .iter()
+                .map(|row: &EvidenceMetaRow| row.memory_id)
+                .skip_while(|id| *id != cursor)
+                .collect();
+            if cycle.is_empty() {
+                cycle.push(cursor);
+            }
+            cycle.sort_unstable();
+            cycle.dedup();
+            report.cycle_memory_ids = cycle;
+            return Ok(false);
+        }
+
+        let Some(row) = load_evidence_meta(db, cursor).await? else {
+            let Some(anchor) = chain.pop() else {
+                anyhow::bail!("memory_meta row disappeared during evidence backfill: {cursor}");
+            };
+            report.broken_parent_memory_ids.push(anchor.memory_id);
+            let root = root_for_meta(&anchor);
+            persist_primary_evidence_root(db, anchor.memory_id, &root, 0, Utc::now().timestamp())
+                .await?;
+            report.roots_backfilled += 1;
+            report.new_roots += 1;
+            break (root, 0_i64);
+        };
+
+        if let Some(root) = &row.evidence_root_id {
+            // Older partial migrations may have populated memory_meta without
+            // adding the normalized primary-root row. Repair that idempotently.
+            persist_primary_evidence_root(
+                db,
+                row.memory_id,
+                root,
+                row.derivation_depth,
+                Utc::now().timestamp(),
+            )
+            .await?;
+            break (root.clone(), row.derivation_depth);
+        }
+
+        let parent = row.parent_memory_id;
+        chain.push(row);
+        match parent {
+            Some(parent) => cursor = parent,
+            None => {
+                let anchor = chain.pop().expect("the just-pushed row is present");
+                let root = root_for_meta(&anchor);
+                persist_primary_evidence_root(
+                    db,
+                    anchor.memory_id,
+                    &root,
+                    0,
+                    Utc::now().timestamp(),
+                )
+                .await?;
+                report.roots_backfilled += 1;
+                report.new_roots += 1;
+                break (root, 0_i64);
+            }
+        }
+    };
+
+    while let Some(row) = chain.pop() {
+        depth = depth.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("derivation depth overflow at memory {}", row.memory_id)
+        })?;
+        persist_primary_evidence_root(db, row.memory_id, &root, depth, Utc::now().timestamp())
+            .await?;
+        report.roots_backfilled += 1;
+        report.inherited_roots += 1;
+    }
+    Ok(true)
+}
+
+async fn evidence_backfill_from_cursor(
+    db: &Database,
+    mut cursor: i64,
+    report: &mut EvidenceRootMigrationReport,
+    persist_progress: bool,
+) -> Result<()> {
+    loop {
+        let rows = sqlx::query(
+            "SELECT memory_id FROM memory_meta
+             WHERE memory_id > $1 AND (evidence_root_id IS NULL OR evidence_root_id = '')
+             ORDER BY memory_id ASC LIMIT $2",
+        )
+        .bind(cursor)
+        .bind(EVIDENCE_ROOT_BACKFILL_BATCH)
+        .fetch_all(&db.pool)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        let ids: Vec<i64> = rows.into_iter().map(|row| row.get("memory_id")).collect();
+        for memory_id in &ids {
+            if !resolve_missing_evidence_root(db, *memory_id, report).await? {
+                return Ok(());
+            }
+        }
+        cursor = *ids.last().expect("non-empty evidence migration batch");
+        report.last_memory_id = cursor;
+        report.broken_parent_memory_ids.sort_unstable();
+        report.broken_parent_memory_ids.dedup();
+        if persist_progress {
+            store_evidence_migration_state(db, "running", report).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn store_evidence_migration_state(
+    db: &Database,
+    status: &str,
+    report: &EvidenceRootMigrationReport,
+) -> Result<()> {
+    let now = Utc::now().timestamp();
+    let encoded = serde_json::to_string(report)?;
+    sqlx::query(
+        "INSERT INTO schema_migrations(migration_id, version, status, cursor, report, updated_at)
+         VALUES($1, $2, $3, $4, $5, $6)
+         ON CONFLICT(migration_id) DO UPDATE SET
+            version = excluded.version,
+            status = excluded.status,
+            cursor = excluded.cursor,
+            report = excluded.report,
+            updated_at = excluded.updated_at",
+    )
+    .bind(EVIDENCE_ROOT_MIGRATION_ID)
+    .bind(EVIDENCE_ROOT_MIGRATION_VERSION as i64)
+    .bind(status)
+    .bind(report.last_memory_id)
+    .bind(encoded)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+async fn migrate_evidence_roots(db: &Database) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            migration_id TEXT PRIMARY KEY,
+            version BIGINT NOT NULL,
+            status TEXT NOT NULL,
+            cursor BIGINT NOT NULL DEFAULT 0,
+            report TEXT NOT NULL,
+            updated_at BIGINT NOT NULL
+        )",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    // The side tables use memory_meta as their relational parent on both
+    // backends. Repair legacy databases before creating those foreign keys.
+    let inserted = match db.backend {
+        Backend::Sqlite => {
+            sqlx::query(
+                "INSERT INTO memory_meta(memory_id, importance, created_at)
+             SELECT m.rowid, 0.5, CAST(m.created_at AS INTEGER) FROM memories m
+             WHERE NOT EXISTS (
+                SELECT 1 FROM memory_meta mm WHERE mm.memory_id = m.rowid
+             )",
+            )
+            .execute(&db.pool)
+            .await?
+        }
+        Backend::Postgres => {
+            sqlx::query(
+                "INSERT INTO memory_meta(memory_id, importance, created_at)
+             SELECT m.id, 0.5, m.created_at FROM memories m
+             WHERE NOT EXISTS (
+                SELECT 1 FROM memory_meta mm WHERE mm.memory_id = m.id
+             )",
+            )
+            .execute(&db.pool)
+            .await?
+        }
+    };
+
+    add_memory_meta_column(db, "evidence_root_id TEXT").await?;
+    add_memory_meta_column(db, "derivation_depth BIGINT NOT NULL DEFAULT 0").await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_evidence_roots (
+            memory_id BIGINT NOT NULL,
+            evidence_root_id TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'supporting',
+            created_at BIGINT NOT NULL,
+            PRIMARY KEY(memory_id, evidence_root_id),
+            FOREIGN KEY(memory_id) REFERENCES memory_meta(memory_id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_meta_evidence_root
+         ON memory_meta(namespace, evidence_root_id)",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_evidence_roots_root
+         ON memory_evidence_roots(evidence_root_id, memory_id)",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO memory_evidence_roots(memory_id, evidence_root_id, role, created_at)
+         SELECT mm.memory_id, mm.evidence_root_id, 'primary', mm.created_at
+         FROM memory_meta mm
+         WHERE mm.evidence_root_id IS NOT NULL AND mm.evidence_root_id <> ''
+           AND NOT EXISTS (
+                SELECT 1 FROM memory_evidence_roots mer
+                WHERE mer.memory_id = mm.memory_id
+                  AND mer.evidence_root_id = mm.evidence_root_id
+           )
+         ON CONFLICT(memory_id, evidence_root_id) DO NOTHING",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let prior = sqlx::query("SELECT status, report FROM schema_migrations WHERE migration_id = $1")
+        .bind(EVIDENCE_ROOT_MIGRATION_ID)
+        .fetch_optional(&db.pool)
+        .await?;
+    let prior_status = prior.as_ref().map(|row| row.get::<String, _>("status"));
+    if prior_status.as_deref() == Some("complete") {
+        let missing: i64 = sqlx::query(
+            "SELECT COUNT(*) AS count FROM memory_meta
+             WHERE evidence_root_id IS NULL OR evidence_root_id = ''",
+        )
+        .fetch_one(&db.pool)
+        .await?
+        .get("count");
+        if missing == 0 {
+            return Ok(());
+        }
+    }
+
+    let mut report = prior
+        .as_ref()
+        .filter(|row| {
+            matches!(
+                row.get::<String, _>("status").as_str(),
+                "running" | "complete"
+            )
+        })
+        .and_then(|row| row.try_get::<String, _>("report").ok())
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_else(|| EvidenceRootMigrationReport {
+            version: EVIDENCE_ROOT_MIGRATION_VERSION,
+            ..Default::default()
+        });
+    if prior_status.as_deref() == Some("complete") {
+        // A completed database can still receive a legacy/direct SQL row. Scan
+        // from the beginning so an explicitly assigned lower id is repaired.
+        report.last_memory_id = 0;
+    }
+    report.meta_rows_created += inserted.rows_affected() as usize;
+    report.cycle_memory_ids.clear();
+    store_evidence_migration_state(db, "running", &report).await?;
+    evidence_backfill_from_cursor(db, report.last_memory_id, &mut report, true).await?;
+    if !report.cycle_memory_ids.is_empty() {
+        store_evidence_migration_state(db, "failed", &report).await?;
+        anyhow::bail!(
+            "evidence-root migration found a parent cycle; repair report stored for memories {:?}",
+            report.cycle_memory_ids
+        );
+    }
+    store_evidence_migration_state(db, "complete", &report).await?;
     Ok(())
 }
 
@@ -698,6 +1119,11 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+
+        // Governed influence phase 1: give every live memory an independent
+        // evidence root and derivation depth. The migration owns its durable
+        // cursor/report and remains restart-safe on large legacy databases.
+        migrate_evidence_roots(self).await?;
 
         match self.backend {
             Backend::Sqlite => {
@@ -1595,7 +2021,7 @@ pub async fn insert_memory(
 ) -> Result<i64> {
     let now = Utc::now().timestamp();
 
-    match db.backend {
+    let memory_id = match db.backend {
         Backend::Sqlite => {
             // `memories` is an FTS5 virtual table (no RETURNING support), and
             // `last_insert_rowid()` is per-connection — so the INSERT and the
@@ -1603,8 +2029,15 @@ pub async fn insert_memory(
             // can hand back a wrong/zero id.
             let mut conn = db.pool.acquire().await?;
             sqlx::query(
-                "INSERT INTO memories (project, session_id, summary, tags, created_at)
-                 VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO memories (rowid, project, session_id, summary, tags, created_at)
+                 VALUES (
+                    (SELECT COALESCE(MAX(id), 0) + 1 FROM (
+                        SELECT rowid AS id FROM memories
+                        UNION ALL
+                        SELECT memory_id AS id FROM memory_meta
+                    )),
+                    $1, $2, $3, $4, $5
+                 )",
             )
             .bind(project)
             .bind(session_id)
@@ -1617,7 +2050,7 @@ pub async fn insert_memory(
             let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() as id")
                 .fetch_one(&mut *conn)
                 .await?;
-            Ok(row.get("id"))
+            row.get("id")
         }
         Backend::Postgres => {
             let row: sqlx::any::AnyRow = sqlx::query(
@@ -1634,9 +2067,54 @@ pub async fn insert_memory(
             .bind(tags)
             .fetch_one(&db.pool)
             .await?;
-            Ok(row.get("id"))
+            row.get("id")
         }
+    };
+
+    // memory_meta is the cross-backend relational parent for evidence and all
+    // later governance side tables. Create it with a stable-source hash or a
+    // durable UUID before returning the live memory id. apply_memory_governance
+    // replaces this root when a derived parent or more specific provenance is supplied.
+    let governance = MemoryGovernance::default();
+    let record_hash = memory_record_hash(
+        project,
+        session_id,
+        summary,
+        tags,
+        "project",
+        "session",
+        &governance,
+    );
+    let initial_source_ref = (session_id != "remember").then(|| format!("session:{session_id}"));
+    let root = match initial_source_ref.as_deref() {
+        Some(source_ref) => evidence_root_id(
+            DEFAULT_NAMESPACE,
+            source_type_str(governance.source_type),
+            Some(source_ref),
+            &record_hash,
+        ),
+        None => new_evidence_root_id(),
+    };
+    if let Err(error) = sqlx::query(
+        "INSERT INTO memory_meta(
+            memory_id, importance, created_at, evidence_root_id, derivation_depth
+         ) VALUES($1, 0.5, $2, $3, 0)",
+    )
+    .bind(memory_id)
+    .bind(now)
+    .bind(&root)
+    .execute(&db.pool)
+    .await
+    {
+        let _ = delete_memory(db, memory_id).await;
+        return Err(error.into());
     }
+    if let Err(error) = persist_primary_evidence_root(db, memory_id, &root, 0, now).await {
+        let _ = delete_memory(db, memory_id).await;
+        let _ = delete_memory_meta(db, memory_id).await;
+        return Err(error);
+    }
+    Ok(memory_id)
 }
 
 pub async fn get_recent_memories(db: &Database, project: &str, limit: i64) -> Result<Vec<Memory>> {
@@ -2316,6 +2794,8 @@ pub struct MemoryMetaInfo {
     pub writer_identity: Option<String>,
     pub source_ref: Option<String>,
     pub parent_memory_id: Option<i64>,
+    pub evidence_root_id: Option<String>,
+    pub derivation_depth: u32,
     pub classification: String,
     pub consent_state: Option<String>,
     pub residency: Option<String>,
@@ -2340,6 +2820,8 @@ impl Default for MemoryMetaInfo {
             writer_identity: None,
             source_ref: None,
             parent_memory_id: None,
+            evidence_root_id: None,
+            derivation_depth: 0,
             classification: "internal".to_string(),
             consent_state: None,
             residency: None,
@@ -2358,7 +2840,8 @@ impl Default for MemoryMetaInfo {
 pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<MemoryMetaInfo> {
     let row: Option<sqlx::any::AnyRow> = sqlx::query(
         "SELECT importance, scope, kind, event_time, namespace, source_type, trust_tier,
-                writer_identity, source_ref, parent_memory_id, classification, consent_state,
+                writer_identity, source_ref, parent_memory_id, evidence_root_id,
+                derivation_depth, classification, consent_state,
                 residency, retention_policy_id, expires_at, legal_hold, record_hash,
                 tombstoned_at, tombstone_reason
          FROM memory_meta WHERE memory_id = $1",
@@ -2404,6 +2887,12 @@ pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<Memor
                 .try_get::<Option<i64>, _>("parent_memory_id")
                 .ok()
                 .flatten(),
+            evidence_root_id: r
+                .try_get::<Option<String>, _>("evidence_root_id")
+                .ok()
+                .flatten()
+                .filter(|root| !root.is_empty()),
+            derivation_depth: r.try_get::<i64, _>("derivation_depth").unwrap_or(0).max(0) as u32,
             classification: r
                 .try_get::<Option<String>, _>("classification")
                 .ok()
@@ -2429,6 +2918,188 @@ pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<Memor
         },
         None => MemoryMetaInfo::default(),
     })
+}
+
+/// All independent evidence roots attached to a memory, primary first.
+pub async fn memory_evidence_roots(
+    db: &Database,
+    memory_id: i64,
+) -> Result<Vec<MemoryEvidenceRoot>> {
+    let rows = sqlx::query(
+        "SELECT evidence_root_id, role, created_at
+         FROM memory_evidence_roots WHERE memory_id = $1
+         ORDER BY CASE role WHEN 'primary' THEN 0 WHEN 'supporting' THEN 1 ELSE 2 END,
+                  evidence_root_id ASC",
+    )
+    .bind(memory_id)
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| MemoryEvidenceRoot {
+            evidence_root_id: row.get("evidence_root_id"),
+            role: row.get("role"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
+/// Add the distinct roots of source memories to a multi-source synthesis.
+/// Namespace boundaries are enforced here so one tenant cannot manufacture
+/// apparent corroboration from another tenant's evidence.
+pub async fn add_supporting_evidence_from_memories(
+    db: &Database,
+    memory_id: i64,
+    source_memory_ids: &[i64],
+) -> Result<usize> {
+    let target = load_evidence_meta(db, memory_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("memory metadata not found: {memory_id}"))?;
+    let target_namespace = normalize_namespace(&target.namespace);
+    let primary = target
+        .evidence_root_id
+        .ok_or_else(|| anyhow::anyhow!("memory {memory_id} has no primary evidence root"))?;
+    let mut roots = BTreeSet::new();
+    for source_memory_id in source_memory_ids {
+        let source = load_evidence_meta(db, *source_memory_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("source memory metadata not found: {source_memory_id}")
+            })?;
+        if normalize_namespace(&source.namespace) != target_namespace {
+            anyhow::bail!(
+                "source memory {} namespace '{}' does not match target namespace '{}'",
+                source_memory_id,
+                source.namespace,
+                target_namespace
+            );
+        }
+        let root = source.evidence_root_id.ok_or_else(|| {
+            anyhow::anyhow!("source memory {source_memory_id} has no evidence root")
+        })?;
+        if root != primary {
+            roots.insert(root);
+        }
+    }
+
+    let now = Utc::now().timestamp();
+    let mut inserted = 0;
+    for root in roots {
+        let result = sqlx::query(
+            "INSERT INTO memory_evidence_roots(memory_id, evidence_root_id, role, created_at)
+             VALUES($1, $2, 'supporting', $3)
+             ON CONFLICT(memory_id, evidence_root_id) DO NOTHING",
+        )
+        .bind(memory_id)
+        .bind(root)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+        inserted += result.rows_affected() as usize;
+    }
+    Ok(inserted)
+}
+
+/// Restore previously captured evidence metadata after a snapshot has remapped
+/// memory ids. New snapshots supply the complete root set; legacy snapshots do
+/// not call this and retain the safe root created by insert_memory.
+pub async fn restore_memory_evidence(
+    db: &Database,
+    memory_id: i64,
+    parent_memory_id: Option<i64>,
+    evidence_root: &str,
+    derivation_depth: u32,
+    roots: &[MemoryEvidenceRoot],
+) -> Result<()> {
+    if evidence_root.trim().is_empty() {
+        anyhow::bail!("snapshot evidence root may not be empty");
+    }
+    sqlx::query(
+        "UPDATE memory_meta
+         SET parent_memory_id = $1, evidence_root_id = $2, derivation_depth = $3
+         WHERE memory_id = $4",
+    )
+    .bind(parent_memory_id)
+    .bind(evidence_root)
+    .bind(derivation_depth as i64)
+    .bind(memory_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id = $1")
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
+
+    let mut has_primary = false;
+    for root in roots {
+        let role = match root.role.as_str() {
+            "primary" => {
+                if root.evidence_root_id != evidence_root {
+                    anyhow::bail!(
+                        "snapshot primary root '{}' does not match metadata root '{}'",
+                        root.evidence_root_id,
+                        evidence_root
+                    );
+                }
+                has_primary = true;
+                "primary"
+            }
+            "contradicting" => "contradicting",
+            _ => "supporting",
+        };
+        sqlx::query(
+            "INSERT INTO memory_evidence_roots(memory_id, evidence_root_id, role, created_at)
+             VALUES($1, $2, $3, $4)
+             ON CONFLICT(memory_id, evidence_root_id) DO UPDATE SET role = excluded.role",
+        )
+        .bind(memory_id)
+        .bind(&root.evidence_root_id)
+        .bind(role)
+        .bind(root.created_at)
+        .execute(&db.pool)
+        .await?;
+    }
+    if !has_primary {
+        persist_primary_evidence_root(
+            db,
+            memory_id,
+            evidence_root,
+            derivation_depth as i64,
+            Utc::now().timestamp(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Re-run the deterministic evidence repair over rows whose roots are missing.
+/// This is intentionally separate from startup migration state so operators can
+/// fix malformed parents and validate the result before restarting.
+#[allow(dead_code)] // operator repair seam; exercised by deterministic tests
+pub async fn repair_evidence_roots(db: &Database) -> Result<EvidenceRootMigrationReport> {
+    let mut report = EvidenceRootMigrationReport {
+        version: EVIDENCE_ROOT_MIGRATION_VERSION,
+        ..Default::default()
+    };
+    evidence_backfill_from_cursor(db, 0, &mut report, false).await?;
+    report.broken_parent_memory_ids.sort_unstable();
+    report.broken_parent_memory_ids.dedup();
+    Ok(report)
+}
+
+pub async fn evidence_root_migration_report(
+    db: &Database,
+) -> Result<Option<(String, EvidenceRootMigrationReport)>> {
+    let row = sqlx::query("SELECT status, report FROM schema_migrations WHERE migration_id = $1")
+        .bind(EVIDENCE_ROOT_MIGRATION_ID)
+        .fetch_optional(&db.pool)
+        .await?;
+    row.map(|row| {
+        let status: String = row.get("status");
+        let report: String = row.get("report");
+        Ok((status, serde_json::from_str(&report)?))
+    })
+    .transpose()
 }
 
 /// Set a memory's scope + kind, clamping both to the known sets. Upserts the
@@ -2500,6 +3171,51 @@ pub async fn apply_memory_governance(
         kind,
         governance,
     );
+    let (resolved_root, derivation_depth) = match governance.parent_memory_id {
+        Some(parent_memory_id) => {
+            let parent = load_evidence_meta(db, parent_memory_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("parent memory metadata not found: {parent_memory_id}")
+                })?;
+            if normalize_namespace(&parent.namespace) != namespace {
+                anyhow::bail!(
+                    "derived memory namespace '{}' does not match parent {} namespace '{}'",
+                    namespace,
+                    parent_memory_id,
+                    parent.namespace
+                );
+            }
+            let parent_root = parent.evidence_root_id.ok_or_else(|| {
+                anyhow::anyhow!("parent memory {parent_memory_id} has no evidence root")
+            })?;
+            let depth = parent.derivation_depth.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("derivation depth overflow at memory {memory_id}")
+            })?;
+            (parent_root, depth)
+        }
+        None => {
+            let session_source_ref =
+                (memory.session_id != "remember").then(|| format!("session:{}", memory.session_id));
+            let stable_source_ref = governance
+                .source_ref
+                .as_deref()
+                .or(session_source_ref.as_deref());
+            let root = match stable_source_ref {
+                Some(source_ref) => evidence_root_id(
+                    &namespace,
+                    source_type_str(governance.source_type),
+                    Some(source_ref),
+                    &record_hash,
+                ),
+                None => load_evidence_meta(db, memory_id)
+                    .await?
+                    .and_then(|existing| existing.evidence_root_id)
+                    .unwrap_or_else(new_evidence_root_id),
+            };
+            (root, 0)
+        }
+    };
     let now = Utc::now().timestamp();
     // trust_first_seen_at is stamped once and preserved across upserts (it is
     // deliberately omitted from DO UPDATE SET), so a memory's trajectory origin
@@ -2510,9 +3226,9 @@ pub async fn apply_memory_governance(
             memory_id, importance, created_at, scope, kind, namespace, source_type, trust_tier,
             writer_identity, source_ref, parent_memory_id, classification, consent_state,
             residency, retention_policy_id, expires_at, legal_hold, record_hash,
-            trust_first_seen_at
+            trust_first_seen_at, evidence_root_id, derivation_depth
          )
-         VALUES($1, 0.5, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+         VALUES($1, 0.5, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
          ON CONFLICT(memory_id) DO UPDATE SET
             scope = excluded.scope,
             kind = excluded.kind,
@@ -2528,7 +3244,9 @@ pub async fn apply_memory_governance(
             retention_policy_id = excluded.retention_policy_id,
             expires_at = excluded.expires_at,
             legal_hold = excluded.legal_hold,
-            record_hash = excluded.record_hash",
+            record_hash = excluded.record_hash,
+            evidence_root_id = excluded.evidence_root_id,
+            derivation_depth = excluded.derivation_depth",
     )
     .bind(memory_id)
     .bind(now)
@@ -2548,8 +3266,11 @@ pub async fn apply_memory_governance(
     .bind(if governance.legal_hold { 1_i64 } else { 0_i64 })
     .bind(&record_hash)
     .bind(now)
+    .bind(&resolved_root)
+    .bind(derivation_depth)
     .execute(&db.pool)
     .await?;
+    persist_primary_evidence_root(db, memory_id, &resolved_root, derivation_depth, now).await?;
     crate::metrics::record(crate::metrics::GovOp::GovernedWrite, _gw.elapsed());
 
     let payload = serde_json::json!({
@@ -2560,6 +3281,8 @@ pub async fn apply_memory_governance(
         "legal_hold": governance.legal_hold,
         "namespace": namespace,
         "parent_memory_id": governance.parent_memory_id,
+        "evidence_root_id": resolved_root,
+        "derivation_depth": derivation_depth,
         "project": memory.project,
         "record_hash": record_hash,
         "residency": governance.residency.as_deref(),
@@ -2992,6 +3715,33 @@ pub async fn governance_inventory(db: &Database) -> Result<Vec<GovernanceInvento
             with_retention_policy: r.try_get("with_retention_policy").unwrap_or(0),
         })
         .collect())
+}
+
+/// Store-wide evidence-lineage totals used by compliance output and migration
+/// verification. Counts are derived only from memory_meta, so they are
+/// identical for SQLite FTS rowids and Postgres memory ids.
+pub async fn evidence_inventory(db: &Database) -> Result<EvidenceInventory> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS memories,
+                (SELECT COUNT(DISTINCT evidence_root_id) FROM memory_evidence_roots)
+                    AS independent_roots,
+                SUM(CASE WHEN derivation_depth = 0 THEN 1 ELSE 0 END) AS direct_memories,
+                SUM(CASE WHEN derivation_depth > 0 THEN 1 ELSE 0 END) AS derived_memories,
+                COALESCE(MAX(derivation_depth), 0) AS maximum_derivation_depth,
+                SUM(CASE WHEN evidence_root_id IS NULL OR evidence_root_id = '' THEN 1 ELSE 0 END)
+                    AS missing_roots
+         FROM memory_meta",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    Ok(EvidenceInventory {
+        memories: row.try_get("memories").unwrap_or(0),
+        independent_roots: row.try_get("independent_roots").unwrap_or(0),
+        direct_memories: row.try_get("direct_memories").unwrap_or(0),
+        derived_memories: row.try_get("derived_memories").unwrap_or(0),
+        maximum_derivation_depth: row.try_get("maximum_derivation_depth").unwrap_or(0),
+        missing_roots: row.try_get("missing_roots").unwrap_or(0),
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5260,6 +6010,12 @@ pub async fn get_memories_by_kind(
 }
 
 pub async fn delete_memory_meta(db: &Database, memory_id: i64) -> Result<()> {
+    // Explicit child-first cleanup keeps this correct even when a SQLite
+    // connection has foreign-key enforcement disabled.
+    sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id = $1")
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
     sqlx::query("DELETE FROM memory_meta WHERE memory_id = $1")
         .bind(memory_id)
         .execute(&db.pool)
@@ -6786,6 +7542,358 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_and_derived_writes_preserve_one_evidence_root() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = create_session(&db, "/tmp/evidence").await?;
+
+        let root_id = insert_memory(&db, "/tmp/evidence", &session, "direct source", None).await?;
+        apply_memory_governance(
+            &db,
+            root_id,
+            "project",
+            "fact",
+            &crate::governance::MemoryGovernance::explicit(),
+            Some("test"),
+            "remember",
+        )
+        .await?;
+        let child_id = insert_memory(&db, "/tmp/evidence", &session, "derived child", None).await?;
+        apply_memory_governance(
+            &db,
+            child_id,
+            "project",
+            "fact",
+            &crate::governance::MemoryGovernance::derived_from(root_id),
+            Some("test"),
+            "derive",
+        )
+        .await?;
+        let grandchild_id =
+            insert_memory(&db, "/tmp/evidence", &session, "derived grandchild", None).await?;
+        apply_memory_governance(
+            &db,
+            grandchild_id,
+            "project",
+            "fact",
+            &crate::governance::MemoryGovernance::derived_from(child_id),
+            Some("test"),
+            "derive",
+        )
+        .await?;
+
+        let root = get_memory_meta_full(&db, root_id).await?;
+        let child = get_memory_meta_full(&db, child_id).await?;
+        let grandchild = get_memory_meta_full(&db, grandchild_id).await?;
+        assert_eq!(root.derivation_depth, 0);
+        assert_eq!(child.derivation_depth, 1);
+        assert_eq!(grandchild.derivation_depth, 2);
+        assert_eq!(child.evidence_root_id, root.evidence_root_id);
+        assert_eq!(grandchild.evidence_root_id, root.evidence_root_id);
+        assert_eq!(memory_evidence_roots(&db, grandchild_id).await?.len(), 1);
+
+        let inventory = evidence_inventory(&db).await?;
+        assert_eq!(inventory.memories, 3);
+        assert_eq!(inventory.independent_roots, 1);
+        assert_eq!(inventory.direct_memories, 1);
+        assert_eq!(inventory.derived_memories, 2);
+        assert_eq!(inventory.maximum_derivation_depth, 2);
+        assert_eq!(inventory.missing_roots, 0);
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_less_direct_writes_receive_distinct_durable_roots() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let first = insert_memory(&db, "/tmp/evidence", "remember", "same fact", None).await?;
+        let second = insert_memory(&db, "/tmp/evidence", "remember", "same fact", None).await?;
+        let governance = crate::governance::MemoryGovernance::explicit();
+        apply_memory_governance(
+            &db,
+            first,
+            "project",
+            "fact",
+            &governance,
+            Some("test"),
+            "remember",
+        )
+        .await?;
+        let first_root = get_memory_meta_full(&db, first)
+            .await?
+            .evidence_root_id
+            .expect("first root");
+        apply_memory_governance(
+            &db,
+            first,
+            "project",
+            "fact",
+            &governance,
+            Some("test"),
+            "update",
+        )
+        .await?;
+        assert_eq!(
+            get_memory_meta_full(&db, first).await?.evidence_root_id,
+            Some(first_root.clone()),
+            "a stored UUID root must survive later governance updates"
+        );
+
+        apply_memory_governance(
+            &db,
+            second,
+            "project",
+            "fact",
+            &governance,
+            Some("test"),
+            "remember",
+        )
+        .await?;
+        let second_root = get_memory_meta_full(&db, second)
+            .await?
+            .evidence_root_id
+            .expect("second root");
+        assert_ne!(
+            first_root, second_root,
+            "separate direct observations are independent even when text matches"
+        );
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multi_source_evidence_deduplicates_roots_and_enforces_namespace() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = create_session(&db, "/tmp/evidence").await?;
+        let first = insert_memory(&db, "/tmp/evidence", &session, "source one", None).await?;
+        let second = insert_memory(&db, "/tmp/evidence", &session, "source two", None).await?;
+        for id in [first, second] {
+            apply_memory_governance(
+                &db,
+                id,
+                "project",
+                "fact",
+                &crate::governance::MemoryGovernance::explicit(),
+                Some("test"),
+                "remember",
+            )
+            .await?;
+        }
+        let derived = insert_memory(&db, "/tmp/evidence", &session, "synthesis", None).await?;
+        apply_memory_governance(
+            &db,
+            derived,
+            "project",
+            "inference",
+            &crate::governance::MemoryGovernance::derived_from(first),
+            Some("test"),
+            "derive",
+        )
+        .await?;
+        assert_eq!(
+            add_supporting_evidence_from_memories(&db, derived, &[first, second, second]).await?,
+            1
+        );
+        assert_eq!(memory_evidence_roots(&db, derived).await?.len(), 2);
+
+        let foreign = insert_memory(&db, "/tmp/evidence", &session, "foreign", None).await?;
+        let mut foreign_governance = crate::governance::MemoryGovernance::explicit();
+        foreign_governance.namespace = "tenant-b".to_string();
+        apply_memory_governance(
+            &db,
+            foreign,
+            "project",
+            "fact",
+            &foreign_governance,
+            Some("test"),
+            "remember",
+        )
+        .await?;
+        assert!(
+            add_supporting_evidence_from_memories(&db, derived, &[foreign])
+                .await
+                .is_err(),
+            "cross-namespace evidence must be rejected"
+        );
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn evidence_repair_is_idempotent_and_reports_broken_parents() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = create_session(&db, "/tmp/evidence").await?;
+        let id = insert_memory(&db, "/tmp/evidence", &session, "legacy orphan", None).await?;
+        sqlx::query(
+            "UPDATE memory_meta
+             SET parent_memory_id = 999999, evidence_root_id = NULL, derivation_depth = 0
+             WHERE memory_id = $1",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id = $1")
+            .bind(id)
+            .execute(&db.pool)
+            .await?;
+
+        let repaired = repair_evidence_roots(&db).await?;
+        assert_eq!(repaired.broken_parent_memory_ids, vec![id]);
+        assert_eq!(repaired.new_roots, 1);
+        assert_eq!(repaired.roots_backfilled, 1);
+        let meta = get_memory_meta_full(&db, id).await?;
+        assert!(meta.evidence_root_id.is_some());
+        assert_eq!(meta.derivation_depth, 0);
+
+        let repeated = repair_evidence_roots(&db).await?;
+        assert_eq!(repeated.roots_backfilled, 0);
+        assert!(repeated.broken_parent_memory_ids.is_empty());
+
+        let migration = evidence_root_migration_report(&db)
+            .await?
+            .expect("startup migration report");
+        assert_eq!(migration.0, "complete");
+        assert!(migration.1.cycle_memory_ids.is_empty());
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn evidence_repair_detects_parent_cycles_without_assigning_roots() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = create_session(&db, "/tmp/evidence").await?;
+        let first = insert_memory(&db, "/tmp/evidence", &session, "cycle one", None).await?;
+        let second = insert_memory(&db, "/tmp/evidence", &session, "cycle two", None).await?;
+        sqlx::query(
+            "UPDATE memory_meta
+             SET parent_memory_id = CASE memory_id WHEN $1 THEN $2 ELSE $1 END,
+                 evidence_root_id = NULL,
+                 derivation_depth = 0
+             WHERE memory_id IN ($1, $2)",
+        )
+        .bind(first)
+        .bind(second)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id IN ($1, $2)")
+            .bind(first)
+            .bind(second)
+            .execute(&db.pool)
+            .await?;
+
+        let report = repair_evidence_roots(&db).await?;
+        assert_eq!(report.cycle_memory_ids, vec![first, second]);
+        assert!(get_memory_meta_full(&db, first)
+            .await?
+            .evidence_root_id
+            .is_none());
+        assert!(get_memory_meta_full(&db, second)
+            .await?
+            .evidence_root_id
+            .is_none());
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_migration_backfills_legacy_memories_without_meta_rows() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "ironmem-evidence-legacy-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let path = path.to_string_lossy().to_string();
+        let db = Database::new(&path).await?;
+        sqlx::query(
+            "CREATE VIRTUAL TABLE memories USING fts5(
+                project, session_id, summary, tags, created_at UNINDEXED
+             )",
+        )
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO memories(project, session_id, summary, tags, created_at)
+             VALUES('/legacy', 'legacy-session', 'legacy source', NULL, 10)",
+        )
+        .execute(&db.pool)
+        .await?;
+
+        db.migrate().await?;
+        let meta = get_memory_meta_full(&db, 1).await?;
+        assert!(meta.evidence_root_id.is_some());
+        assert_eq!(meta.derivation_depth, 0);
+        assert_eq!(memory_evidence_roots(&db, 1).await?.len(), 1);
+        let (status, report) = evidence_root_migration_report(&db)
+            .await?
+            .expect("migration report");
+        assert_eq!(status, "complete");
+        assert_eq!(report.meta_rows_created, 1);
+        assert_eq!(report.roots_backfilled, 1);
+
+        // A direct legacy writer can add a row after the migration was marked
+        // complete. The next startup must repair it instead of trusting the old
+        // completion marker forever.
+        sqlx::query(
+            "INSERT INTO memories(project, session_id, summary, tags, created_at)
+             VALUES('/legacy', 'legacy-session', 'late legacy source', NULL, 11)",
+        )
+        .execute(&db.pool)
+        .await?;
+        db.migrate().await?;
+        let late = get_memory_meta_full(&db, 2).await?;
+        assert!(late.evidence_root_id.is_some());
+        assert_eq!(memory_evidence_roots(&db, 2).await?.len(), 1);
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_migration_fails_closed_and_stores_cycle_report() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = create_session(&db, "/tmp/evidence").await?;
+        let first = insert_memory(&db, "/tmp/evidence", &session, "cycle a", None).await?;
+        let second = insert_memory(&db, "/tmp/evidence", &session, "cycle b", None).await?;
+        sqlx::query(
+            "UPDATE memory_meta
+             SET parent_memory_id = CASE memory_id WHEN $1 THEN $2 ELSE $1 END,
+                 evidence_root_id = NULL,
+                 derivation_depth = 0
+             WHERE memory_id IN ($1, $2)",
+        )
+        .bind(first)
+        .bind(second)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id IN ($1, $2)")
+            .bind(first)
+            .bind(second)
+            .execute(&db.pool)
+            .await?;
+        sqlx::query("DELETE FROM schema_migrations WHERE migration_id = $1")
+            .bind(EVIDENCE_ROOT_MIGRATION_ID)
+            .execute(&db.pool)
+            .await?;
+
+        let error = db
+            .migrate()
+            .await
+            .expect_err("lineage cycles must fail migration");
+        assert!(error.to_string().contains("parent cycle"));
+        let (status, report) = evidence_root_migration_report(&db)
+            .await?
+            .expect("failed migration report");
+        assert_eq!(status, "failed");
+        assert_eq!(report.cycle_memory_ids, vec![first, second]);
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn namespace_filters_recall_boundaries() -> Result<()> {
         let (db, path) = test_db().await?;
         let s = create_session(&db, "/tmp/p").await?;
@@ -6846,6 +7954,11 @@ mod tests {
 
         assert!(governed_delete_memory(&db, id, Some("test"), Some("unit test")).await?);
         assert!(get_memory_by_id(&db, id).await?.is_none());
+        let replacement = insert_memory(&db, "/tmp/p", &s, "replacement", None).await?;
+        assert!(
+            replacement > id,
+            "SQLite must not reuse a row id whose audit metadata is retained"
+        );
         let ledger = memory_ledger_for_memory(&db, id).await?;
         assert!(ledger.iter().any(|e| e.op_type == "remember"));
         assert!(ledger.iter().any(|e| e.op_type == "forget"));
