@@ -578,11 +578,12 @@ mod tests {
             hash_sensitive_value("private deployment query")
         );
 
+        let replay_nonce = uuid::Uuid::new_v4().to_string();
         crate::db::claim_influence_nonce(
             &db,
             "purpose_attestation",
             "issuer",
-            "n",
+            &replay_nonce,
             "r",
             9999999999,
         )
@@ -591,7 +592,7 @@ mod tests {
             &db,
             "purpose_attestation",
             "issuer",
-            "n",
+            &replay_nonce,
             "r",
             9999999999
         )
