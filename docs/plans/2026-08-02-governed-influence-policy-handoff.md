@@ -5,7 +5,7 @@
 **Active worktree:** `/Users/kingjames/Projects/Iron-mem-pr38-policy`
 **Active branch:** `agent/governed-influence-policy`
 **Stack base:** `agent/governed-influence-evidence-roots` at `10c20feeb3dc93ed71bc5bc8703c528874feda22` (draft PR #39)
-**State:** Phase 2 published as draft PR #40. Phase 3 is explicitly paused until the urgent local-extraction recovery described below is implemented and verified.
+**State:** Phase 2 is published as draft PR #40. The local-extraction prerequisite is implemented in draft PR #41 and the preserved live backlog has been recovered successfully. Phase 3 may resume after revalidating the stacked PR state.
 
 ## Delivery boundary
 
@@ -201,12 +201,28 @@ Do not delete, replace, or bulk rewrite the 499 session archives. Do not backfil
 
 ## Remaining work
 
+### Recovery completed 2026-08-02
+
+- Draft PR #41: `Restore offline fact and procedure extraction`, stacked on PR #39.
+- Branch/head: `fix/offline-extraction-recovery` at `c2c30ae46589a231e05b100c79356c016fb03442`; local, remote, and PR head matched and the PR was clean/mergeable.
+- Complete local verification: strict clippy passed; 244 tests passed, zero failed, one intentional benchmark ignored; clean MCP stdio passed.
+- A timestamped pre-recovery SQLite backup was created at `~/.ironmem/backups/pre-offline-extraction-canary-20260802T050000Z-c2c30ae/mem.db` with SHA-256 `21d533fdf9d481e420dbb6f5146987477ae2ce686b0dc300f37fb5e140f7248a`.
+- Five-session live canary: 56 facts, eight procedures, 64/64 source-supported items, zero failures, unique child refs, and zero lineage/governance mismatches.
+- Full bounded recovery: all 499 preserved archives plus eight nonempty uncompressed post-checkpoint sessions now have completed `local-extractive-v1` receipts; zero eligible candidates remain.
+- Receipt totals: 507 complete, zero failed, 1,455 facts, 88 procedures, and 1,543/1,543 source-supported extracted items.
+- Deny-safe dedupe avoided 210 redundant fact writes. The 1,320 recovery-owned children have 1,320 distinct source refs, 1,320 derive-ledger entries, and zero evidence-root/depth/namespace/classification mismatches.
+- Source archives were not deleted or rewritten. Configuration was unchanged. Recovery disabled `auto`/cloud embeddings and sent no archive content to a provider.
+- A release binary with `local-onnx` support was built from PR #41 and deployed locally after preserving the prior executable as `~/.ironmem/bin/ironmem.pre-offline-extraction-c2c30ae`.
+- Installed binary SHA-256: `e35b09f865b6ef62b8ccaaac27761e4299929b1897f774a7c1ef77a0c66c6672`, matching the verified release artifact.
+- The worker was restarted and `/status` verified `ok=true`, `compression.mode=local`, `cloud_required=false`, and extractor `local-extractive-v1` with 507 completed/zero failed receipts. Future local sessions now use on-device typed extraction.
+- `/status` candidate totals are intentionally global and include older pre-checkpoint archives; the timestamp/id-bounded post-checkpoint recovery query returned zero remaining archives and zero remaining nonempty uncompressed sessions.
+
+Runbook: `docs/plans/2026-08-02-offline-extraction-recovery-runbook.md` in PR #41.
+
 ### Prerequisite: local extraction recovery
 
-- Implement and publish the complete recovery PR above.
-- Verify the on-device extractor and canary backfill.
-- Backfill preserved local transcripts safely and report exact receipts.
-- Resume the approved governed-influence sequence only after recovery succeeds.
+- Completed in PR #41 and the live receipt-backed recovery described above.
+- Do not repeat the backfill; re-check receipt status and candidate count if the database changes before deployment.
 
 ### Phase 3: purpose and shared egress gate
 
