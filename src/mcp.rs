@@ -68,6 +68,7 @@ pub struct IronMemServer {
     config: Arc<Config>,
     embedder: Option<Arc<dyn Embedder>>,
     store: Arc<dyn VectorStore>,
+    policy_principal: crate::influence::PolicyPrincipal,
 }
 
 impl IronMemServer {
@@ -270,6 +271,41 @@ impl IronMemServer {
                         "source_ref": { "type": "string", "description": "Optional source event, receipt, URL, or tool id" }
                     },
                     "required": ["project", "text"]
+                })),
+            ),
+            Tool::new(
+                "get_memory_influence",
+                "Read the versioned influence policy for a memory. Requires influence_policy:read on shared HTTP MCP; local stdio is a local-operator channel.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "memory_id": { "type": "integer", "description": "Memory id" },
+                        "namespace": { "type": "string", "description": "Governance namespace (default local)" }
+                    },
+                    "required": ["memory_id"]
+                })),
+            ),
+            Tool::new(
+                "set_memory_influence",
+                "Apply a version-checked influence-policy patch and append an atomic ledger receipt. Requires influence_policy:write on shared HTTP MCP; local stdio is a local-operator channel.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "memory_id": { "type": "integer", "description": "Memory id" },
+                        "namespace": { "type": "string", "description": "Governance namespace (default local)" },
+                        "expected_version": { "type": "integer", "minimum": 1, "description": "Current policy version for optimistic concurrency" },
+                        "reason": { "type": "string", "description": "Required audit reason" },
+                        "request_id": { "type": "string", "description": "Optional caller request id; generated when omitted" },
+                        "state": { "type": "string", "enum": ["eligible", "quarantined", "reasoning_only", "action_restricted", "blocked", "superseded"] },
+                        "allowed_task_types": { "type": "array", "items": { "type": "string" }, "maxItems": 64 },
+                        "denied_task_types": { "type": "array", "items": { "type": "string" }, "maxItems": 64 },
+                        "maximum_action_risk": { "type": "string", "enum": ["none", "low", "medium", "high", "critical"] },
+                        "requires_original_source": { "type": "boolean" },
+                        "requires_human_confirmation": { "type": "boolean" },
+                        "maximum_derivation_depth": { "type": "integer", "minimum": 0 },
+                        "clear_maximum_derivation_depth": { "type": "boolean", "description": "Clear an existing depth limit; mutually exclusive with maximum_derivation_depth" }
+                    },
+                    "required": ["memory_id", "expected_version", "reason"]
                 })),
             ),
             Tool::new(
@@ -885,6 +921,130 @@ impl IronMemServer {
         )]))
     }
 
+    async fn handle_get_memory_influence(
+        &self,
+        args: &JsonObject,
+    ) -> Result<CallToolResult, ErrorData> {
+        let memory_id = args
+            .get("memory_id")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| ErrorData::invalid_params("missing 'memory_id'", None))?;
+        let namespace = namespace_arg(args);
+        match crate::influence::get_memory_policy(
+            &self.db,
+            &self.policy_principal,
+            memory_id,
+            &namespace,
+        )
+        .await
+        {
+            Ok(policy) => {
+                let value = serde_json::json!({ "ok": true, "record": policy });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&value).unwrap(),
+                )]))
+            }
+            Err(error) => Ok(policy_tool_error(error)),
+        }
+    }
+
+    async fn handle_set_memory_influence(
+        &self,
+        args: &JsonObject,
+    ) -> Result<CallToolResult, ErrorData> {
+        let memory_id = args
+            .get("memory_id")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| ErrorData::invalid_params("missing 'memory_id'", None))?;
+        let expected_version = args
+            .get("expected_version")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| ErrorData::invalid_params("missing 'expected_version'", None))?;
+        let reason = args
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| ErrorData::invalid_params("missing 'reason'", None))?;
+        let state = args
+            .get("state")
+            .and_then(|value| value.as_str())
+            .map(str::parse)
+            .transpose()
+            .map_err(|error: crate::influence::PolicyError| {
+                ErrorData::invalid_params(error.to_string(), None)
+            })?;
+        let maximum_action_risk = args
+            .get("maximum_action_risk")
+            .and_then(|value| value.as_str())
+            .map(str::parse)
+            .transpose()
+            .map_err(|error: crate::influence::PolicyError| {
+                ErrorData::invalid_params(error.to_string(), None)
+            })?;
+        let maximum_derivation_depth = args
+            .get("maximum_derivation_depth")
+            .and_then(|value| value.as_u64())
+            .map(|value| {
+                u32::try_from(value).map_err(|_| {
+                    ErrorData::invalid_params("'maximum_derivation_depth' exceeds u32 range", None)
+                })
+            })
+            .transpose()?;
+        let clear_depth = args
+            .get("clear_maximum_derivation_depth")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if clear_depth && maximum_derivation_depth.is_some() {
+            return Err(ErrorData::invalid_params(
+                "'maximum_derivation_depth' and 'clear_maximum_derivation_depth' are mutually exclusive",
+                None,
+            ));
+        }
+        let namespace = namespace_arg(args);
+        let request = crate::influence::PolicyMutationRequest {
+            expected_version,
+            patch: crate::influence::MemoryInfluencePolicyPatch {
+                state,
+                allowed_task_types: string_array_arg(args, "allowed_task_types")?,
+                denied_task_types: string_array_arg(args, "denied_task_types")?,
+                maximum_action_risk,
+                requires_original_source: args
+                    .get("requires_original_source")
+                    .and_then(|value| value.as_bool()),
+                requires_human_confirmation: args
+                    .get("requires_human_confirmation")
+                    .and_then(|value| value.as_bool()),
+                maximum_derivation_depth: if clear_depth {
+                    Some(None)
+                } else {
+                    maximum_derivation_depth.map(Some)
+                },
+            },
+            reason: reason.to_string(),
+            request_id: args
+                .get("request_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("mcp-policy-{}", uuid::Uuid::new_v4())),
+        };
+        match crate::influence::update_memory_policy(
+            &self.db,
+            &self.policy_principal,
+            memory_id,
+            &namespace,
+            &request,
+        )
+        .await
+        {
+            Ok(policy) => {
+                let value = serde_json::json!({ "ok": true, "record": policy });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&value).unwrap(),
+                )]))
+            }
+            Err(error) => Ok(policy_tool_error(error)),
+        }
+    }
+
     async fn handle_get_profile(&self) -> Result<CallToolResult, ErrorData> {
         let profile = db::get_profile_memory(&self.db)
             .await
@@ -1140,6 +1300,51 @@ fn namespace_arg(args: &JsonObject) -> String {
     )
 }
 
+fn policy_tool_error(error: anyhow::Error) -> CallToolResult {
+    let value = if let Some(policy_error) = crate::influence::policy_error(&error) {
+        serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": policy_error.code(),
+                "message": policy_error.to_string(),
+                "current_version": policy_error.current_version(),
+            }
+        })
+    } else {
+        serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "influence_policy_storage_error",
+                "message": error.to_string(),
+            }
+        })
+    };
+    CallToolResult::error(vec![Content::text(
+        serde_json::to_string_pretty(&value).unwrap(),
+    )])
+}
+
+fn string_array_arg(
+    args: &JsonObject,
+    field: &str,
+) -> std::result::Result<Option<Vec<String>>, ErrorData> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| ErrorData::invalid_params(format!("'{field}' must be an array"), None))?;
+    values
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                ErrorData::invalid_params(format!("every '{field}' entry must be a string"), None)
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map(Some)
+}
+
 impl ServerHandler for IronMemServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -1176,6 +1381,8 @@ impl ServerHandler for IronMemServer {
             "list_sessions" => self.handle_list_sessions(&args).await,
             "inject_context" => self.handle_inject_context(&args).await,
             "remember" => self.handle_remember(&args).await,
+            "get_memory_influence" => self.handle_get_memory_influence(&args).await,
+            "set_memory_influence" => self.handle_set_memory_influence(&args).await,
             "get_profile" => self.handle_get_profile().await,
             "refresh_profile" => self.handle_refresh_profile().await,
             "list_corrections" => self.handle_list_corrections(&args).await,
@@ -1198,6 +1405,7 @@ pub async fn run_stdio(db: Arc<Database>, config: Config) -> Result<()> {
         config: Arc::new(config),
         embedder,
         store,
+        policy_principal: crate::influence::PolicyPrincipal::local_operator("ironmem:mcp:stdio"),
     };
 
     let service = server.serve(rmcp::transport::stdio()).await?;
@@ -1211,11 +1419,18 @@ pub async fn run_streamable_http(
     bind: SocketAddr,
 ) -> Result<()> {
     let (embedder, store) = vectorstore::build_semantic(&db, &config).await;
+    let policy_principal = crate::influence::PolicyPrincipal::configured(
+        "ironmem:mcp:http",
+        "shared_mcp",
+        config.mcp_namespaces.clone(),
+        config.mcp_capabilities.clone(),
+    );
     let server = IronMemServer {
         db,
         config: Arc::new(config),
         embedder,
         store,
+        policy_principal,
     };
     let auth_token = server.config.auth_token.clone();
 
@@ -1342,6 +1557,9 @@ mod tests {
                 config,
                 embedder,
                 store,
+                policy_principal: crate::influence::PolicyPrincipal::local_operator(
+                    "ironmem:mcp:test",
+                ),
             },
             db_path_string,
         )
@@ -1396,6 +1614,102 @@ mod tests {
         let props = &v["inputSchema"]["properties"];
         assert!(props.get("dry_run").is_some(), "schema has dry_run");
         assert!(props.get("apply").is_some(), "schema has apply");
+    }
+
+    #[test]
+    fn tool_list_includes_influence_policy_crud() {
+        let tools = IronMemServer::build_tool_list();
+        let get_policy = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "get_memory_influence")
+            .expect("get_memory_influence tool registered");
+        let set_policy = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "set_memory_influence")
+            .expect("set_memory_influence tool registered");
+        let get_schema = serde_json::to_value(get_policy).unwrap();
+        let set_schema = serde_json::to_value(set_policy).unwrap();
+        assert!(get_schema["inputSchema"]["properties"]["memory_id"].is_object());
+        assert!(set_schema["inputSchema"]["properties"]["expected_version"].is_object());
+        assert!(set_schema["inputSchema"]["properties"]["reason"].is_object());
+    }
+
+    #[tokio::test]
+    async fn influence_policy_tools_share_versioned_capability_checked_handlers() {
+        let (server, path) = test_server().await;
+        let session = db::create_session(&server.db, "/tmp/mcp-policy")
+            .await
+            .unwrap();
+        let memory_id = db::insert_memory(
+            &server.db,
+            "/tmp/mcp-policy",
+            &session,
+            "MCP policy memory",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut get_args = JsonObject::new();
+        get_args.insert("memory_id".into(), serde_json::json!(memory_id));
+        get_args.insert("namespace".into(), serde_json::json!("local"));
+        let initial: serde_json::Value = serde_json::from_str(&result_text(
+            &server.handle_get_memory_influence(&get_args).await.unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(initial["ok"], true);
+        assert_eq!(initial["record"]["policy"]["version"], 1);
+        assert_eq!(initial["record"]["explicit"], false);
+
+        let mut set_args = JsonObject::new();
+        set_args.insert("memory_id".into(), serde_json::json!(memory_id));
+        set_args.insert("namespace".into(), serde_json::json!("local"));
+        set_args.insert("expected_version".into(), serde_json::json!(1));
+        set_args.insert("reason".into(), serde_json::json!("MCP policy test"));
+        set_args.insert("request_id".into(), serde_json::json!("mcp-policy-test"));
+        set_args.insert("state".into(), serde_json::json!("reasoning_only"));
+        set_args.insert(
+            "allowed_task_types".into(),
+            serde_json::json!(["Code Review"]),
+        );
+        let updated: serde_json::Value = serde_json::from_str(&result_text(
+            &server.handle_set_memory_influence(&set_args).await.unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(updated["ok"], true);
+        assert_eq!(updated["record"]["policy"]["version"], 2);
+        assert_eq!(
+            updated["record"]["policy"]["allowed_task_types"][0],
+            "code_review"
+        );
+
+        let stale_result = server.handle_set_memory_influence(&set_args).await.unwrap();
+        assert_eq!(stale_result.is_error, Some(true));
+        let stale: serde_json::Value = serde_json::from_str(&result_text(&stale_result)).unwrap();
+        assert_eq!(stale["ok"], false);
+        assert_eq!(stale["error"]["code"], "policy_version_conflict");
+        assert_eq!(stale["error"]["current_version"], 2);
+
+        let mut shared_http = server.clone();
+        shared_http.policy_principal = crate::influence::PolicyPrincipal::configured(
+            "ironmem:mcp:http",
+            "shared_mcp",
+            vec!["local".to_string()],
+            Vec::new(),
+        );
+        let denied_result = shared_http
+            .handle_get_memory_influence(&get_args)
+            .await
+            .unwrap();
+        assert_eq!(denied_result.is_error, Some(true));
+        let denied: serde_json::Value = serde_json::from_str(&result_text(&denied_result)).unwrap();
+        assert_eq!(denied["ok"], false);
+        assert_eq!(
+            denied["error"]["code"],
+            "influence_policy_capability_required"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -1569,6 +1883,7 @@ mod tests {
             config,
             embedder,
             store,
+            policy_principal: crate::influence::PolicyPrincipal::local_operator("ironmem:mcp:test"),
         };
 
         // No profile yet.

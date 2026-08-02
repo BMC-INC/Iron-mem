@@ -16,6 +16,7 @@ mod eval;
 mod expansion;
 mod governance;
 mod hooks;
+mod influence;
 mod mcp;
 mod metrics;
 mod observer;
@@ -103,6 +104,62 @@ enum SchedulerCommands {
     InstallLaunchd,
     /// Stop and remove the macOS launchd sleep-cycle agent
     UninstallLaunchd,
+}
+
+#[derive(Subcommand)]
+enum InfluenceCommands {
+    /// Read the effective versioned influence policy for a memory
+    Get {
+        memory_id: i64,
+        #[arg(long, default_value = "local")]
+        namespace: String,
+    },
+    /// Apply a version-checked policy patch and ledger the transition
+    Set {
+        memory_id: i64,
+        #[arg(long)]
+        expected_version: u64,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        request_id: Option<String>,
+        #[arg(long, default_value = "local")]
+        namespace: String,
+        #[arg(long, default_value = "ironmem:cli")]
+        actor: String,
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long = "allow-task")]
+        allowed_task_types: Vec<String>,
+        #[arg(long = "deny-task")]
+        denied_task_types: Vec<String>,
+        #[arg(long)]
+        clear_allowed_tasks: bool,
+        #[arg(long)]
+        clear_denied_tasks: bool,
+        #[arg(long = "max-risk", alias = "maximum-action-risk")]
+        maximum_action_risk: Option<String>,
+        #[arg(
+            long = "require-source",
+            alias = "requires-original-source",
+            num_args = 0..=1,
+            default_missing_value = "true",
+            require_equals = true
+        )]
+        requires_original_source: Option<bool>,
+        #[arg(
+            long = "require-confirmation",
+            alias = "requires-human-confirmation",
+            num_args = 0..=1,
+            default_missing_value = "true",
+            require_equals = true
+        )]
+        requires_human_confirmation: Option<bool>,
+        #[arg(long)]
+        maximum_derivation_depth: Option<u32>,
+        #[arg(long)]
+        clear_maximum_derivation_depth: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -253,6 +310,12 @@ enum Commands {
         /// Human-readable reason written into the memory ledger
         #[arg(long)]
         reason: Option<String>,
+    },
+
+    /// Read or change a memory's governed influence policy
+    Influence {
+        #[command(subcommand)]
+        action: InfluenceCommands,
     },
 
     /// Show the user profile (durable cross-project facts + recent activity)
@@ -683,6 +746,7 @@ async fn async_main() -> Result<()> {
             actor,
             reason,
         } => run_forget(&cfg, memory_id, &actor, reason.as_deref()).await?,
+        Commands::Influence { action } => run_influence(&cfg, action).await?,
         Commands::Profile { refresh } => run_profile(&cfg, refresh).await?,
         Commands::Corrections {
             project,
@@ -1071,6 +1135,112 @@ async fn run_lineage(cfg: &config::Config, memory_id: i64) -> Result<()> {
     let lineage = compliance::memory_lineage(&database, memory_id).await?;
     println!("{}", serde_json::to_string_pretty(&lineage)?);
     Ok(())
+}
+
+async fn run_influence(cfg: &config::Config, action: InfluenceCommands) -> Result<()> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    match action {
+        InfluenceCommands::Get {
+            memory_id,
+            namespace,
+        } => {
+            let principal = influence::PolicyPrincipal::local_operator("ironmem:cli");
+            let record = influence::get_memory_policy(&database, &principal, memory_id, &namespace)
+                .await
+                .map_err(cli_policy_error)?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+        }
+        InfluenceCommands::Set {
+            memory_id,
+            expected_version,
+            reason,
+            request_id,
+            namespace,
+            actor,
+            state,
+            allowed_task_types,
+            denied_task_types,
+            clear_allowed_tasks,
+            clear_denied_tasks,
+            maximum_action_risk,
+            requires_original_source,
+            requires_human_confirmation,
+            maximum_derivation_depth,
+            clear_maximum_derivation_depth,
+        } => {
+            anyhow::ensure!(
+                !clear_allowed_tasks || allowed_task_types.is_empty(),
+                "--clear-allowed-tasks cannot be combined with --allow-task"
+            );
+            anyhow::ensure!(
+                !clear_denied_tasks || denied_task_types.is_empty(),
+                "--clear-denied-tasks cannot be combined with --deny-task"
+            );
+            anyhow::ensure!(
+                !(clear_maximum_derivation_depth && maximum_derivation_depth.is_some()),
+                "--clear-maximum-derivation-depth cannot be combined with --maximum-derivation-depth"
+            );
+            let allowed_task_types = if clear_allowed_tasks {
+                Some(Vec::new())
+            } else if allowed_task_types.is_empty() {
+                None
+            } else {
+                Some(allowed_task_types)
+            };
+            let denied_task_types = if clear_denied_tasks {
+                Some(Vec::new())
+            } else if denied_task_types.is_empty() {
+                None
+            } else {
+                Some(denied_task_types)
+            };
+            let state = state
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .map_err(anyhow::Error::new)?;
+            let maximum_action_risk = maximum_action_risk
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .map_err(anyhow::Error::new)?;
+            let principal = influence::PolicyPrincipal::local_operator(actor);
+            let request = influence::PolicyMutationRequest {
+                expected_version,
+                patch: influence::MemoryInfluencePolicyPatch {
+                    state,
+                    allowed_task_types,
+                    denied_task_types,
+                    maximum_action_risk,
+                    requires_original_source,
+                    requires_human_confirmation,
+                    maximum_derivation_depth: if clear_maximum_derivation_depth {
+                        Some(None)
+                    } else {
+                        maximum_derivation_depth.map(Some)
+                    },
+                },
+                reason,
+                request_id: request_id
+                    .unwrap_or_else(|| format!("cli-policy-{}", uuid::Uuid::new_v4())),
+            };
+            let record = influence::update_memory_policy(
+                &database, &principal, memory_id, &namespace, &request,
+            )
+            .await
+            .map_err(cli_policy_error)?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+        }
+    }
+    Ok(())
+}
+
+fn cli_policy_error(error: anyhow::Error) -> anyhow::Error {
+    match influence::policy_error(&error) {
+        Some(policy_error) => anyhow::anyhow!("{}: {}", policy_error.code(), policy_error),
+        None => error,
+    }
 }
 
 async fn run_mcp(cfg: config::Config) -> Result<()> {

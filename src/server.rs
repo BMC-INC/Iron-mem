@@ -148,6 +148,10 @@ pub fn router(state: AppState) -> Router {
         .route("/compliance/report", get(get_compliance_report))
         .route("/memory/{id}/lineage", get(get_memory_lineage))
         .route(
+            "/memory/{id}/influence",
+            get(get_memory_influence).put(put_memory_influence),
+        )
+        .route(
             "/sync/events",
             get(export_sync_events).post(publish_sync_event),
         )
@@ -182,6 +186,8 @@ pub struct AgentIdentity {
     pub agent_id: String,
     /// Normalized namespace allowlist; empty = all namespaces.
     pub namespaces: Vec<String>,
+    /// Administrative capabilities remain distinct from namespace access.
+    pub capabilities: Vec<String>,
 }
 
 impl AgentIdentity {
@@ -215,6 +221,11 @@ async fn require_agent_key(
             .namespaces
             .iter()
             .map(|n| crate::governance::normalize_namespace(n))
+            .collect(),
+        capabilities: key
+            .capabilities
+            .iter()
+            .map(|capability| capability.trim().to_ascii_lowercase())
             .collect(),
     };
     // Generic guard for namespace-scoped GET endpoints (?namespace=...).
@@ -884,6 +895,146 @@ async fn get_memory_lineage(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(lineage))
+}
+
+#[derive(Deserialize)]
+pub struct InfluencePolicyQuery {
+    pub namespace: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct PutInfluencePolicyRequest {
+    pub namespace: Option<String>,
+    pub expected_version: u64,
+    pub reason: String,
+    pub request_id: Option<String>,
+    pub state: Option<crate::influence::InfluenceState>,
+    pub allowed_task_types: Option<Vec<String>>,
+    pub denied_task_types: Option<Vec<String>>,
+    pub maximum_action_risk: Option<crate::influence::ActionRisk>,
+    pub requires_original_source: Option<bool>,
+    pub requires_human_confirmation: Option<bool>,
+    pub maximum_derivation_depth: Option<u32>,
+    #[serde(default)]
+    pub clear_maximum_derivation_depth: bool,
+}
+
+type InfluenceHttpError = (StatusCode, Json<serde_json::Value>);
+
+fn rest_policy_principal(
+    agent: Option<axum::Extension<AgentIdentity>>,
+) -> crate::influence::PolicyPrincipal {
+    match agent {
+        Some(axum::Extension(identity)) => crate::influence::PolicyPrincipal::configured(
+            format!("agent:{}", identity.agent_id),
+            "authenticated_agent",
+            identity.namespaces,
+            identity.capabilities,
+        ),
+        None => crate::influence::PolicyPrincipal::local_operator("ironmem:rest-local"),
+    }
+}
+
+fn influence_http_error(error: anyhow::Error) -> InfluenceHttpError {
+    if let Some(policy_error) = crate::influence::policy_error(&error) {
+        let status = match policy_error {
+            crate::influence::PolicyError::MemoryNotFound { .. } => StatusCode::NOT_FOUND,
+            crate::influence::PolicyError::NamespaceDenied { .. }
+            | crate::influence::PolicyError::CapabilityRequired { .. } => StatusCode::FORBIDDEN,
+            crate::influence::PolicyError::VersionConflict { .. } => StatusCode::CONFLICT,
+            crate::influence::PolicyError::InvalidPolicy(_)
+            | crate::influence::PolicyError::NoChange => StatusCode::BAD_REQUEST,
+        };
+        return (
+            status,
+            Json(serde_json::json!({
+                "error": {
+                    "code": policy_error.code(),
+                    "message": policy_error.to_string(),
+                    "current_version": policy_error.current_version(),
+                }
+            })),
+        );
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": {
+                "code": "influence_policy_storage_error",
+                "message": error.to_string(),
+            }
+        })),
+    )
+}
+
+async fn get_memory_influence(
+    State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
+    Path(id): Path<i64>,
+    Query(query): Query<InfluencePolicyQuery>,
+) -> Result<Json<crate::influence::MemoryInfluencePolicyRecord>, InfluenceHttpError> {
+    let namespace = crate::governance::normalize_namespace(
+        query
+            .namespace
+            .as_deref()
+            .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+    );
+    crate::influence::get_memory_policy(&state.db, &rest_policy_principal(agent), id, &namespace)
+        .await
+        .map(Json)
+        .map_err(influence_http_error)
+}
+
+async fn put_memory_influence(
+    State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
+    Path(id): Path<i64>,
+    Json(body): Json<PutInfluencePolicyRequest>,
+) -> Result<Json<crate::influence::MemoryInfluencePolicyRecord>, InfluenceHttpError> {
+    if body.clear_maximum_derivation_depth && body.maximum_derivation_depth.is_some() {
+        return Err(influence_http_error(anyhow::Error::new(
+            crate::influence::PolicyError::InvalidPolicy(
+                "maximum_derivation_depth and clear_maximum_derivation_depth are mutually exclusive"
+                    .to_string(),
+            ),
+        )));
+    }
+    let namespace = crate::governance::normalize_namespace(
+        body.namespace
+            .as_deref()
+            .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+    );
+    let maximum_derivation_depth = if body.clear_maximum_derivation_depth {
+        Some(None)
+    } else {
+        body.maximum_derivation_depth.map(Some)
+    };
+    let request = crate::influence::PolicyMutationRequest {
+        expected_version: body.expected_version,
+        patch: crate::influence::MemoryInfluencePolicyPatch {
+            state: body.state,
+            allowed_task_types: body.allowed_task_types,
+            denied_task_types: body.denied_task_types,
+            maximum_action_risk: body.maximum_action_risk,
+            requires_original_source: body.requires_original_source,
+            requires_human_confirmation: body.requires_human_confirmation,
+            maximum_derivation_depth,
+        },
+        reason: body.reason,
+        request_id: body
+            .request_id
+            .unwrap_or_else(|| format!("rest-policy-{}", uuid::Uuid::new_v4())),
+    };
+    crate::influence::update_memory_policy(
+        &state.db,
+        &rest_policy_principal(agent),
+        id,
+        &namespace,
+        &request,
+    )
+    .await
+    .map(Json)
+    .map_err(influence_http_error)
 }
 
 #[derive(Deserialize)]
@@ -1574,6 +1725,14 @@ async fn api_list_sessions(
 #[cfg(test)]
 mod workbench_tests {
     use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
 
     #[test]
     fn graph_window_options_validate_dates_trim_filters_and_cap_limits() {
@@ -1622,5 +1781,134 @@ mod workbench_tests {
         assert_eq!(json["legal_hold"], true);
         assert!(json.get("record_hash").is_none());
         assert!(json.get("tombstoned_at").is_none());
+    }
+
+    #[tokio::test]
+    async fn influence_rest_requires_capability_and_reports_version_conflicts() {
+        let path = std::env::temp_dir().join(format!(
+            "ironmem-rest-influence-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let path_string = path.to_string_lossy().to_string();
+        let database = db::Database::new(&path_string).await.unwrap();
+        database.migrate().await.unwrap();
+        let session = db::create_session(&database, "/tmp/rest-policy")
+            .await
+            .unwrap();
+        let memory_id = db::insert_memory(
+            &database,
+            "/tmp/rest-policy",
+            &session,
+            "REST policy memory",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut config = Config::default();
+        config.embedding.provider = "none".to_string();
+        config.agent_keys = vec![
+            crate::config::AgentKeyConfig {
+                token: "read-token".to_string(),
+                agent_id: "reader".to_string(),
+                namespaces: vec!["local".to_string()],
+                capabilities: vec![crate::influence::POLICY_READ_CAPABILITY.to_string()],
+            },
+            crate::config::AgentKeyConfig {
+                token: "write-token".to_string(),
+                agent_id: "policy-admin".to_string(),
+                namespaces: vec!["local".to_string()],
+                capabilities: vec![
+                    crate::influence::POLICY_READ_CAPABILITY.to_string(),
+                    crate::influence::POLICY_WRITE_CAPABILITY.to_string(),
+                ],
+            },
+        ];
+        let (embedder, store) = vectorstore::build_semantic(&database, &config).await;
+        let app = router(AppState {
+            db: database,
+            config,
+            embedder,
+            store,
+        });
+        let body = serde_json::json!({
+            "namespace": "local",
+            "expected_version": 1,
+            "reason": "restrict REST policy test",
+            "request_id": "rest-policy-test",
+            "state": "blocked"
+        })
+        .to_string();
+
+        let denied = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri(format!("/memory/{memory_id}/influence"))
+                    .header("authorization", "Bearer read-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response_json(denied).await["error"]["code"],
+            "influence_policy_capability_required"
+        );
+
+        let updated = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri(format!("/memory/{memory_id}/influence"))
+                    .header("authorization", "Bearer write-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        let updated = response_json(updated).await;
+        assert_eq!(updated["policy"]["version"], 2);
+        assert_eq!(updated["policy"]["state"], "blocked");
+        assert_eq!(updated["updated_by"], "agent:policy-admin");
+
+        let conflict = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri(format!("/memory/{memory_id}/influence"))
+                    .header("authorization", "Bearer write-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let conflict = response_json(conflict).await;
+        assert_eq!(conflict["error"]["code"], "policy_version_conflict");
+        assert_eq!(conflict["error"]["current_version"], 2);
+
+        let read = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/memory/{memory_id}/influence?namespace=local"))
+                    .header("authorization", "Bearer read-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+        assert_eq!(response_json(read).await["policy"]["version"], 2);
+
+        let _ = std::fs::remove_file(path);
     }
 }
