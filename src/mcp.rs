@@ -22,6 +22,25 @@ fn schema(val: serde_json::Value) -> Arc<JsonObject> {
     Arc::new(val.as_object().expect("schema must be an object").clone())
 }
 
+fn purpose_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Optional purpose envelope. Strict mode requires a trusted opaque attestation.",
+        "properties": {
+            "request_id": { "type": "string" },
+            "namespace": { "type": "string" },
+            "project": { "type": "string" },
+            "task_type": { "type": "string" },
+            "intended_action": { "type": ["string", "null"] },
+            "action_risk": { "type": "string", "enum": ["none", "low", "medium", "high", "critical"] },
+            "require_source_backing": { "type": "boolean" },
+            "purpose_attestation": { "type": ["string", "null"] },
+            "confirmation_receipt": { "type": ["string", "null"] }
+        },
+        "required": ["request_id", "namespace", "project", "task_type", "action_risk"]
+    })
+}
+
 /// A successful tool result whose payload reports a graceful, non-fatal error
 /// (e.g. unknown id / missing blob) — distinct from an MCP protocol error.
 fn error_result(message: impl Into<String>) -> CallToolResult {
@@ -72,6 +91,47 @@ pub struct IronMemServer {
 }
 
 impl IronMemServer {
+    fn purpose_arg(args: &JsonObject) -> Result<Option<crate::purpose::RecallPurpose>, ErrorData> {
+        args.get("purpose")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| ErrorData::invalid_params(format!("invalid purpose: {error}"), None))
+    }
+
+    async fn gate_memories(
+        &self,
+        memories: Vec<db::Memory>,
+        namespace: &str,
+        project: &str,
+        args: &JsonObject,
+        consumer: crate::egress::ConsumerCapabilities,
+    ) -> Result<crate::egress::GateResult, ErrorData> {
+        let purpose = Self::purpose_arg(args)?;
+        let channel = if self.policy_principal.authority == "local_operator" {
+            crate::egress::PurposeChannel::LocalOperator(self.policy_principal.actor.clone())
+        } else {
+            // Shared-token MCP is not per-agent identity. Strict calls must
+            // carry a trusted purpose attestation.
+            crate::egress::PurposeChannel::Remote {
+                authenticated_agent: None,
+            }
+        };
+        crate::egress::gate_memories_with_query(
+            &self.db,
+            memories,
+            namespace,
+            project,
+            purpose.as_ref(),
+            channel,
+            consumer,
+            &self.config.influence,
+            args.get("query").and_then(|value| value.as_str()),
+        )
+        .await
+        .map_err(|error| ErrorData::invalid_params(error.to_string(), None))
+    }
+
     fn build_tool_list() -> Vec<Tool> {
         vec![
             Tool::new(
@@ -131,7 +191,8 @@ impl IronMemServer {
                         "project": { "type": "string", "description": "Project root path" },
                         "limit": { "type": "integer", "description": "Max results (default 5)" },
                         "query": { "type": "string", "description": "Search query (optional)" },
-                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" }
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
+                        "purpose": purpose_schema()
                     },
                     "required": ["project"]
                 })),
@@ -145,7 +206,8 @@ impl IronMemServer {
                         "project": { "type": "string", "description": "Project root path. Omit when global=true." },
                         "limit": { "type": "integer", "description": "Max chunks (default 15)" },
                         "global": { "type": "boolean", "description": "When true, skim across all projects." },
-                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" }
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
+                        "purpose": purpose_schema()
                     }
                 })),
             ),
@@ -166,7 +228,9 @@ impl IronMemServer {
                         "chunk_id": { "type": "string", "description": "Chunk id returned by get_context or memory_skim; expands exact source span when available" },
                         "observation_id": { "type": "integer", "description": "Observation id whose full original output to retrieve" },
                         "memory_id": { "type": "integer", "description": "Memory id whose verbatim pre-LLM session transcript to retrieve" },
-                        "hash": { "type": "string", "description": "Blob content hash (alternative to chunk_id / observation_id / memory_id)" }
+                        "hash": { "type": "string", "description": "Blob content hash (alternative to chunk_id / observation_id / memory_id)" },
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
+                        "purpose": purpose_schema()
                     }
                 })),
             ),
@@ -178,7 +242,8 @@ impl IronMemServer {
                     "properties": {
                         "project": { "type": "string", "description": "Project root path" },
                         "limit": { "type": "integer", "description": "Max results (default 5)" },
-                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" }
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
+                        "purpose": purpose_schema()
                     },
                     "required": ["project"]
                 })),
@@ -193,7 +258,8 @@ impl IronMemServer {
                         "project": { "type": "string", "description": "Project root path" },
                         "limit": { "type": "integer", "description": "Max results (default 10)" },
                         "semantic": { "type": "boolean", "description": "Blend semantic vector search with keyword search (default true). Set false for keyword-only." },
-                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" }
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
+                        "purpose": purpose_schema()
                     },
                     "required": ["query", "project"]
                 })),
@@ -207,7 +273,8 @@ impl IronMemServer {
                         "query": { "type": "string", "description": "Search query" },
                         "limit": { "type": "integer", "description": "Max results (default 10)" },
                         "semantic": { "type": "boolean", "description": "Blend semantic vector search with keyword search (default true). Set false for keyword-only." },
-                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" }
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
+                        "purpose": purpose_schema()
                     },
                     "required": ["query"]
                 })),
@@ -241,7 +308,9 @@ impl IronMemServer {
                     "type": "object",
                     "properties": {
                         "project": { "type": "string", "description": "Project root path" },
-                        "limit": { "type": "integer", "description": "Max memories to inject (default 5)" }
+                        "limit": { "type": "integer", "description": "Max memories to inject (default 5)" },
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
+                        "purpose": purpose_schema()
                     },
                     "required": ["project"]
                 })),
@@ -493,12 +562,58 @@ impl IronMemServer {
         &self,
         args: &JsonObject,
     ) -> Result<CallToolResult, ErrorData> {
+        let observation_id = args.get("observation_id").and_then(|v| v.as_i64());
+        let memory_id = args.get("memory_id").and_then(|v| v.as_i64());
+        let hash = args.get("hash").and_then(|v| v.as_str());
+        let chunk_id = args.get("chunk_id").and_then(|v| v.as_str());
+        let namespace = namespace_arg(args);
+        let ids = db::memory_ids_for_original_reference(
+            &self.db,
+            observation_id,
+            memory_id,
+            hash,
+            chunk_id,
+        )
+        .await
+        .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        let memories = db::memories_by_ids_in_namespace(&self.db, &ids, &namespace)
+            .await
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        if self.config.influence.enabled && memories.is_empty() {
+            return Ok(error_result(
+                "original_source_not_bound_to_authorized_memory".to_string(),
+            ));
+        }
+        let project = memories
+            .first()
+            .map(|memory| memory.project.clone())
+            .unwrap_or_else(|| "*".to_string());
+        let gate = self
+            .gate_memories(
+                memories,
+                &namespace,
+                &project,
+                args,
+                crate::egress::ConsumerCapabilities {
+                    reasoning_only_channel: true,
+                    exact_source_expansion: true,
+                    denial_diagnostics: false,
+                },
+            )
+            .await?;
+        if self.config.influence.enabled
+            && gate.authorized.is_empty()
+            && gate.advisory.is_empty()
+            && gate.source_required.is_empty()
+        {
+            return Ok(error_result("memory_influence_denied".to_string()));
+        }
         match crate::expansion::retrieve_original(
             &self.db,
-            args.get("observation_id").and_then(|v| v.as_i64()),
-            args.get("memory_id").and_then(|v| v.as_i64()),
-            args.get("hash").and_then(|v| v.as_str()),
-            args.get("chunk_id").and_then(|v| v.as_str()),
+            observation_id,
+            memory_id,
+            hash,
+            chunk_id,
         )
         .await
         {
@@ -506,6 +621,10 @@ impl IronMemServer {
                 let mut json = serde_json::to_value(expanded).unwrap();
                 if let Some(obj) = json.as_object_mut() {
                     obj.insert("ok".to_string(), serde_json::json!(true));
+                    obj.insert(
+                        "influence_decisions".to_string(),
+                        serde_json::to_value(gate.decisions).unwrap_or_default(),
+                    );
                 }
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&json).unwrap(),
@@ -595,6 +714,20 @@ impl IronMemServer {
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
         };
 
+        let gate = self
+            .gate_memories(
+                memories,
+                &namespace,
+                project,
+                args,
+                crate::egress::ConsumerCapabilities {
+                    reasoning_only_channel: true,
+                    exact_source_expansion: false,
+                    denial_diagnostics: self.policy_principal.authority == "local_operator",
+                },
+            )
+            .await?;
+        let memories = gate.authorized;
         let memory_ids: Vec<i64> = memories.iter().map(|m| m.id).collect();
         let chunks = db::chunks_for_memories(&self.db, &memory_ids)
             .await
@@ -612,7 +745,14 @@ impl IronMemServer {
 
         let event_times = self.event_times_map(&memories).await;
         let evidence_chains = self.evidence_chains_json(&memory_ids, &chunks).await;
-        let json = serde_json::json!({ "memories": memories, "expansions": expansions, "event_times": event_times, "evidence_chains": evidence_chains });
+        let json = serde_json::json!({
+            "memories": memories,
+            "advisory_memories": gate.advisory,
+            "influence_decisions": gate.decisions,
+            "expansions": expansions,
+            "event_times": event_times,
+            "evidence_chains": evidence_chains
+        });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -634,13 +774,49 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let mem_ids: Vec<i64> = chunks.iter().map(|c| c.memory_id).collect();
+        let memories = db::memories_by_ids_in_namespace(&self.db, &mem_ids, &namespace)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let gate = self
+            .gate_memories(
+                memories,
+                &namespace,
+                project.unwrap_or("*"),
+                args,
+                crate::egress::ConsumerCapabilities {
+                    reasoning_only_channel: true,
+                    exact_source_expansion: false,
+                    denial_diagnostics: false,
+                },
+            )
+            .await?;
+        let allowed_ids = gate
+            .authorized
+            .iter()
+            .map(|memory| memory.id)
+            .collect::<std::collections::HashSet<_>>();
+        let advisory_ids = gate
+            .advisory
+            .iter()
+            .map(|memory| memory.id)
+            .collect::<std::collections::HashSet<_>>();
+        let authorized_chunks = chunks
+            .iter()
+            .filter(|chunk| allowed_ids.contains(&chunk.memory_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let advisory_chunks = chunks
+            .iter()
+            .filter(|chunk| advisory_ids.contains(&chunk.memory_id))
+            .cloned()
+            .collect::<Vec<_>>();
         let event_times = serde_json::to_value(
             db::event_times_for(&self.db, &mem_ids)
                 .await
                 .unwrap_or_default(),
         )
         .unwrap_or_else(|_| serde_json::json!({}));
-        let json = serde_json::json!({ "chunks": chunks, "event_times": event_times });
+        let json = serde_json::json!({ "chunks": authorized_chunks, "advisory_chunks": advisory_chunks, "influence_decisions": gate.decisions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -660,6 +836,13 @@ impl IronMemServer {
             "memory_chunks": stats.total_memory_chunks,
             "db_path": self.config.db_path,
             "ccr": stats.ccr_json(),
+            "influence": {
+                "enabled": self.config.influence.enabled,
+                "mode": self.config.influence.mode,
+                "require_purpose": self.config.influence.require_purpose,
+                "require_trusted_attestation": self.config.influence.require_trusted_attestation,
+                "events": db::influence_event_status(&self.db).await.unwrap_or_else(|_| serde_json::json!({})),
+            },
         });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
@@ -678,8 +861,21 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let event_times = self.event_times_map(&memories).await;
-        let json = serde_json::json!({ "memories": memories, "event_times": event_times });
+        let gate = self
+            .gate_memories(
+                memories,
+                &namespace,
+                project,
+                args,
+                crate::egress::ConsumerCapabilities {
+                    reasoning_only_channel: true,
+                    exact_source_expansion: false,
+                    denial_diagnostics: false,
+                },
+            )
+            .await?;
+        let event_times = self.event_times_map(&gate.authorized).await;
+        let json = serde_json::json!({ "memories": gate.authorized, "advisory_memories": gate.advisory, "influence_decisions": gate.decisions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -703,8 +899,21 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let event_times = self.event_times_map(&memories).await;
-        let json = serde_json::json!({ "memories": memories, "event_times": event_times });
+        let gate = self
+            .gate_memories(
+                memories,
+                &namespace,
+                project,
+                args,
+                crate::egress::ConsumerCapabilities {
+                    reasoning_only_channel: true,
+                    exact_source_expansion: false,
+                    denial_diagnostics: false,
+                },
+            )
+            .await?;
+        let event_times = self.event_times_map(&gate.authorized).await;
+        let json = serde_json::json!({ "memories": gate.authorized, "advisory_memories": gate.advisory, "influence_decisions": gate.decisions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -724,8 +933,21 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let event_times = self.event_times_map(&memories).await;
-        let json = serde_json::json!({ "memories": memories, "event_times": event_times });
+        let gate = self
+            .gate_memories(
+                memories,
+                &namespace,
+                "*",
+                args,
+                crate::egress::ConsumerCapabilities {
+                    reasoning_only_channel: true,
+                    exact_source_expansion: false,
+                    denial_diagnostics: false,
+                },
+            )
+            .await?;
+        let event_times = self.event_times_map(&gate.authorized).await;
+        let json = serde_json::json!({ "memories": gate.authorized, "advisory_memories": gate.advisory, "influence_decisions": gate.decisions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -782,6 +1004,21 @@ impl IronMemServer {
         )
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let namespace = namespace_arg(args);
+        let gate = self
+            .gate_memories(
+                memories,
+                &namespace,
+                project,
+                args,
+                crate::egress::ConsumerCapabilities {
+                    reasoning_only_channel: false,
+                    exact_source_expansion: false,
+                    denial_diagnostics: false,
+                },
+            )
+            .await?;
+        let memories = gate.authorized;
 
         hooks::write_ironmem_file(project, &memories)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -791,6 +1028,8 @@ impl IronMemServer {
         let json = serde_json::json!({
             "injected": memories.len(),
             "project": project,
+            "denied_memory_ids": gate.denied_memory_ids,
+            "influence_decisions": gate.decisions,
         });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
@@ -1709,6 +1948,70 @@ mod tests {
             "influence_policy_capability_required"
         );
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn blocked_memory_never_crosses_mcp_context_search_source_or_file_egress() {
+        let (mut server, path) = test_server().await;
+        Arc::make_mut(&mut server.config).influence.enabled = true;
+        let project_dir =
+            std::env::temp_dir().join(format!("ironmem-mcp-egress-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project = project_dir.to_string_lossy().to_string();
+        let session = db::create_session(&server.db, &project).await.unwrap();
+        let memory_id = db::insert_memory(
+            &server.db,
+            &project,
+            &session,
+            "mcp-blocked-content-marker",
+            None,
+        )
+        .await
+        .unwrap();
+        crate::influence::update_memory_policy(
+            &server.db,
+            &crate::influence::PolicyPrincipal::local_operator("test"),
+            memory_id,
+            "local",
+            &crate::influence::PolicyMutationRequest {
+                expected_version: 1,
+                patch: crate::influence::MemoryInfluencePolicyPatch {
+                    state: Some(crate::influence::InfluenceState::Blocked),
+                    ..Default::default()
+                },
+                reason: "egress test".into(),
+                request_id: "mcp-egress-policy".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut context_args = JsonObject::new();
+        context_args.insert("project".into(), serde_json::json!(project));
+        let context = server.handle_get_context(&context_args).await.unwrap();
+        assert!(!result_text(&context).contains("mcp-blocked-content-marker"));
+
+        let mut search_args = context_args.clone();
+        search_args.insert(
+            "query".into(),
+            serde_json::json!("mcp-blocked-content-marker"),
+        );
+        let search = server.handle_search_memories(&search_args).await.unwrap();
+        assert!(!result_text(&search).contains("mcp-blocked-content-marker"));
+
+        let mut source_args = JsonObject::new();
+        source_args.insert("memory_id".into(), serde_json::json!(memory_id));
+        let source = server.handle_retrieve_original(&source_args).await.unwrap();
+        assert!(!result_text(&source).contains("mcp-blocked-content-marker"));
+
+        let injected = server.handle_inject_context(&context_args).await.unwrap();
+        assert!(!result_text(&injected).contains("mcp-blocked-content-marker"));
+        if let Ok(file) = std::fs::read_to_string(project_dir.join("IRONMEM.md")) {
+            assert!(!file.contains("mcp-blocked-content-marker"));
+        }
+
+        let _ = std::fs::remove_dir_all(project_dir);
         let _ = std::fs::remove_file(path);
     }
 

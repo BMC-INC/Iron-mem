@@ -10,6 +10,7 @@ mod corrections;
 mod db;
 #[cfg(test)]
 mod e2e;
+mod egress;
 mod embedder;
 mod embedding_codec;
 mod eval;
@@ -23,6 +24,7 @@ mod metrics;
 mod observer;
 mod profile;
 mod provider;
+mod purpose;
 mod recovery;
 mod reflection;
 mod reranker;
@@ -37,7 +39,62 @@ mod vectorstore;
 
 use anyhow::Result;
 use chrono::{Local, TimeZone};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+
+#[derive(Debug, Clone, Args, Default)]
+struct RecallPurposeArgs {
+    /// Purpose task type (normalized to lowercase snake case)
+    #[arg(long)]
+    task_type: Option<String>,
+    /// Intended downstream action, if this recall may authorize an action
+    #[arg(long)]
+    intended_action: Option<String>,
+    /// none|low|medium|high|critical
+    #[arg(long, default_value = "none")]
+    action_risk: String,
+    /// Require exact source backing before content is released
+    #[arg(long)]
+    require_source: bool,
+    /// Read an opaque purpose attestation from a protected file
+    #[arg(long)]
+    purpose_attestation_file: Option<String>,
+    /// Read an opaque human-confirmation receipt from a protected file
+    #[arg(long)]
+    confirmation_receipt_file: Option<String>,
+}
+
+impl RecallPurposeArgs {
+    fn build(
+        &self,
+        namespace: &str,
+        project: &str,
+    ) -> Result<Option<crate::purpose::RecallPurpose>> {
+        let Some(task_type) = &self.task_type else {
+            return Ok(None);
+        };
+        Ok(Some(crate::purpose::RecallPurpose {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            namespace: namespace.to_string(),
+            project: project.to_string(),
+            task_type: task_type.clone(),
+            intended_action: self.intended_action.clone(),
+            action_risk: self.action_risk.parse().map_err(anyhow::Error::new)?,
+            require_source_backing: self.require_source,
+            purpose_attestation: self
+                .purpose_attestation_file
+                .as_deref()
+                .map(std::fs::read_to_string)
+                .transpose()?
+                .map(|value| value.trim().to_string()),
+            confirmation_receipt: self
+                .confirmation_receipt_file
+                .as_deref()
+                .map(std::fs::read_to_string)
+                .transpose()?
+                .map(|value| value.trim().to_string()),
+        }))
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -162,6 +219,30 @@ enum InfluenceCommands {
         #[arg(long)]
         clear_maximum_derivation_depth: bool,
     },
+    /// Mint a scoped, expiring, single-use local confirmation receipt
+    Confirm {
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value = "local")]
+        namespace: String,
+        #[arg(long)]
+        task_type: String,
+        #[arg(long)]
+        intended_action: Option<String>,
+        #[arg(long, default_value = "none")]
+        action_risk: String,
+        #[arg(long)]
+        require_source: bool,
+        #[arg(long)]
+        actor: String,
+        #[arg(long, default_value = "300")]
+        ttl_seconds: i64,
+        /// Protected output file; the receipt is never printed or placed in argv
+        #[arg(long)]
+        output: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -186,6 +267,8 @@ enum Commands {
         /// Governance namespace/realm boundary
         #[arg(long, default_value = "local")]
         namespace: String,
+        #[command(flatten)]
+        purpose: RecallPurposeArgs,
     },
 
     /// Search memories across all projects
@@ -198,6 +281,8 @@ enum Commands {
         /// Governance namespace/realm boundary
         #[arg(long, default_value = "local")]
         namespace: String,
+        #[command(flatten)]
+        purpose: RecallPurposeArgs,
     },
 
     /// List recent memories for a project
@@ -211,6 +296,8 @@ enum Commands {
         /// Governance namespace/realm boundary
         #[arg(long, default_value = "local")]
         namespace: String,
+        #[command(flatten)]
+        purpose: RecallPurposeArgs,
     },
 
     /// List projects with stored memories
@@ -249,6 +336,8 @@ enum Commands {
         /// Max memories to inject
         #[arg(short, long, default_value = "5")]
         limit: i64,
+        #[command(flatten)]
+        purpose: RecallPurposeArgs,
     },
 
     /// Store an explicit memory (use --scope user for cross-project facts)
@@ -558,7 +647,13 @@ enum Commands {
     },
 
     /// Show the full memory→action lineage (ledger + injections) for a memory
-    Lineage { memory_id: i64 },
+    Lineage {
+        memory_id: i64,
+        #[arg(long, default_value = "local")]
+        namespace: String,
+        #[command(flatten)]
+        purpose: RecallPurposeArgs,
+    },
 
     /// Record usage feedback for a memory
     Feedback {
@@ -709,23 +804,40 @@ async fn async_main() -> Result<()> {
             project,
             limit,
             namespace,
-        } => run_search(&cfg, &query, project.as_deref(), limit, &namespace).await?,
+            purpose,
+        } => {
+            run_search(
+                &cfg,
+                &query,
+                project.as_deref(),
+                limit,
+                &namespace,
+                &purpose,
+            )
+            .await?
+        }
         Commands::SearchGlobal {
             query,
             limit,
             namespace,
-        } => run_search_global(&cfg, &query, limit, &namespace).await?,
+            purpose,
+        } => run_search_global(&cfg, &query, limit, &namespace, &purpose).await?,
         Commands::List {
             project,
             limit,
             namespace,
-        } => run_list(&cfg, project.as_deref(), limit, &namespace).await?,
+            purpose,
+        } => run_list(&cfg, project.as_deref(), limit, &namespace, &purpose).await?,
         Commands::Projects { limit } => run_projects(&cfg, limit).await?,
         Commands::Sessions { project, limit } => {
             run_sessions(&cfg, project.as_deref(), limit).await?
         }
         Commands::Wipe { project, force } => run_wipe(&cfg, project.as_deref(), force).await?,
-        Commands::Inject { project, limit } => run_inject(&cfg, project.as_deref(), limit).await?,
+        Commands::Inject {
+            project,
+            limit,
+            purpose,
+        } => run_inject(&cfg, project.as_deref(), limit, &purpose).await?,
         Commands::Remember {
             text,
             project,
@@ -943,7 +1055,11 @@ async fn async_main() -> Result<()> {
             apply,
             actor,
         } => run_ledger_migrate(&cfg, &namespace, &out, apply, &actor).await?,
-        Commands::Lineage { memory_id } => run_lineage(&cfg, memory_id).await?,
+        Commands::Lineage {
+            memory_id,
+            namespace,
+            purpose,
+        } => run_lineage(&cfg, memory_id, &namespace, &purpose).await?,
         Commands::Feedback {
             memory_id,
             project,
@@ -1199,10 +1315,40 @@ async fn run_ledger_migrate(
     Ok(())
 }
 
-async fn run_lineage(cfg: &config::Config, memory_id: i64) -> Result<()> {
+async fn run_lineage(
+    cfg: &config::Config,
+    memory_id: i64,
+    namespace: &str,
+    purpose_args: &RecallPurposeArgs,
+) -> Result<()> {
     let database = db::Database::new(&cfg.effective_database_url()).await?;
     database.migrate().await?;
-    let lineage = compliance::memory_lineage(&database, memory_id).await?;
+    let memory = db::get_memory_by_id_in_namespace(&database, memory_id, namespace).await?;
+    let mut content_allowed = false;
+    if let Some(memory) = memory {
+        let project = memory.project.clone();
+        let purpose = purpose_args.build(namespace, &project)?;
+        let gate = egress::gate_memories(
+            &database,
+            vec![memory],
+            namespace,
+            &project,
+            purpose.as_ref(),
+            egress::PurposeChannel::LocalOperator("ironmem:cli".into()),
+            egress::ConsumerCapabilities {
+                reasoning_only_channel: true,
+                exact_source_expansion: false,
+                denial_diagnostics: true,
+            },
+            &cfg.influence,
+        )
+        .await?;
+        content_allowed = !gate.authorized.is_empty() || !gate.advisory.is_empty();
+    }
+    let mut lineage = compliance::memory_lineage(&database, memory_id).await?;
+    if cfg.influence.enabled && !content_allowed {
+        lineage.summary = None;
+    }
     println!("{}", serde_json::to_string_pretty(&lineage)?);
     Ok(())
 }
@@ -1301,6 +1447,68 @@ async fn run_influence(cfg: &config::Config, action: InfluenceCommands) -> Resul
             .await
             .map_err(cli_policy_error)?;
             println!("{}", serde_json::to_string_pretty(&record)?);
+        }
+        InfluenceCommands::Confirm {
+            request_id,
+            project,
+            namespace,
+            task_type,
+            intended_action,
+            action_risk,
+            require_source,
+            actor,
+            ttl_seconds,
+            output,
+        } => {
+            anyhow::ensure!(
+                (1..=3600).contains(&ttl_seconds),
+                "ttl must be 1..=3600 seconds"
+            );
+            let key_path = cfg
+                .influence
+                .confirmation_key_file
+                .as_deref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("influence.confirmation_key_file is not configured")
+                })?;
+            let key = std::fs::read(key_path)?;
+            let risk: influence::ActionRisk = action_risk.parse().map_err(anyhow::Error::new)?;
+            let wire = purpose::RecallPurpose {
+                request_id,
+                namespace,
+                project,
+                task_type,
+                intended_action,
+                action_risk: risk,
+                require_source_backing: require_source,
+                purpose_attestation: None,
+                confirmation_receipt: None,
+            };
+            let now = chrono::Utc::now().timestamp();
+            let token = purpose::mint_confirmation_token(
+                &wire,
+                &key,
+                "ironmem:local-operator",
+                &actor,
+                risk,
+                now,
+                now + ttl_seconds,
+            )?;
+            let output = std::path::Path::new(&output);
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(output, token)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o600))?;
+            }
+            println!(
+                "Confirmation receipt written to {} (expires in {}s)",
+                output.display(),
+                ttl_seconds
+            );
         }
     }
     Ok(())
@@ -1704,19 +1912,42 @@ async fn run_search(
     project: Option<&str>,
     limit: i64,
     namespace: &str,
+    purpose_args: &RecallPurposeArgs,
 ) -> Result<()> {
     let project = resolve_project(project)?;
     let database = db::Database::new(&cfg.effective_database_url()).await?;
     database.migrate().await?;
     let memories =
         db::search_memories_in_namespace(&database, namespace, &project, query, limit).await?;
+    let purpose = purpose_args.build(namespace, &project)?;
+    let gate = egress::gate_memories_with_query(
+        &database,
+        memories,
+        namespace,
+        &project,
+        purpose.as_ref(),
+        egress::PurposeChannel::LocalOperator("ironmem:cli".into()),
+        egress::ConsumerCapabilities {
+            reasoning_only_channel: true,
+            exact_source_expansion: false,
+            denial_diagnostics: true,
+        },
+        &cfg.influence,
+        Some(query),
+    )
+    .await?;
+    let egress::GateResult {
+        authorized: memories,
+        advisory,
+        ..
+    } = gate;
 
-    if memories.is_empty() {
+    if memories.is_empty() && advisory.is_empty() {
         println!("No memories found for query: {}", query);
         return Ok(());
     }
 
-    println!("Found {} memories:\n", memories.len());
+    println!("Found {} memories:\n", memories.len() + advisory.len());
     for m in memories {
         println!("─────────────────────────────────");
         println!("ID: {} | Session: {}", m.id, m.session_id);
@@ -1724,6 +1955,12 @@ async fn run_search(
         if let Some(tags) = m.tags {
             println!("Tags: {}", tags);
         }
+        println!();
+    }
+    for m in advisory {
+        println!("─────────────────────────────────");
+        println!("ID: {} | advisory reasoning only", m.id);
+        println!("{}", m.summary);
         println!();
     }
     Ok(())
@@ -1734,17 +1971,43 @@ async fn run_search_global(
     query: &str,
     limit: i64,
     namespace: &str,
+    purpose_args: &RecallPurposeArgs,
 ) -> Result<()> {
     let database = db::Database::new(&cfg.effective_database_url()).await?;
     database.migrate().await?;
     let memories = db::search_all_memories_in_namespace(&database, namespace, query, limit).await?;
+    let purpose = purpose_args.build(namespace, "*")?;
+    let gate = egress::gate_memories_with_query(
+        &database,
+        memories,
+        namespace,
+        "*",
+        purpose.as_ref(),
+        egress::PurposeChannel::LocalOperator("ironmem:cli".into()),
+        egress::ConsumerCapabilities {
+            reasoning_only_channel: true,
+            exact_source_expansion: false,
+            denial_diagnostics: true,
+        },
+        &cfg.influence,
+        Some(query),
+    )
+    .await?;
+    let egress::GateResult {
+        authorized: memories,
+        advisory,
+        ..
+    } = gate;
 
-    if memories.is_empty() {
+    if memories.is_empty() && advisory.is_empty() {
         println!("No memories found across any project for query: {}", query);
         return Ok(());
     }
 
-    println!("Found {} memories across all projects:\n", memories.len());
+    println!(
+        "Found {} memories across all projects:\n",
+        memories.len() + advisory.len()
+    );
     for m in memories {
         println!("─────────────────────────────────");
         println!("Project: {}", m.project);
@@ -1755,6 +2018,13 @@ async fn run_search_global(
         }
         println!();
     }
+    for m in advisory {
+        println!("─────────────────────────────────");
+        println!("Project: {}", m.project);
+        println!("ID: {} | advisory reasoning only", m.id);
+        println!("{}", m.summary);
+        println!();
+    }
     Ok(())
 }
 
@@ -1763,14 +2033,36 @@ async fn run_list(
     project: Option<&str>,
     limit: i64,
     namespace: &str,
+    purpose_args: &RecallPurposeArgs,
 ) -> Result<()> {
     let project = resolve_project(project)?;
     let database = db::Database::new(&cfg.effective_database_url()).await?;
     database.migrate().await?;
     let memories =
         db::get_recent_memories_in_namespace(&database, namespace, &project, limit).await?;
+    let purpose = purpose_args.build(namespace, &project)?;
+    let gate = egress::gate_memories(
+        &database,
+        memories,
+        namespace,
+        &project,
+        purpose.as_ref(),
+        egress::PurposeChannel::LocalOperator("ironmem:cli".into()),
+        egress::ConsumerCapabilities {
+            reasoning_only_channel: true,
+            exact_source_expansion: false,
+            denial_diagnostics: true,
+        },
+        &cfg.influence,
+    )
+    .await?;
+    let egress::GateResult {
+        authorized: memories,
+        advisory,
+        ..
+    } = gate;
 
-    if memories.is_empty() {
+    if memories.is_empty() && advisory.is_empty() {
         println!("No memories for project: {}", project);
         return Ok(());
     }
@@ -1783,6 +2075,12 @@ async fn run_list(
         if let Some(tags) = m.tags {
             println!("Tags: {}", tags);
         }
+        println!();
+    }
+    for m in advisory {
+        println!("─────────────────────────────────");
+        println!("ID: {} | advisory reasoning only", m.id);
+        println!("{}", m.summary);
         println!();
     }
     Ok(())
@@ -1886,7 +2184,12 @@ async fn run_wipe(cfg: &config::Config, project: Option<&str>, force: bool) -> R
     Ok(())
 }
 
-async fn run_inject(cfg: &config::Config, project: Option<&str>, limit: i64) -> Result<()> {
+async fn run_inject(
+    cfg: &config::Config,
+    project: Option<&str>,
+    limit: i64,
+    purpose_args: &RecallPurposeArgs,
+) -> Result<()> {
     let project = resolve_project(project)?;
     let database = db::Database::new(&cfg.effective_database_url()).await?;
     database.migrate().await?;
@@ -1902,6 +2205,23 @@ async fn run_inject(cfg: &config::Config, project: Option<&str>, limit: i64) -> 
         limit as usize,
     )
     .await?;
+    let purpose = purpose_args.build(crate::governance::DEFAULT_NAMESPACE, &project)?;
+    let gate = egress::gate_memories(
+        &database,
+        memories,
+        crate::governance::DEFAULT_NAMESPACE,
+        &project,
+        purpose.as_ref(),
+        egress::PurposeChannel::LocalOperator("ironmem:cli".into()),
+        egress::ConsumerCapabilities {
+            reasoning_only_channel: false,
+            exact_source_expansion: false,
+            denial_diagnostics: true,
+        },
+        &cfg.influence,
+    )
+    .await?;
+    let memories = gate.authorized;
 
     db::record_injection_events(&database, &project, None, Some("session-start"), &memories)
         .await

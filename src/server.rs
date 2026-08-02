@@ -126,6 +126,7 @@ pub fn router(state: AppState) -> Router {
         .route("/event", post(record_event))
         .route("/compress", post(compress_session))
         .route("/context", get(get_context))
+        .route("/context/evaluate", post(evaluate_context))
         .route("/skim", get(get_skim))
         .route("/status", get(get_status))
         .route("/retrieve_original", post(retrieve_original))
@@ -150,6 +151,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/memory/{id}/influence",
             get(get_memory_influence).put(put_memory_influence),
+        )
+        .route(
+            "/memory/{id}/influence-events",
+            get(get_memory_influence_events),
         )
         .route(
             "/sync/events",
@@ -383,6 +388,8 @@ pub struct RetrieveOriginalRequest {
     pub memory_id: Option<i64>,
     pub hash: Option<String>,
     pub chunk_id: Option<String>,
+    pub namespace: Option<String>,
+    pub purpose: Option<crate::purpose::RecallPurpose>,
 }
 
 #[derive(Serialize)]
@@ -394,12 +401,72 @@ pub struct RetrieveOriginalResponse {
     pub memory_id: Option<i64>,
     pub source_start: Option<i64>,
     pub source_end: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub influence_decisions: Vec<crate::egress::InfluenceDecision>,
 }
 
 async fn retrieve_original(
     State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
     Json(body): Json<RetrieveOriginalRequest>,
 ) -> Result<Json<RetrieveOriginalResponse>, (StatusCode, String)> {
+    let namespace = crate::governance::normalize_namespace(
+        body.namespace
+            .as_deref()
+            .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+    );
+    let ids = db::memory_ids_for_original_reference(
+        &state.db,
+        body.observation_id,
+        body.memory_id,
+        body.hash.as_deref(),
+        body.chunk_id.as_deref(),
+    )
+    .await
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let memories = db::memories_by_ids_in_namespace(&state.db, &ids, &namespace)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if state.config.influence.enabled && memories.is_empty() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "original_source_not_bound_to_authorized_memory".to_string(),
+        ));
+    }
+    let project = memories
+        .first()
+        .map(|memory| memory.project.clone())
+        .unwrap_or_else(|| "*".to_string());
+    let channel = match &agent {
+        Some(axum::Extension(identity)) => crate::egress::PurposeChannel::Remote {
+            authenticated_agent: Some(identity.agent_id.clone()),
+        },
+        None => crate::egress::PurposeChannel::LocalOperator("ironmem:rest-local".into()),
+    };
+    let gate = crate::egress::gate_memories_with_query(
+        &state.db,
+        memories,
+        &namespace,
+        &project,
+        body.purpose.as_ref(),
+        channel,
+        crate::egress::ConsumerCapabilities {
+            reasoning_only_channel: true,
+            exact_source_expansion: true,
+            denial_diagnostics: agent.is_none(),
+        },
+        &state.config.influence,
+        None,
+    )
+    .await
+    .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    if state.config.influence.enabled
+        && gate.authorized.is_empty()
+        && gate.advisory.is_empty()
+        && gate.source_required.is_empty()
+    {
+        return Err((StatusCode::FORBIDDEN, "memory_influence_denied".to_string()));
+    }
     let expanded = crate::expansion::retrieve_original(
         &state.db,
         body.observation_id,
@@ -418,6 +485,7 @@ async fn retrieve_original(
         memory_id: expanded.memory_id,
         source_start: expanded.source_start,
         source_end: expanded.source_end,
+        influence_decisions: gate.decisions,
     }))
 }
 
@@ -1037,6 +1105,27 @@ async fn put_memory_influence(
     .map_err(influence_http_error)
 }
 
+async fn get_memory_influence_events(
+    State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    Query(query): Query<InfluencePolicyQuery>,
+) -> Result<Json<Vec<db::InfluenceEventInfo>>, InfluenceHttpError> {
+    let namespace = crate::governance::normalize_namespace(
+        query
+            .namespace
+            .as_deref()
+            .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+    );
+    crate::influence::get_memory_policy(&state.db, &rest_policy_principal(agent), id, &namespace)
+        .await
+        .map_err(influence_http_error)?;
+    db::influence_events_for_memory(&state.db, id, 200)
+        .await
+        .map(Json)
+        .map_err(influence_http_error)
+}
+
 #[derive(Deserialize)]
 pub struct RestoreSnapshotRequest {
     pub dry_run: Option<bool>,
@@ -1157,6 +1246,10 @@ fn truthy(v: &Option<String>) -> Option<bool> {
 #[derive(Serialize)]
 pub struct ContextResponse {
     pub memories: Vec<db::Memory>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisory_memories: Vec<db::Memory>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub influence_decisions: Vec<crate::egress::InfluenceDecision>,
     pub expansions: Vec<ContextExpansion>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_chains: Vec<ContextEvidenceChain>,
@@ -1165,6 +1258,32 @@ pub struct ContextResponse {
     /// Only memories that carry a date appear here.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub event_times: std::collections::HashMap<i64, String>,
+}
+
+#[derive(Deserialize)]
+pub struct EvaluateContextRequest {
+    pub project: String,
+    pub query: Option<String>,
+    pub limit: Option<i64>,
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub rerank: bool,
+    pub pool: Option<usize>,
+    pub purpose: crate::purpose::RecallPurpose,
+}
+
+#[derive(Serialize)]
+pub struct SourceBackedMemory {
+    pub memory: db::Memory,
+    pub source: crate::expansion::ExpandedOriginal,
+}
+
+#[derive(Serialize)]
+pub struct EvaluateContextResponse {
+    #[serde(flatten)]
+    pub context: ContextResponse,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_backed_memories: Vec<SourceBackedMemory>,
 }
 
 /// (W1.3) Lost-in-the-middle mitigation: re-order rank-sorted memories (best
@@ -1240,8 +1359,68 @@ async fn context_evidence_chains(
     Ok(chains)
 }
 
+async fn retrieve_context_candidates(
+    state: &AppState,
+    project: &str,
+    namespace: &str,
+    query: Option<&str>,
+    limit: i64,
+    rerank_on: bool,
+    pool: Option<usize>,
+) -> Result<Vec<db::Memory>, (StatusCode, String)> {
+    let ranked_query = query.is_some_and(|query| !query.is_empty());
+    let memories = match query {
+        Some(query) if !query.is_empty() => {
+            if rerank_on && state.config.multi_hop_enabled() && retrieval::is_multi_hop_query(query)
+            {
+                retrieval::iterative_rerank_search_in_namespace(
+                    &state.db,
+                    state.embedder.as_deref(),
+                    state.store.as_ref(),
+                    &state.config,
+                    namespace,
+                    Some(project),
+                    query,
+                    limit as usize,
+                    state.config.multi_hop.max_hops,
+                    pool,
+                )
+                .await
+                .unwrap_or_default()
+            } else if rerank_on {
+                retrieval::rerank_search_in_namespace_with_pool(
+                    &state.db,
+                    state.embedder.as_deref(),
+                    state.store.as_ref(),
+                    &state.config,
+                    namespace,
+                    Some(project),
+                    query,
+                    limit as usize,
+                    pool,
+                )
+                .await
+                .unwrap_or_default()
+            } else {
+                state
+                    .hybrid_in_namespace(namespace, Some(project), query, limit)
+                    .await
+            }
+        }
+        _ => db::get_recent_memories_in_namespace(&state.db, namespace, project, limit)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+    };
+    Ok(if ranked_query {
+        u_shaped_order(dedup_by_summary(memories))
+    } else {
+        memories
+    })
+}
+
 async fn get_context(
     State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
     Query(params): Query<ContextQuery>,
 ) -> Result<Json<ContextResponse>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(state.config.inject_limit as i64);
@@ -1253,65 +1432,41 @@ async fn get_context(
             .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
     );
 
-    let ranked_query = matches!(&params.query, Some(q) if !q.is_empty());
-    let memories = match &params.query {
-        Some(q) if !q.is_empty() => {
-            if rerank_on && state.config.multi_hop_enabled() && retrieval::is_multi_hop_query(q) {
-                // (W3.1) Multi-hop question → iterative retrieve→reason→re-query.
-                // Gated to multi-hop-looking queries so single-hop pays no extra
-                // latency; degrades to a single reranked pass on any failure. An
-                // explicit ?pool= override is threaded through every hop.
-                retrieval::iterative_rerank_search_in_namespace(
-                    &state.db,
-                    state.embedder.as_deref(),
-                    state.store.as_ref(),
-                    &state.config,
-                    &namespace,
-                    Some(&params.project),
-                    q,
-                    limit as usize,
-                    state.config.multi_hop.max_hops,
-                    params.pool,
-                )
-                .await
-                .unwrap_or_default()
-            } else if rerank_on {
-                // Re-anchored reranked retrieval: protect the base@limit ordering
-                // (FTS-strong temporal answers) while letting the LLM promote
-                // buried wide-pool answers. Failure falls back to base order.
-                retrieval::rerank_search_in_namespace_with_pool(
-                    &state.db,
-                    state.embedder.as_deref(),
-                    state.store.as_ref(),
-                    &state.config,
-                    &namespace,
-                    Some(&params.project),
-                    q,
-                    limit as usize,
-                    params.pool,
-                )
-                .await
-                .unwrap_or_default()
-            } else {
-                state
-                    .hybrid_in_namespace(&namespace, Some(&params.project), q, limit)
-                    .await
-            }
-        }
-        _ => db::get_recent_memories_in_namespace(&state.db, &namespace, &params.project, limit)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-    };
+    let memories = retrieve_context_candidates(
+        &state,
+        &params.project,
+        &namespace,
+        params.query.as_deref(),
+        limit,
+        rerank_on,
+        params.pool,
+    )
+    .await?;
 
-    // (W1.3) For ranked (query) results only: drop near-duplicate facts, then
-    // U-shape the order so the most-relevant memories sit at the ends of the
-    // answerer's context. The recent-memories fallback stays in chronological
-    // order (reordering it would be wrong).
-    let memories = if ranked_query {
-        u_shaped_order(dedup_by_summary(memories))
-    } else {
-        memories
+    let channel = match &agent {
+        Some(axum::Extension(identity)) => crate::egress::PurposeChannel::Remote {
+            authenticated_agent: Some(identity.agent_id.clone()),
+        },
+        None => crate::egress::PurposeChannel::LocalOperator("ironmem:rest-local".to_string()),
     };
+    let gate = crate::egress::gate_memories_with_query(
+        &state.db,
+        memories,
+        &namespace,
+        &params.project,
+        None,
+        channel,
+        crate::egress::ConsumerCapabilities {
+            reasoning_only_channel: true,
+            exact_source_expansion: false,
+            denial_diagnostics: agent.is_none(),
+        },
+        &state.config.influence,
+        params.query.as_deref(),
+    )
+    .await
+    .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    let memories = gate.authorized;
 
     let memory_ids: Vec<i64> = memories.iter().map(|m| m.id).collect();
     let chunks = db::chunks_for_memories(&state.db, &memory_ids)
@@ -1336,9 +1491,128 @@ async fn get_context(
 
     Ok(Json(ContextResponse {
         memories,
+        advisory_memories: gate.advisory,
+        influence_decisions: gate.decisions,
         expansions,
         evidence_chains,
         event_times,
+    }))
+}
+
+async fn evaluate_context(
+    State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
+    Json(body): Json<EvaluateContextRequest>,
+) -> Result<Json<EvaluateContextResponse>, (StatusCode, String)> {
+    let namespace = crate::governance::normalize_namespace(
+        body.namespace
+            .as_deref()
+            .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+    );
+    if let Some(axum::Extension(identity)) = &agent {
+        if !identity.allows(&namespace) {
+            return Err((StatusCode::FORBIDDEN, "namespace_denied".to_string()));
+        }
+    }
+    let memories = retrieve_context_candidates(
+        &state,
+        &body.project,
+        &namespace,
+        body.query.as_deref(),
+        body.limit.unwrap_or(state.config.inject_limit as i64),
+        body.rerank,
+        body.pool,
+    )
+    .await?;
+    let channel = match &agent {
+        Some(axum::Extension(identity)) => crate::egress::PurposeChannel::Remote {
+            authenticated_agent: Some(identity.agent_id.clone()),
+        },
+        None => crate::egress::PurposeChannel::LocalOperator("ironmem:rest-local".into()),
+    };
+    let mut gate = crate::egress::gate_memories_with_query(
+        &state.db,
+        memories,
+        &namespace,
+        &body.project,
+        Some(&body.purpose),
+        channel,
+        crate::egress::ConsumerCapabilities {
+            reasoning_only_channel: true,
+            exact_source_expansion: true,
+            denial_diagnostics: agent.is_none(),
+        },
+        &state.config.influence,
+        body.query.as_deref(),
+    )
+    .await
+    .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+
+    let mut source_backed_memories = Vec::new();
+    let mut source_failures = Vec::new();
+    for memory in gate.source_required.drain(..) {
+        match crate::expansion::retrieve_original(&state.db, None, Some(memory.id), None, None)
+            .await
+        {
+            Ok(source) => source_backed_memories.push(SourceBackedMemory { memory, source }),
+            Err(_) => {
+                gate.denied_memory_ids.push(memory.id);
+                if let Some(decision) = gate
+                    .decisions
+                    .iter_mut()
+                    .find(|decision| decision.memory_id == memory.id)
+                {
+                    let mut failure = decision.clone();
+                    failure.decision_id = uuid::Uuid::new_v4().to_string();
+                    failure.decision = crate::egress::InfluenceDecisionKind::Deny;
+                    failure.reason_codes.push("source_unavailable".to_string());
+                    source_failures.push(failure.clone());
+                    *decision = failure;
+                }
+            }
+        }
+    }
+    if !source_failures.is_empty() {
+        let failure_ids = source_failures
+            .iter()
+            .map(|decision| decision.memory_id)
+            .collect::<Vec<_>>();
+        let contexts = db::influence_contexts_for(&state.db, &failure_ids, &namespace)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        db::record_influence_decisions(&state.db, &source_failures, &contexts, true, None)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    }
+    let memory_ids = gate
+        .authorized
+        .iter()
+        .map(|memory| memory.id)
+        .collect::<Vec<_>>();
+    let chunks = db::chunks_for_memories(&state.db, &memory_ids)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let context = ContextResponse {
+        memories: gate.authorized,
+        advisory_memories: gate.advisory,
+        influence_decisions: gate.decisions,
+        expansions: memory_ids
+            .iter()
+            .map(|memory_id| ContextExpansion {
+                memory_id: *memory_id,
+                chunks: chunks.get(memory_id).cloned().unwrap_or_default(),
+            })
+            .collect(),
+        evidence_chains: context_evidence_chains(&state.db, &memory_ids, &chunks)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+        event_times: db::event_times_for(&state.db, &memory_ids)
+            .await
+            .unwrap_or_default(),
+    };
+    Ok(Json(EvaluateContextResponse {
+        context,
+        source_backed_memories,
     }))
 }
 
@@ -1354,10 +1628,15 @@ pub struct SkimQuery {
 #[derive(Serialize)]
 pub struct SkimResponse {
     pub chunks: Vec<db::MemoryChunk>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisory_chunks: Vec<db::MemoryChunk>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub influence_decisions: Vec<crate::egress::InfluenceDecision>,
 }
 
 async fn get_skim(
     State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
     Query(params): Query<SkimQuery>,
 ) -> Result<Json<SkimResponse>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(state.config.inject_limit as i64 * 3);
@@ -1375,7 +1654,58 @@ async fn get_skim(
     let chunks = db::recent_memory_chunks_in_namespace(&state.db, &namespace, project, limit)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(SkimResponse { chunks }))
+    let ids = chunks
+        .iter()
+        .map(|chunk| chunk.memory_id)
+        .collect::<Vec<_>>();
+    let memories = db::memories_by_ids_in_namespace(&state.db, &ids, &namespace)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let channel = match &agent {
+        Some(axum::Extension(identity)) => crate::egress::PurposeChannel::Remote {
+            authenticated_agent: Some(identity.agent_id.clone()),
+        },
+        None => crate::egress::PurposeChannel::LocalOperator("ironmem:rest-local".into()),
+    };
+    let gate = crate::egress::gate_memories(
+        &state.db,
+        memories,
+        &namespace,
+        project.unwrap_or("*"),
+        None,
+        channel,
+        crate::egress::ConsumerCapabilities {
+            reasoning_only_channel: true,
+            exact_source_expansion: false,
+            denial_diagnostics: agent.is_none(),
+        },
+        &state.config.influence,
+    )
+    .await
+    .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    let allowed = gate
+        .authorized
+        .iter()
+        .map(|memory| memory.id)
+        .collect::<std::collections::HashSet<_>>();
+    let advisory = gate
+        .advisory
+        .iter()
+        .map(|memory| memory.id)
+        .collect::<std::collections::HashSet<_>>();
+    Ok(Json(SkimResponse {
+        chunks: chunks
+            .iter()
+            .filter(|chunk| allowed.contains(&chunk.memory_id))
+            .cloned()
+            .collect(),
+        advisory_chunks: chunks
+            .iter()
+            .filter(|chunk| advisory.contains(&chunk.memory_id))
+            .cloned()
+            .collect(),
+        influence_decisions: gate.decisions,
+    }))
 }
 
 // GET /status
@@ -1397,6 +1727,7 @@ pub struct StatusResponse {
     pub compression: serde_json::Value,
     /// Receipt-backed local extraction yield and recovery state.
     pub extraction: crate::recovery::ExtractionStatus,
+    pub influence: serde_json::Value,
 }
 
 async fn get_status(
@@ -1428,6 +1759,13 @@ async fn get_status(
             "cloud_required": false,
         }),
         extraction,
+        influence: serde_json::json!({
+            "enabled": state.config.influence.enabled,
+            "mode": state.config.influence.mode,
+            "require_purpose": state.config.influence.require_purpose,
+            "require_trusted_attestation": state.config.influence.require_trusted_attestation,
+            "events": db::influence_event_status(&state.db).await.unwrap_or_else(|_| serde_json::json!({})),
+        }),
     }))
 }
 
@@ -1598,6 +1936,7 @@ pub struct MemoryEvidenceResponse {
 
 async fn api_memory_evidence(
     State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
     Path(id): Path<i64>,
     Query(query): Query<EvidenceQuery>,
 ) -> Result<Json<MemoryEvidenceResponse>, (StatusCode, String)> {
@@ -1611,6 +1950,34 @@ async fn api_memory_evidence(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("memory {id} not found")))?;
+    let channel = match &agent {
+        Some(axum::Extension(identity)) => crate::egress::PurposeChannel::Remote {
+            authenticated_agent: Some(identity.agent_id.clone()),
+        },
+        None => crate::egress::PurposeChannel::LocalOperator("ironmem:workbench-local".into()),
+    };
+    let project = memory.project.clone();
+    let gate = crate::egress::gate_memories(
+        &state.db,
+        vec![memory],
+        &namespace,
+        &project,
+        None,
+        channel,
+        crate::egress::ConsumerCapabilities {
+            reasoning_only_channel: false,
+            exact_source_expansion: false,
+            denial_diagnostics: agent.is_none(),
+        },
+        &state.config.influence,
+    )
+    .await
+    .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    let memory = gate
+        .authorized
+        .into_iter()
+        .next()
+        .ok_or_else(|| (StatusCode::FORBIDDEN, "memory_influence_denied".to_string()))?;
     let metadata = EvidenceMetadata::from(
         db::get_memory_meta_full(&state.db, id)
             .await
@@ -1656,6 +2023,7 @@ async fn api_list_projects(
 
 async fn api_list_memories(
     State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
     Query(params): Query<MemoriesQuery>,
 ) -> Result<Json<Vec<db::Memory>>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(50);
@@ -1683,7 +2051,30 @@ async fn api_list_memories(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
 
-    Ok(Json(memories))
+    let project = params.project.as_deref().unwrap_or("*");
+    let channel = match &agent {
+        Some(axum::Extension(identity)) => crate::egress::PurposeChannel::Remote {
+            authenticated_agent: Some(identity.agent_id.clone()),
+        },
+        None => crate::egress::PurposeChannel::LocalOperator("ironmem:workbench-local".into()),
+    };
+    let gate = crate::egress::gate_memories(
+        &state.db,
+        memories,
+        &namespace,
+        project,
+        None,
+        channel,
+        crate::egress::ConsumerCapabilities {
+            reasoning_only_channel: false,
+            exact_source_expansion: false,
+            denial_diagnostics: agent.is_none(),
+        },
+        &state.config.influence,
+    )
+    .await
+    .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    Ok(Json(gate.authorized))
 }
 
 async fn api_delete_memory(
@@ -1915,6 +2306,110 @@ mod workbench_tests {
         assert_eq!(read.status(), StatusCode::OK);
         assert_eq!(response_json(read).await["policy"]["version"], 2);
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn blocked_memory_never_crosses_rest_or_workbench_egress() {
+        let path =
+            std::env::temp_dir().join(format!("ironmem-rest-egress-{}.db", uuid::Uuid::new_v4()));
+        let database = db::Database::new(path.to_str().unwrap()).await.unwrap();
+        database.migrate().await.unwrap();
+        let project = "/tmp/rest-egress";
+        let session = db::create_session(&database, project).await.unwrap();
+        let memory_id =
+            db::insert_memory(&database, project, &session, "blocked-content-marker", None)
+                .await
+                .unwrap();
+        crate::influence::update_memory_policy(
+            &database,
+            &crate::influence::PolicyPrincipal::local_operator("test"),
+            memory_id,
+            "local",
+            &crate::influence::PolicyMutationRequest {
+                expected_version: 1,
+                patch: crate::influence::MemoryInfluencePolicyPatch {
+                    state: Some(crate::influence::InfluenceState::Blocked),
+                    ..Default::default()
+                },
+                reason: "egress test".into(),
+                request_id: "egress-policy".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let config = crate::config::Config {
+            db_path: path.to_string_lossy().to_string(),
+            influence: crate::config::InfluenceConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (embedder, store) = vectorstore::build_semantic(&database, &config).await;
+        let app = router(AppState {
+            db: database,
+            config,
+            embedder,
+            store,
+        });
+
+        for uri in [
+            "/context?project=%2Ftmp%2Frest-egress",
+            "/api/memories?project=%2Ftmp%2Frest-egress",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(!response_json(response)
+                .await
+                .to_string()
+                .contains("blocked-content-marker"));
+        }
+        let evidence = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/api/memories/{memory_id}/evidence"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence.status(), StatusCode::FORBIDDEN);
+
+        let evaluated = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/context/evaluate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "project": project,
+                            "purpose": {
+                                "request_id": "rest-eval",
+                                "namespace": "local",
+                                "project": project,
+                                "task_type": "answer",
+                                "action_risk": "none",
+                                "require_source_backing": false
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evaluated.status(), StatusCode::OK);
+        assert!(!response_json(evaluated)
+            .await
+            .to_string()
+            .contains("blocked-content-marker"));
         let _ = std::fs::remove_file(path);
     }
 }

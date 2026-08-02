@@ -104,6 +104,7 @@ pub struct MemoryLineage {
     pub parent_chain: Vec<i64>,
     pub ledger: Vec<db::MemoryLedgerEntry>,
     pub injections: Vec<db::InjectionEventInfo>,
+    pub influence_events: Vec<db::InfluenceEventInfo>,
 }
 
 pub async fn memory_lineage(db: &Database, memory_id: i64) -> Result<MemoryLineage> {
@@ -159,6 +160,7 @@ pub async fn memory_lineage(db: &Database, memory_id: i64) -> Result<MemoryLinea
         parent_chain,
         ledger: db::memory_ledger_for_memory(db, memory_id).await?,
         injections: db::injection_events_for_memory(db, memory_id, 200).await?,
+        influence_events: db::influence_events_for_memory(db, memory_id, 200).await?,
     })
 }
 
