@@ -243,6 +243,56 @@ pub fn sha256_hex(input: &[u8]) -> String {
     hex(&hasher.finalize())
 }
 
+/// Version of the canonical evidence-root preimage. Bump this only when the
+/// encoding or field semantics change; stored root IDs remain valid forever.
+pub const EVIDENCE_ROOT_VERSION: u8 = 1;
+
+fn push_len_prefixed(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    out.extend_from_slice(value);
+}
+
+fn push_optional_len_prefixed(out: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            push_len_prefixed(out, value.as_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+/// Build a stable evidence-root identifier from a versioned, length-delimited
+/// binary encoding. Length prefixes make field boundaries unambiguous (unlike
+/// delimiter-joined strings) and keep the format identical on every backend.
+pub fn evidence_root_id(
+    namespace: &str,
+    source_type: &str,
+    source_ref: Option<&str>,
+    canonical_source_hash: &str,
+) -> String {
+    let mut preimage = Vec::with_capacity(
+        namespace.len()
+            + source_type.len()
+            + source_ref.map(str::len).unwrap_or_default()
+            + canonical_source_hash.len()
+            + 64,
+    );
+    preimage.extend_from_slice(b"ironmem:evidence-root");
+    preimage.push(EVIDENCE_ROOT_VERSION);
+    push_len_prefixed(&mut preimage, normalize_namespace(namespace).as_bytes());
+    push_len_prefixed(&mut preimage, source_type.as_bytes());
+    push_optional_len_prefixed(&mut preimage, source_ref);
+    push_len_prefixed(&mut preimage, canonical_source_hash.as_bytes());
+    format!("evr{EVIDENCE_ROOT_VERSION}:{}", sha256_hex(&preimage))
+}
+
+/// Create a durable root for a direct record that has no stable source
+/// reference. The generated value is stored on first write and never re-derived.
+pub fn new_evidence_root_id() -> String {
+    format!("evr{EVIDENCE_ROOT_VERSION}:uuid:{}", uuid::Uuid::new_v4())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn memory_record_hash(
     project: &str,
@@ -401,6 +451,26 @@ mod tests {
         assert!(
             many < 0.1,
             "reference term saturates below the weight ceiling"
+        );
+    }
+
+    #[test]
+    fn evidence_root_encoding_has_unambiguous_field_boundaries() {
+        let left = evidence_root_id("tenant", "tool", Some("ab"), "c");
+        let right = evidence_root_id("tenant", "tool", Some("a"), "bc");
+        assert_ne!(left, right);
+        assert_eq!(
+            left,
+            evidence_root_id("tenant", "tool", Some("ab"), "c"),
+            "the canonical encoding must be deterministic"
+        );
+    }
+
+    #[test]
+    fn evidence_roots_are_namespace_isolated() {
+        assert_ne!(
+            evidence_root_id("tenant-a", "external", Some("doc:1"), "hash"),
+            evidence_root_id("tenant-b", "external", Some("doc:1"), "hash")
         );
     }
 }

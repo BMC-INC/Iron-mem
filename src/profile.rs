@@ -70,6 +70,21 @@ pub async fn regenerate(
     let id = db::insert_memory(db, PROFILE_PROJECT, "profile", &text, Some("profile user")).await?;
     db::upsert_memory_meta(db, id, 0.9).await?; // the profile is high-importance
     db::set_memory_scope_kind(db, id, "user", "profile").await?;
+    let source_ids: Vec<i64> = sources.iter().map(|memory| memory.id).collect();
+    let mut governance = crate::governance::MemoryGovernance::derived_from(source_ids[0]);
+    governance.writer_identity = Some("ironmem:profile".to_string());
+    governance.source_ref = Some("user-profile-rollup".to_string());
+    db::apply_memory_governance(
+        db,
+        id,
+        "user",
+        "profile",
+        &governance,
+        Some("ironmem:profile"),
+        "derive",
+    )
+    .await?;
+    db::add_supporting_evidence_from_memories(db, id, &source_ids).await?;
 
     if let Some(emb) = embedder {
         match emb.embed(std::slice::from_ref(&text)).await {

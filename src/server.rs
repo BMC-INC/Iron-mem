@@ -126,6 +126,7 @@ pub fn router(state: AppState) -> Router {
         .route("/event", post(record_event))
         .route("/compress", post(compress_session))
         .route("/context", get(get_context))
+        .route("/context/evaluate", post(evaluate_context))
         .route("/skim", get(get_skim))
         .route("/status", get(get_status))
         .route("/retrieve_original", post(retrieve_original))
@@ -148,6 +149,19 @@ pub fn router(state: AppState) -> Router {
         .route("/compliance/report", get(get_compliance_report))
         .route("/memory/{id}/lineage", get(get_memory_lineage))
         .route(
+            "/memory/{id}/influence",
+            get(get_memory_influence).put(put_memory_influence),
+        )
+        .route(
+            "/memory/{id}/influence-events",
+            get(get_memory_influence_events),
+        )
+        .route("/contradictions", post(create_contradiction))
+        .route(
+            "/contradictions/{id}",
+            get(get_contradiction).put(update_contradiction),
+        )
+        .route(
             "/sync/events",
             get(export_sync_events).post(publish_sync_event),
         )
@@ -157,6 +171,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/graph/window", get(api_graph_window))
         .route("/api/memories", get(api_list_memories))
         .route("/api/memories/{id}/evidence", get(api_memory_evidence))
+        .route(
+            "/api/memories/{id}/influence/simulate",
+            post(api_simulate_memory_influence),
+        )
         .route("/api/memories/{id}", delete(api_delete_memory))
         .route("/api/sessions", get(api_list_sessions))
         .with_state(Arc::new(state));
@@ -182,6 +200,8 @@ pub struct AgentIdentity {
     pub agent_id: String,
     /// Normalized namespace allowlist; empty = all namespaces.
     pub namespaces: Vec<String>,
+    /// Administrative capabilities remain distinct from namespace access.
+    pub capabilities: Vec<String>,
 }
 
 impl AgentIdentity {
@@ -215,6 +235,11 @@ async fn require_agent_key(
             .namespaces
             .iter()
             .map(|n| crate::governance::normalize_namespace(n))
+            .collect(),
+        capabilities: key
+            .capabilities
+            .iter()
+            .map(|capability| capability.trim().to_ascii_lowercase())
             .collect(),
     };
     // Generic guard for namespace-scoped GET endpoints (?namespace=...).
@@ -372,6 +397,8 @@ pub struct RetrieveOriginalRequest {
     pub memory_id: Option<i64>,
     pub hash: Option<String>,
     pub chunk_id: Option<String>,
+    pub namespace: Option<String>,
+    pub purpose: Option<crate::purpose::RecallPurpose>,
 }
 
 #[derive(Serialize)]
@@ -383,12 +410,72 @@ pub struct RetrieveOriginalResponse {
     pub memory_id: Option<i64>,
     pub source_start: Option<i64>,
     pub source_end: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub influence_decisions: Vec<crate::egress::InfluenceDecision>,
 }
 
 async fn retrieve_original(
     State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
     Json(body): Json<RetrieveOriginalRequest>,
 ) -> Result<Json<RetrieveOriginalResponse>, (StatusCode, String)> {
+    let namespace = crate::governance::normalize_namespace(
+        body.namespace
+            .as_deref()
+            .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+    );
+    let ids = db::memory_ids_for_original_reference(
+        &state.db,
+        body.observation_id,
+        body.memory_id,
+        body.hash.as_deref(),
+        body.chunk_id.as_deref(),
+    )
+    .await
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let memories = db::memories_by_ids_in_namespace(&state.db, &ids, &namespace)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if state.config.influence.enabled && memories.is_empty() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "original_source_not_bound_to_authorized_memory".to_string(),
+        ));
+    }
+    let project = memories
+        .first()
+        .map(|memory| memory.project.clone())
+        .unwrap_or_else(|| "*".to_string());
+    let channel = match &agent {
+        Some(axum::Extension(identity)) => crate::egress::PurposeChannel::Remote {
+            authenticated_agent: Some(identity.agent_id.clone()),
+        },
+        None => crate::egress::PurposeChannel::LocalOperator("ironmem:rest-local".into()),
+    };
+    let gate = crate::egress::gate_memories_with_query(
+        &state.db,
+        memories,
+        &namespace,
+        &project,
+        body.purpose.as_ref(),
+        channel,
+        crate::egress::ConsumerCapabilities {
+            reasoning_only_channel: true,
+            exact_source_expansion: true,
+            denial_diagnostics: agent.is_none(),
+        },
+        &state.config.influence,
+        None,
+    )
+    .await
+    .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    if state.config.influence.enabled
+        && gate.authorized.is_empty()
+        && gate.advisory.is_empty()
+        && gate.source_required.is_empty()
+    {
+        return Err((StatusCode::FORBIDDEN, "memory_influence_denied".to_string()));
+    }
     let expanded = crate::expansion::retrieve_original(
         &state.db,
         body.observation_id,
@@ -407,6 +494,7 @@ async fn retrieve_original(
         memory_id: expanded.memory_id,
         source_start: expanded.source_start,
         source_end: expanded.source_end,
+        influence_decisions: gate.decisions,
     }))
 }
 
@@ -887,6 +975,225 @@ async fn get_memory_lineage(
 }
 
 #[derive(Deserialize)]
+pub struct InfluencePolicyQuery {
+    pub namespace: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct PutInfluencePolicyRequest {
+    pub namespace: Option<String>,
+    pub expected_version: u64,
+    pub reason: String,
+    pub request_id: Option<String>,
+    pub state: Option<crate::influence::InfluenceState>,
+    pub allowed_task_types: Option<Vec<String>>,
+    pub denied_task_types: Option<Vec<String>>,
+    pub maximum_action_risk: Option<crate::influence::ActionRisk>,
+    pub requires_original_source: Option<bool>,
+    pub requires_human_confirmation: Option<bool>,
+    pub maximum_derivation_depth: Option<u32>,
+    #[serde(default)]
+    pub clear_maximum_derivation_depth: bool,
+}
+
+type InfluenceHttpError = (StatusCode, Json<serde_json::Value>);
+
+fn rest_policy_principal(
+    agent: Option<axum::Extension<AgentIdentity>>,
+) -> crate::influence::PolicyPrincipal {
+    match agent {
+        Some(axum::Extension(identity)) => crate::influence::PolicyPrincipal::configured(
+            format!("agent:{}", identity.agent_id),
+            "authenticated_agent",
+            identity.namespaces,
+            identity.capabilities,
+        ),
+        None => crate::influence::PolicyPrincipal::local_operator("ironmem:rest-local"),
+    }
+}
+
+fn influence_http_error(error: anyhow::Error) -> InfluenceHttpError {
+    if let Some(policy_error) = crate::influence::policy_error(&error) {
+        let status = match policy_error {
+            crate::influence::PolicyError::MemoryNotFound { .. }
+            | crate::influence::PolicyError::ContradictionNotFound { .. } => StatusCode::NOT_FOUND,
+            crate::influence::PolicyError::NamespaceDenied { .. }
+            | crate::influence::PolicyError::CapabilityRequired { .. } => StatusCode::FORBIDDEN,
+            crate::influence::PolicyError::VersionConflict { .. } => StatusCode::CONFLICT,
+            crate::influence::PolicyError::InvalidPolicy(_)
+            | crate::influence::PolicyError::NoChange => StatusCode::BAD_REQUEST,
+        };
+        return (
+            status,
+            Json(serde_json::json!({
+                "error": {
+                    "code": policy_error.code(),
+                    "message": policy_error.to_string(),
+                    "current_version": policy_error.current_version(),
+                }
+            })),
+        );
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": {
+                "code": "influence_policy_storage_error",
+                "message": error.to_string(),
+            }
+        })),
+    )
+}
+
+async fn get_memory_influence(
+    State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
+    Path(id): Path<i64>,
+    Query(query): Query<InfluencePolicyQuery>,
+) -> Result<Json<crate::influence::MemoryInfluencePolicyRecord>, InfluenceHttpError> {
+    let namespace = crate::governance::normalize_namespace(
+        query
+            .namespace
+            .as_deref()
+            .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+    );
+    crate::influence::get_memory_policy(&state.db, &rest_policy_principal(agent), id, &namespace)
+        .await
+        .map(Json)
+        .map_err(influence_http_error)
+}
+
+async fn put_memory_influence(
+    State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
+    Path(id): Path<i64>,
+    Json(body): Json<PutInfluencePolicyRequest>,
+) -> Result<Json<crate::influence::MemoryInfluencePolicyRecord>, InfluenceHttpError> {
+    if body.clear_maximum_derivation_depth && body.maximum_derivation_depth.is_some() {
+        return Err(influence_http_error(anyhow::Error::new(
+            crate::influence::PolicyError::InvalidPolicy(
+                "maximum_derivation_depth and clear_maximum_derivation_depth are mutually exclusive"
+                    .to_string(),
+            ),
+        )));
+    }
+    let namespace = crate::governance::normalize_namespace(
+        body.namespace
+            .as_deref()
+            .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+    );
+    let maximum_derivation_depth = if body.clear_maximum_derivation_depth {
+        Some(None)
+    } else {
+        body.maximum_derivation_depth.map(Some)
+    };
+    let request = crate::influence::PolicyMutationRequest {
+        expected_version: body.expected_version,
+        patch: crate::influence::MemoryInfluencePolicyPatch {
+            state: body.state,
+            allowed_task_types: body.allowed_task_types,
+            denied_task_types: body.denied_task_types,
+            maximum_action_risk: body.maximum_action_risk,
+            requires_original_source: body.requires_original_source,
+            requires_human_confirmation: body.requires_human_confirmation,
+            maximum_derivation_depth,
+        },
+        reason: body.reason,
+        request_id: body
+            .request_id
+            .unwrap_or_else(|| format!("rest-policy-{}", uuid::Uuid::new_v4())),
+    };
+    crate::influence::update_memory_policy(
+        &state.db,
+        &rest_policy_principal(agent),
+        id,
+        &namespace,
+        &request,
+    )
+    .await
+    .map(Json)
+    .map_err(influence_http_error)
+}
+
+async fn get_memory_influence_events(
+    State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    Query(query): Query<InfluencePolicyQuery>,
+) -> Result<Json<Vec<db::InfluenceEventInfo>>, InfluenceHttpError> {
+    let namespace = crate::governance::normalize_namespace(
+        query
+            .namespace
+            .as_deref()
+            .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+    );
+    crate::influence::get_memory_policy(&state.db, &rest_policy_principal(agent), id, &namespace)
+        .await
+        .map_err(influence_http_error)?;
+    db::influence_events_for_memory(&state.db, id, 200)
+        .await
+        .map(Json)
+        .map_err(influence_http_error)
+}
+
+async fn create_contradiction(
+    State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
+    Json(body): Json<crate::contradiction::CreateContradictionRequest>,
+) -> Result<Json<crate::contradiction::ContradictionSet>, InfluenceHttpError> {
+    crate::contradiction::create(&state.db, &rest_policy_principal(agent), &body)
+        .await
+        .map(Json)
+        .map_err(influence_http_error)
+}
+
+async fn get_contradiction(
+    State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
+    Path(id): Path<String>,
+    Query(query): Query<InfluencePolicyQuery>,
+) -> Result<Json<crate::contradiction::ContradictionSet>, InfluenceHttpError> {
+    let namespace = query
+        .namespace
+        .as_deref()
+        .unwrap_or(crate::governance::DEFAULT_NAMESPACE);
+    crate::contradiction::get(&state.db, &rest_policy_principal(agent), &id, namespace)
+        .await
+        .map(Json)
+        .map_err(influence_http_error)
+}
+
+#[derive(Deserialize)]
+struct UpdateContradictionBody {
+    #[serde(default = "default_namespace")]
+    namespace: String,
+    #[serde(flatten)]
+    update: crate::contradiction::UpdateContradictionRequest,
+}
+
+fn default_namespace() -> String {
+    crate::governance::DEFAULT_NAMESPACE.to_string()
+}
+
+async fn update_contradiction(
+    State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateContradictionBody>,
+) -> Result<Json<crate::contradiction::ContradictionSet>, InfluenceHttpError> {
+    crate::contradiction::update(
+        &state.db,
+        &rest_policy_principal(agent),
+        &id,
+        &body.namespace,
+        &body.update,
+    )
+    .await
+    .map(Json)
+    .map_err(influence_http_error)
+}
+
+#[derive(Deserialize)]
 pub struct RestoreSnapshotRequest {
     pub dry_run: Option<bool>,
 }
@@ -1006,6 +1313,10 @@ fn truthy(v: &Option<String>) -> Option<bool> {
 #[derive(Serialize)]
 pub struct ContextResponse {
     pub memories: Vec<db::Memory>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisory_memories: Vec<db::Memory>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub influence_decisions: Vec<crate::egress::InfluenceDecision>,
     pub expansions: Vec<ContextExpansion>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_chains: Vec<ContextEvidenceChain>,
@@ -1014,6 +1325,32 @@ pub struct ContextResponse {
     /// Only memories that carry a date appear here.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub event_times: std::collections::HashMap<i64, String>,
+}
+
+#[derive(Deserialize)]
+pub struct EvaluateContextRequest {
+    pub project: String,
+    pub query: Option<String>,
+    pub limit: Option<i64>,
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub rerank: bool,
+    pub pool: Option<usize>,
+    pub purpose: crate::purpose::RecallPurpose,
+}
+
+#[derive(Serialize)]
+pub struct SourceBackedMemory {
+    pub memory: db::Memory,
+    pub source: crate::expansion::ExpandedOriginal,
+}
+
+#[derive(Serialize)]
+pub struct EvaluateContextResponse {
+    #[serde(flatten)]
+    pub context: ContextResponse,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_backed_memories: Vec<SourceBackedMemory>,
 }
 
 /// (W1.3) Lost-in-the-middle mitigation: re-order rank-sorted memories (best
@@ -1089,8 +1426,68 @@ async fn context_evidence_chains(
     Ok(chains)
 }
 
+async fn retrieve_context_candidates(
+    state: &AppState,
+    project: &str,
+    namespace: &str,
+    query: Option<&str>,
+    limit: i64,
+    rerank_on: bool,
+    pool: Option<usize>,
+) -> Result<Vec<db::Memory>, (StatusCode, String)> {
+    let ranked_query = query.is_some_and(|query| !query.is_empty());
+    let memories = match query {
+        Some(query) if !query.is_empty() => {
+            if rerank_on && state.config.multi_hop_enabled() && retrieval::is_multi_hop_query(query)
+            {
+                retrieval::iterative_rerank_search_in_namespace(
+                    &state.db,
+                    state.embedder.as_deref(),
+                    state.store.as_ref(),
+                    &state.config,
+                    namespace,
+                    Some(project),
+                    query,
+                    limit as usize,
+                    state.config.multi_hop.max_hops,
+                    pool,
+                )
+                .await
+                .unwrap_or_default()
+            } else if rerank_on {
+                retrieval::rerank_search_in_namespace_with_pool(
+                    &state.db,
+                    state.embedder.as_deref(),
+                    state.store.as_ref(),
+                    &state.config,
+                    namespace,
+                    Some(project),
+                    query,
+                    limit as usize,
+                    pool,
+                )
+                .await
+                .unwrap_or_default()
+            } else {
+                state
+                    .hybrid_in_namespace(namespace, Some(project), query, limit)
+                    .await
+            }
+        }
+        _ => db::get_recent_memories_in_namespace(&state.db, namespace, project, limit)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+    };
+    Ok(if ranked_query {
+        u_shaped_order(dedup_by_summary(memories))
+    } else {
+        memories
+    })
+}
+
 async fn get_context(
     State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
     Query(params): Query<ContextQuery>,
 ) -> Result<Json<ContextResponse>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(state.config.inject_limit as i64);
@@ -1102,65 +1499,41 @@ async fn get_context(
             .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
     );
 
-    let ranked_query = matches!(&params.query, Some(q) if !q.is_empty());
-    let memories = match &params.query {
-        Some(q) if !q.is_empty() => {
-            if rerank_on && state.config.multi_hop_enabled() && retrieval::is_multi_hop_query(q) {
-                // (W3.1) Multi-hop question → iterative retrieve→reason→re-query.
-                // Gated to multi-hop-looking queries so single-hop pays no extra
-                // latency; degrades to a single reranked pass on any failure. An
-                // explicit ?pool= override is threaded through every hop.
-                retrieval::iterative_rerank_search_in_namespace(
-                    &state.db,
-                    state.embedder.as_deref(),
-                    state.store.as_ref(),
-                    &state.config,
-                    &namespace,
-                    Some(&params.project),
-                    q,
-                    limit as usize,
-                    state.config.multi_hop.max_hops,
-                    params.pool,
-                )
-                .await
-                .unwrap_or_default()
-            } else if rerank_on {
-                // Re-anchored reranked retrieval: protect the base@limit ordering
-                // (FTS-strong temporal answers) while letting the LLM promote
-                // buried wide-pool answers. Failure falls back to base order.
-                retrieval::rerank_search_in_namespace_with_pool(
-                    &state.db,
-                    state.embedder.as_deref(),
-                    state.store.as_ref(),
-                    &state.config,
-                    &namespace,
-                    Some(&params.project),
-                    q,
-                    limit as usize,
-                    params.pool,
-                )
-                .await
-                .unwrap_or_default()
-            } else {
-                state
-                    .hybrid_in_namespace(&namespace, Some(&params.project), q, limit)
-                    .await
-            }
-        }
-        _ => db::get_recent_memories_in_namespace(&state.db, &namespace, &params.project, limit)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-    };
+    let memories = retrieve_context_candidates(
+        &state,
+        &params.project,
+        &namespace,
+        params.query.as_deref(),
+        limit,
+        rerank_on,
+        params.pool,
+    )
+    .await?;
 
-    // (W1.3) For ranked (query) results only: drop near-duplicate facts, then
-    // U-shape the order so the most-relevant memories sit at the ends of the
-    // answerer's context. The recent-memories fallback stays in chronological
-    // order (reordering it would be wrong).
-    let memories = if ranked_query {
-        u_shaped_order(dedup_by_summary(memories))
-    } else {
-        memories
+    let channel = match &agent {
+        Some(axum::Extension(identity)) => crate::egress::PurposeChannel::Remote {
+            authenticated_agent: Some(identity.agent_id.clone()),
+        },
+        None => crate::egress::PurposeChannel::LocalOperator("ironmem:rest-local".to_string()),
     };
+    let gate = crate::egress::gate_memories_with_query(
+        &state.db,
+        memories,
+        &namespace,
+        &params.project,
+        None,
+        channel,
+        crate::egress::ConsumerCapabilities {
+            reasoning_only_channel: true,
+            exact_source_expansion: false,
+            denial_diagnostics: agent.is_none(),
+        },
+        &state.config.influence,
+        params.query.as_deref(),
+    )
+    .await
+    .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    let memories = gate.authorized;
 
     let memory_ids: Vec<i64> = memories.iter().map(|m| m.id).collect();
     let chunks = db::chunks_for_memories(&state.db, &memory_ids)
@@ -1185,9 +1558,128 @@ async fn get_context(
 
     Ok(Json(ContextResponse {
         memories,
+        advisory_memories: gate.advisory,
+        influence_decisions: gate.decisions,
         expansions,
         evidence_chains,
         event_times,
+    }))
+}
+
+async fn evaluate_context(
+    State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
+    Json(body): Json<EvaluateContextRequest>,
+) -> Result<Json<EvaluateContextResponse>, (StatusCode, String)> {
+    let namespace = crate::governance::normalize_namespace(
+        body.namespace
+            .as_deref()
+            .unwrap_or(crate::governance::DEFAULT_NAMESPACE),
+    );
+    if let Some(axum::Extension(identity)) = &agent {
+        if !identity.allows(&namespace) {
+            return Err((StatusCode::FORBIDDEN, "namespace_denied".to_string()));
+        }
+    }
+    let memories = retrieve_context_candidates(
+        &state,
+        &body.project,
+        &namespace,
+        body.query.as_deref(),
+        body.limit.unwrap_or(state.config.inject_limit as i64),
+        body.rerank,
+        body.pool,
+    )
+    .await?;
+    let channel = match &agent {
+        Some(axum::Extension(identity)) => crate::egress::PurposeChannel::Remote {
+            authenticated_agent: Some(identity.agent_id.clone()),
+        },
+        None => crate::egress::PurposeChannel::LocalOperator("ironmem:rest-local".into()),
+    };
+    let mut gate = crate::egress::gate_memories_with_query(
+        &state.db,
+        memories,
+        &namespace,
+        &body.project,
+        Some(&body.purpose),
+        channel,
+        crate::egress::ConsumerCapabilities {
+            reasoning_only_channel: true,
+            exact_source_expansion: true,
+            denial_diagnostics: agent.is_none(),
+        },
+        &state.config.influence,
+        body.query.as_deref(),
+    )
+    .await
+    .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+
+    let mut source_backed_memories = Vec::new();
+    let mut source_failures = Vec::new();
+    for memory in gate.source_required.drain(..) {
+        match crate::expansion::retrieve_original(&state.db, None, Some(memory.id), None, None)
+            .await
+        {
+            Ok(source) => source_backed_memories.push(SourceBackedMemory { memory, source }),
+            Err(_) => {
+                gate.denied_memory_ids.push(memory.id);
+                if let Some(decision) = gate
+                    .decisions
+                    .iter_mut()
+                    .find(|decision| decision.memory_id == memory.id)
+                {
+                    let mut failure = decision.clone();
+                    failure.decision_id = uuid::Uuid::new_v4().to_string();
+                    failure.decision = crate::egress::InfluenceDecisionKind::Deny;
+                    failure.reason_codes.push("source_unavailable".to_string());
+                    source_failures.push(failure.clone());
+                    *decision = failure;
+                }
+            }
+        }
+    }
+    if !source_failures.is_empty() {
+        let failure_ids = source_failures
+            .iter()
+            .map(|decision| decision.memory_id)
+            .collect::<Vec<_>>();
+        let contexts = db::influence_contexts_for(&state.db, &failure_ids, &namespace)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        db::record_influence_decisions(&state.db, &source_failures, &contexts, true, None)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    }
+    let memory_ids = gate
+        .authorized
+        .iter()
+        .map(|memory| memory.id)
+        .collect::<Vec<_>>();
+    let chunks = db::chunks_for_memories(&state.db, &memory_ids)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let context = ContextResponse {
+        memories: gate.authorized,
+        advisory_memories: gate.advisory,
+        influence_decisions: gate.decisions,
+        expansions: memory_ids
+            .iter()
+            .map(|memory_id| ContextExpansion {
+                memory_id: *memory_id,
+                chunks: chunks.get(memory_id).cloned().unwrap_or_default(),
+            })
+            .collect(),
+        evidence_chains: context_evidence_chains(&state.db, &memory_ids, &chunks)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+        event_times: db::event_times_for(&state.db, &memory_ids)
+            .await
+            .unwrap_or_default(),
+    };
+    Ok(Json(EvaluateContextResponse {
+        context,
+        source_backed_memories,
     }))
 }
 
@@ -1203,10 +1695,15 @@ pub struct SkimQuery {
 #[derive(Serialize)]
 pub struct SkimResponse {
     pub chunks: Vec<db::MemoryChunk>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisory_chunks: Vec<db::MemoryChunk>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub influence_decisions: Vec<crate::egress::InfluenceDecision>,
 }
 
 async fn get_skim(
     State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
     Query(params): Query<SkimQuery>,
 ) -> Result<Json<SkimResponse>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(state.config.inject_limit as i64 * 3);
@@ -1224,7 +1721,58 @@ async fn get_skim(
     let chunks = db::recent_memory_chunks_in_namespace(&state.db, &namespace, project, limit)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(SkimResponse { chunks }))
+    let ids = chunks
+        .iter()
+        .map(|chunk| chunk.memory_id)
+        .collect::<Vec<_>>();
+    let memories = db::memories_by_ids_in_namespace(&state.db, &ids, &namespace)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let channel = match &agent {
+        Some(axum::Extension(identity)) => crate::egress::PurposeChannel::Remote {
+            authenticated_agent: Some(identity.agent_id.clone()),
+        },
+        None => crate::egress::PurposeChannel::LocalOperator("ironmem:rest-local".into()),
+    };
+    let gate = crate::egress::gate_memories(
+        &state.db,
+        memories,
+        &namespace,
+        project.unwrap_or("*"),
+        None,
+        channel,
+        crate::egress::ConsumerCapabilities {
+            reasoning_only_channel: true,
+            exact_source_expansion: false,
+            denial_diagnostics: agent.is_none(),
+        },
+        &state.config.influence,
+    )
+    .await
+    .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    let allowed = gate
+        .authorized
+        .iter()
+        .map(|memory| memory.id)
+        .collect::<std::collections::HashSet<_>>();
+    let advisory = gate
+        .advisory
+        .iter()
+        .map(|memory| memory.id)
+        .collect::<std::collections::HashSet<_>>();
+    Ok(Json(SkimResponse {
+        chunks: chunks
+            .iter()
+            .filter(|chunk| allowed.contains(&chunk.memory_id))
+            .cloned()
+            .collect(),
+        advisory_chunks: chunks
+            .iter()
+            .filter(|chunk| advisory.contains(&chunk.memory_id))
+            .cloned()
+            .collect(),
+        influence_decisions: gate.decisions,
+    }))
 }
 
 // GET /status
@@ -1244,6 +1792,9 @@ pub struct StatusResponse {
     pub rerank: serde_json::Value,
     /// Session graduation mode. `local` requires no provider credentials.
     pub compression: serde_json::Value,
+    /// Receipt-backed local extraction yield and recovery state.
+    pub extraction: crate::recovery::ExtractionStatus,
+    pub influence: serde_json::Value,
 }
 
 async fn get_status(
@@ -1253,6 +1804,9 @@ async fn get_status(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let extraction = crate::recovery::status(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(StatusResponse {
         ok: true,
         sessions: stats.total_sessions,
@@ -1270,6 +1824,16 @@ async fn get_status(
         compression: serde_json::json!({
             "mode": state.config.compression.mode,
             "cloud_required": false,
+        }),
+        extraction,
+        influence: serde_json::json!({
+            "enabled": state.config.influence.enabled,
+            "mode": state.config.influence.mode,
+            "require_purpose": state.config.influence.require_purpose,
+            "require_trusted_attestation": state.config.influence.require_trusted_attestation,
+            "contradiction_high_risk_mode": state.config.influence.contradiction_high_risk_mode,
+            "contradictions": db::contradiction_status(&state.db).await.unwrap_or_else(|_| serde_json::json!({})),
+            "events": db::influence_event_status(&state.db).await.unwrap_or_else(|_| serde_json::json!({})),
         }),
     }))
 }
@@ -1401,6 +1965,8 @@ pub struct EvidenceMetadata {
     pub retention_policy_id: Option<String>,
     pub expires_at: Option<i64>,
     pub legal_hold: bool,
+    pub evidence_root_id: Option<String>,
+    pub derivation_depth: u32,
 }
 
 impl From<db::MemoryMetaInfo> for EvidenceMetadata {
@@ -1422,6 +1988,8 @@ impl From<db::MemoryMetaInfo> for EvidenceMetadata {
             retention_policy_id: meta.retention_policy_id,
             expires_at: meta.expires_at,
             legal_hold: meta.legal_hold,
+            evidence_root_id: meta.evidence_root_id,
+            derivation_depth: meta.derivation_depth,
         }
     }
 }
@@ -1437,10 +2005,15 @@ pub struct MemoryEvidenceResponse {
     pub metadata: EvidenceMetadata,
     pub chunks: Vec<db::MemoryChunk>,
     pub graph_edges: Vec<db::MemoryEdge>,
+    pub influence_policy: Option<crate::influence::MemoryInfluencePolicyRecord>,
+    pub contradiction_sets: Vec<crate::contradiction::ContradictionSet>,
+    pub influence_events: Vec<db::InfluenceEventInfo>,
+    pub independent_root_count: usize,
 }
 
 async fn api_memory_evidence(
     State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
     Path(id): Path<i64>,
     Query(query): Query<EvidenceQuery>,
 ) -> Result<Json<MemoryEvidenceResponse>, (StatusCode, String)> {
@@ -1454,6 +2027,34 @@ async fn api_memory_evidence(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("memory {id} not found")))?;
+    let channel = match &agent {
+        Some(axum::Extension(identity)) => crate::egress::PurposeChannel::Remote {
+            authenticated_agent: Some(identity.agent_id.clone()),
+        },
+        None => crate::egress::PurposeChannel::LocalOperator("ironmem:workbench-local".into()),
+    };
+    let project = memory.project.clone();
+    let gate = crate::egress::gate_memories(
+        &state.db,
+        vec![memory],
+        &namespace,
+        &project,
+        None,
+        channel,
+        crate::egress::ConsumerCapabilities {
+            reasoning_only_channel: false,
+            exact_source_expansion: false,
+            denial_diagnostics: agent.is_none(),
+        },
+        &state.config.influence,
+    )
+    .await
+    .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    let memory = gate
+        .authorized
+        .into_iter()
+        .next()
+        .ok_or_else(|| (StatusCode::FORBIDDEN, "memory_influence_denied".to_string()))?;
     let metadata = EvidenceMetadata::from(
         db::get_memory_meta_full(&state.db, id)
             .await
@@ -1465,11 +2066,137 @@ async fn api_memory_evidence(
     let mut graph_edges = db::memory_edges_for_memories(&state.db, &[id])
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let principal = rest_policy_principal(agent);
+    let influence_policy =
+        crate::influence::get_memory_policy(&state.db, &principal, id, &namespace)
+            .await
+            .ok();
+    let contradiction_sets =
+        crate::contradiction::list_for_memory(&state.db, &principal, id, &namespace)
+            .await
+            .unwrap_or_default();
+    let influence_events = if influence_policy.is_some() {
+        db::influence_events_for_memory(&state.db, id, 20)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let independent_root_count = db::influence_contexts_for(&state.db, &[id], &namespace)
+        .await
+        .ok()
+        .and_then(|contexts| contexts.get(&id).map(|context| context.evidence_root_count))
+        .unwrap_or(0);
     Ok(Json(MemoryEvidenceResponse {
         memory,
         metadata,
         chunks: chunks.remove(&id).unwrap_or_default(),
         graph_edges: graph_edges.remove(&id).unwrap_or_default(),
+        influence_policy,
+        contradiction_sets,
+        influence_events,
+        independent_root_count,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct InfluenceSimulationRequest {
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+    pub task_type: String,
+    pub intended_action: Option<String>,
+    #[serde(default = "default_action_risk")]
+    pub action_risk: crate::influence::ActionRisk,
+    #[serde(default)]
+    pub require_source_backing: bool,
+    #[serde(default = "default_true_value")]
+    pub reasoning_only_channel: bool,
+    #[serde(default = "default_true_value")]
+    pub exact_source_expansion: bool,
+}
+
+fn default_true_value() -> bool {
+    true
+}
+
+fn default_action_risk() -> crate::influence::ActionRisk {
+    crate::influence::ActionRisk::None
+}
+
+#[derive(Serialize)]
+pub struct InfluenceSimulationResponse {
+    pub simulation_only: bool,
+    pub confirmation_minted: bool,
+    pub decision: crate::egress::InfluenceDecision,
+}
+
+async fn api_simulate_memory_influence(
+    State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
+    Path(id): Path<i64>,
+    Json(body): Json<InfluenceSimulationRequest>,
+) -> Result<Json<InfluenceSimulationResponse>, InfluenceHttpError> {
+    let namespace = crate::governance::normalize_namespace(&body.namespace);
+    let principal = rest_policy_principal(agent.clone());
+    principal
+        .authorize(crate::influence::POLICY_READ_CAPABILITY, &namespace)
+        .map_err(|error| influence_http_error(anyhow::Error::new(error)))?;
+    let memory = db::get_memory_by_id_in_namespace(&state.db, id, &namespace)
+        .await
+        .map_err(influence_http_error)?
+        .ok_or_else(|| {
+            influence_http_error(anyhow::Error::new(
+                crate::influence::PolicyError::MemoryNotFound {
+                    memory_id: id,
+                    namespace: namespace.clone(),
+                },
+            ))
+        })?;
+    let wire = crate::purpose::RecallPurpose {
+        request_id: format!("workbench-simulation-{}", uuid::Uuid::new_v4()),
+        namespace: namespace.clone(),
+        project: memory.project,
+        task_type: body.task_type,
+        intended_action: body.intended_action,
+        action_risk: body.action_risk,
+        require_source_backing: body.require_source_backing,
+        purpose_attestation: None,
+        confirmation_receipt: None,
+    };
+    let now = chrono::Utc::now().timestamp();
+    let verified = match agent {
+        Some(axum::Extension(identity)) => crate::purpose::PurposeVerifier::verify(
+            &crate::purpose::AdvisoryPurposeVerifier,
+            &wire,
+            Some(&identity.agent_id),
+            now,
+        ),
+        None => crate::purpose::local_operator_purpose(&wire, "ironmem:workbench-local", now)
+            .map(|purpose| (purpose, None)),
+    }
+    .map_err(|error| influence_http_error(anyhow::Error::new(error)))?
+    .0;
+    let contexts = db::influence_contexts_for(&state.db, &[id], &namespace)
+        .await
+        .map_err(influence_http_error)?;
+    let context = contexts.get(&id).ok_or_else(|| {
+        influence_http_error(anyhow::anyhow!("memory policy context is unavailable"))
+    })?;
+    let decision = crate::egress::evaluate(
+        context,
+        &verified,
+        crate::egress::ConsumerCapabilities {
+            reasoning_only_channel: body.reasoning_only_channel,
+            exact_source_expansion: body.exact_source_expansion,
+            denial_diagnostics: true,
+        },
+        false,
+        &state.config.influence,
+    );
+    Ok(Json(InfluenceSimulationResponse {
+        simulation_only: true,
+        confirmation_minted: false,
+        decision,
     }))
 }
 
@@ -1499,6 +2226,7 @@ async fn api_list_projects(
 
 async fn api_list_memories(
     State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
     Query(params): Query<MemoriesQuery>,
 ) -> Result<Json<Vec<db::Memory>>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(50);
@@ -1526,7 +2254,30 @@ async fn api_list_memories(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
 
-    Ok(Json(memories))
+    let project = params.project.as_deref().unwrap_or("*");
+    let channel = match &agent {
+        Some(axum::Extension(identity)) => crate::egress::PurposeChannel::Remote {
+            authenticated_agent: Some(identity.agent_id.clone()),
+        },
+        None => crate::egress::PurposeChannel::LocalOperator("ironmem:workbench-local".into()),
+    };
+    let gate = crate::egress::gate_memories(
+        &state.db,
+        memories,
+        &namespace,
+        project,
+        None,
+        channel,
+        crate::egress::ConsumerCapabilities {
+            reasoning_only_channel: false,
+            exact_source_expansion: false,
+            denial_diagnostics: agent.is_none(),
+        },
+        &state.config.influence,
+    )
+    .await
+    .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    Ok(Json(gate.authorized))
 }
 
 async fn api_delete_memory(
@@ -1574,6 +2325,14 @@ async fn api_list_sessions(
 #[cfg(test)]
 mod workbench_tests {
     use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
 
     #[test]
     fn graph_window_options_validate_dates_trim_filters_and_cap_limits() {
@@ -1622,5 +2381,346 @@ mod workbench_tests {
         assert_eq!(json["legal_hold"], true);
         assert!(json.get("record_hash").is_none());
         assert!(json.get("tombstoned_at").is_none());
+    }
+
+    #[tokio::test]
+    async fn influence_rest_requires_capability_and_reports_version_conflicts() {
+        let path = std::env::temp_dir().join(format!(
+            "ironmem-rest-influence-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let path_string = path.to_string_lossy().to_string();
+        let database = db::Database::new(&path_string).await.unwrap();
+        database.migrate().await.unwrap();
+        let session = db::create_session(&database, "/tmp/rest-policy")
+            .await
+            .unwrap();
+        let memory_id = db::insert_memory(
+            &database,
+            "/tmp/rest-policy",
+            &session,
+            "REST policy memory",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut config = Config::default();
+        config.embedding.provider = "none".to_string();
+        config.agent_keys = vec![
+            crate::config::AgentKeyConfig {
+                token: "read-token".to_string(),
+                agent_id: "reader".to_string(),
+                namespaces: vec!["local".to_string()],
+                capabilities: vec![crate::influence::POLICY_READ_CAPABILITY.to_string()],
+            },
+            crate::config::AgentKeyConfig {
+                token: "write-token".to_string(),
+                agent_id: "policy-admin".to_string(),
+                namespaces: vec!["local".to_string()],
+                capabilities: vec![
+                    crate::influence::POLICY_READ_CAPABILITY.to_string(),
+                    crate::influence::POLICY_WRITE_CAPABILITY.to_string(),
+                ],
+            },
+        ];
+        let (embedder, store) = vectorstore::build_semantic(&database, &config).await;
+        let app = router(AppState {
+            db: database,
+            config,
+            embedder,
+            store,
+        });
+        let body = serde_json::json!({
+            "namespace": "local",
+            "expected_version": 1,
+            "reason": "restrict REST policy test",
+            "request_id": "rest-policy-test",
+            "state": "blocked"
+        })
+        .to_string();
+
+        let denied = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri(format!("/memory/{memory_id}/influence"))
+                    .header("authorization", "Bearer read-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response_json(denied).await["error"]["code"],
+            "influence_policy_capability_required"
+        );
+
+        let updated = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri(format!("/memory/{memory_id}/influence"))
+                    .header("authorization", "Bearer write-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        let updated = response_json(updated).await;
+        assert_eq!(updated["policy"]["version"], 2);
+        assert_eq!(updated["policy"]["state"], "blocked");
+        assert_eq!(updated["updated_by"], "agent:policy-admin");
+
+        let conflict = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri(format!("/memory/{memory_id}/influence"))
+                    .header("authorization", "Bearer write-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let conflict = response_json(conflict).await;
+        assert_eq!(conflict["error"]["code"], "policy_version_conflict");
+        assert_eq!(conflict["error"]["current_version"], 2);
+
+        let read = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/memory/{memory_id}/influence?namespace=local"))
+                    .header("authorization", "Bearer read-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+        assert_eq!(response_json(read).await["policy"]["version"], 2);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn blocked_memory_never_crosses_rest_or_workbench_egress() {
+        let path =
+            std::env::temp_dir().join(format!("ironmem-rest-egress-{}.db", uuid::Uuid::new_v4()));
+        let database = db::Database::new(path.to_str().unwrap()).await.unwrap();
+        database.migrate().await.unwrap();
+        let project = "/tmp/rest-egress";
+        let session = db::create_session(&database, project).await.unwrap();
+        let memory_id =
+            db::insert_memory(&database, project, &session, "blocked-content-marker", None)
+                .await
+                .unwrap();
+        crate::influence::update_memory_policy(
+            &database,
+            &crate::influence::PolicyPrincipal::local_operator("test"),
+            memory_id,
+            "local",
+            &crate::influence::PolicyMutationRequest {
+                expected_version: 1,
+                patch: crate::influence::MemoryInfluencePolicyPatch {
+                    state: Some(crate::influence::InfluenceState::Blocked),
+                    ..Default::default()
+                },
+                reason: "egress test".into(),
+                request_id: "egress-policy".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let config = crate::config::Config {
+            db_path: path.to_string_lossy().to_string(),
+            influence: crate::config::InfluenceConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (embedder, store) = vectorstore::build_semantic(&database, &config).await;
+        let app = router(AppState {
+            db: database,
+            config,
+            embedder,
+            store,
+        });
+
+        for uri in [
+            "/context?project=%2Ftmp%2Frest-egress",
+            "/api/memories?project=%2Ftmp%2Frest-egress",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(!response_json(response)
+                .await
+                .to_string()
+                .contains("blocked-content-marker"));
+        }
+        let evidence = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/api/memories/{memory_id}/evidence"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence.status(), StatusCode::FORBIDDEN);
+
+        let evaluated = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/context/evaluate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "project": project,
+                            "purpose": {
+                                "request_id": "rest-eval",
+                                "namespace": "local",
+                                "project": project,
+                                "task_type": "answer",
+                                "action_risk": "none",
+                                "require_source_backing": false
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evaluated.status(), StatusCode::OK);
+        assert!(!response_json(evaluated)
+            .await
+            .to_string()
+            .contains("blocked-content-marker"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn workbench_exposes_evidence_controls_and_simulates_without_mutation() {
+        let path = std::env::temp_dir().join(format!(
+            "ironmem-workbench-simulation-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let database = db::Database::new(path.to_str().unwrap()).await.unwrap();
+        database.migrate().await.unwrap();
+        let project = "/tmp/workbench-simulation";
+        let session = db::create_session(&database, project).await.unwrap();
+        let first = db::insert_memory(&database, project, &session, "oauth", None)
+            .await
+            .unwrap();
+        let second = db::insert_memory(&database, project, &session, "passkey", None)
+            .await
+            .unwrap();
+        crate::contradiction::create(
+            &database,
+            &crate::influence::PolicyPrincipal::local_operator("test"),
+            &crate::contradiction::CreateContradictionRequest {
+                namespace: "local".into(),
+                realm: "project".into(),
+                project: Some(project.into()),
+                claim_key: "project.auth.mode".into(),
+                cardinality: crate::contradiction::ClaimCardinality::Single,
+                members: vec![
+                    crate::contradiction::ContradictionMember {
+                        memory_id: first,
+                        stance: crate::contradiction::MemberStance::Competing,
+                    },
+                    crate::contradiction::ContradictionMember {
+                        memory_id: second,
+                        stance: crate::contradiction::MemberStance::Competing,
+                    },
+                ],
+                reason: "simulation test".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let config = Config {
+            influence: crate::config::InfluenceConfig {
+                enabled: true,
+                contradiction_high_risk_mode:
+                    crate::config::ContradictionHighRiskMode::RequireConfirmation,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (embedder, store) = vectorstore::build_semantic(&database, &config).await;
+        let app = router(AppState {
+            db: database.clone(),
+            config,
+            embedder,
+            store,
+        });
+        let evidence = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/api/memories/{first}/evidence"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence.status(), StatusCode::OK);
+        let evidence = response_json(evidence).await;
+        assert_eq!(evidence["contradiction_sets"].as_array().unwrap().len(), 1);
+        assert_eq!(evidence["influence_policy"]["policy"]["version"], 1);
+        assert_eq!(evidence["independent_root_count"], 1);
+
+        let simulation = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(format!("/api/memories/{first}/influence/simulate"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "task_type": "deploy",
+                            "intended_action": "release",
+                            "action_risk": "high"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(simulation.status(), StatusCode::OK);
+        let simulation = response_json(simulation).await;
+        assert_eq!(simulation["simulation_only"], true);
+        assert_eq!(simulation["confirmation_minted"], false);
+        assert_eq!(
+            simulation["decision"]["decision"],
+            "require_human_confirmation"
+        );
+        let receipts = sqlx::query("SELECT COUNT(*) AS count FROM memory_influence_events")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+        use sqlx::Row;
+        assert_eq!(receipts.get::<i64, _>("count"), 1); // evidence view only; simulation is pure
+        drop(database);
+        let _ = std::fs::remove_file(path);
     }
 }

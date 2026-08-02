@@ -22,10 +22,12 @@ pub enum GovOp {
     GovernedWrite,
     /// Governed delete: the tombstone UPDATE.
     TombstoneWrite,
+    /// Deterministic per-candidate influence policy evaluation.
+    InfluenceEval,
 }
 
 impl GovOp {
-    const COUNT: usize = 5;
+    const COUNT: usize = 6;
 
     fn idx(self) -> usize {
         match self {
@@ -34,6 +36,7 @@ impl GovOp {
             GovOp::NamespaceResolve => 2,
             GovOp::GovernedWrite => 3,
             GovOp::TombstoneWrite => 4,
+            GovOp::InfluenceEval => 5,
         }
     }
 
@@ -44,6 +47,7 @@ impl GovOp {
             2 => "namespace_resolve",
             3 => "governed_write",
             4 => "tombstone_write",
+            5 => "influence_eval",
             _ => "unknown",
         }
     }
@@ -53,6 +57,8 @@ struct OpStat {
     count: AtomicU64,
     total_nanos: AtomicU64,
     max_nanos: AtomicU64,
+    /// Lock-free log2 nanosecond buckets used for bounded percentile telemetry.
+    histogram: [AtomicU64; 64],
 }
 
 impl OpStat {
@@ -61,12 +67,14 @@ impl OpStat {
             count: AtomicU64::new(0),
             total_nanos: AtomicU64::new(0),
             max_nanos: AtomicU64::new(0),
+            histogram: [const { AtomicU64::new(0) }; 64],
         }
     }
 }
 
 // One fixed slot per GovOp — no allocation, no lock, no map lookup on the hot path.
 static STATS: [OpStat; GovOp::COUNT] = [
+    OpStat::new(),
     OpStat::new(),
     OpStat::new(),
     OpStat::new(),
@@ -80,6 +88,12 @@ pub fn record(op: GovOp, dur: Duration) {
     let nanos = dur.as_nanos().min(u64::MAX as u128) as u64;
     s.count.fetch_add(1, Ordering::Relaxed);
     s.total_nanos.fetch_add(nanos, Ordering::Relaxed);
+    let bucket = if nanos == 0 {
+        0
+    } else {
+        (63 - nanos.leading_zeros() as usize).min(63)
+    };
+    s.histogram[bucket].fetch_add(1, Ordering::Relaxed);
     // Monotonic max via CAS loop.
     let mut cur = s.max_nanos.load(Ordering::Relaxed);
     while nanos > cur {
@@ -188,9 +202,30 @@ fn stat_json(s: &OpStat) -> serde_json::Value {
     } else {
         0.0
     };
+    let percentile_us = |percentile: u64| {
+        if count == 0 {
+            return 0.0;
+        }
+        let target = count.saturating_mul(percentile).div_ceil(100);
+        let mut seen = 0_u64;
+        for (index, bucket) in s.histogram.iter().enumerate() {
+            seen = seen.saturating_add(bucket.load(Ordering::Relaxed));
+            if seen >= target {
+                let upper_nanos = if index == 63 {
+                    u64::MAX
+                } else {
+                    (1_u64 << (index + 1)).saturating_sub(1)
+                };
+                return round3(upper_nanos as f64 / 1000.0);
+            }
+        }
+        round3(max as f64 / 1000.0)
+    };
     serde_json::json!({
         "count": count,
         "avg_us": round3(avg_us),
+        "p50_us": percentile_us(50),
+        "p99_us": percentile_us(99),
         "max_us": round3(max as f64 / 1000.0),
     })
 }
@@ -226,6 +261,8 @@ mod tests {
         let tomb = &snap["tombstone_write"];
         assert!(tomb["count"].as_u64().unwrap() >= 2);
         assert!(tomb["max_us"].as_f64().unwrap() >= 30.0);
+        assert!(tomb["p50_us"].as_f64().unwrap() > 0.0);
+        assert!(tomb["p99_us"].as_f64().unwrap() >= tomb["p50_us"].as_f64().unwrap());
     }
 
     #[test]

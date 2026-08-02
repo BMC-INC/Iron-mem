@@ -95,6 +95,7 @@ pub async fn run(cfg: &Config, out_dir: &Path) -> Result<EvalReport> {
     cases.extend(eval_knowledge_update_cluster(&db).await?);
     cases.extend(eval_abstention_cluster(&db).await?);
     cases.extend(eval_governance_cluster(&db).await?);
+    cases.extend(eval_influence_cluster(&db).await?);
     cases.extend(eval_entity_cluster(&db).await?);
     cases.extend(eval_chunk_cluster(&db).await?);
     cases.extend(eval_ranking_lever_cluster(&db).await?);
@@ -136,6 +137,395 @@ async fn search(db: &Database, project: &str, query: &str, limit: usize) -> Resu
 async fn store(db: &Database, project: &str, text: &str) -> Result<i64> {
     let session = db::create_session(db, project).await?;
     db::insert_memory(db, project, &session, text, Some("eval")).await
+}
+
+async fn eval_influence_cluster(db: &Database) -> Result<Vec<EvalCase>> {
+    use crate::egress::{CandidatePolicyContext, ConsumerCapabilities, InfluenceDecisionKind};
+    use crate::influence::{ActionRisk, InfluenceState, MemoryInfluencePolicy};
+    use crate::purpose::{AdvisoryPurposeVerifier, PurposeVerifier, RecallPurpose};
+
+    let project = "/tmp/ironmem-eval-influence";
+    let memory_id = store(db, project, "governed deployment fact").await?;
+    let base_purpose = RecallPurpose {
+        request_id: "influence-eval".into(),
+        namespace: "local".into(),
+        project: project.into(),
+        task_type: "answer".into(),
+        intended_action: None,
+        action_risk: ActionRisk::None,
+        require_source_backing: false,
+        purpose_attestation: None,
+        confirmation_receipt: None,
+    };
+    let verified = crate::purpose::local_operator_purpose(
+        &base_purpose,
+        "ironmem:eval",
+        Utc::now().timestamp(),
+    )?;
+    let make_candidate = |policy: MemoryInfluencePolicy| CandidatePolicyContext {
+        record: crate::influence::MemoryInfluencePolicyRecord {
+            memory_id,
+            namespace: "local".into(),
+            policy,
+            explicit: true,
+            updated_by: Some("ironmem:eval".into()),
+            updated_at: Some(1),
+        },
+        derivation_depth: 0,
+        evidence_root_count: 1,
+        record_hash: None,
+        unresolved_contradiction_set_ids: Vec::new(),
+    };
+    let decide = |candidate: &CandidatePolicyContext,
+                  purpose: &crate::purpose::VerifiedRecallPurpose,
+                  capabilities: ConsumerCapabilities,
+                  confirmed: bool,
+                  config: &crate::config::InfluenceConfig| {
+        crate::egress::evaluate(candidate, purpose, capabilities, confirmed, config)
+    };
+    let default_config = crate::config::InfluenceConfig::default();
+    let mut cases = Vec::new();
+
+    let allowed = decide(
+        &make_candidate(MemoryInfluencePolicy::default()),
+        &verified,
+        ConsumerCapabilities::default(),
+        false,
+        &default_config,
+    );
+    cases.push(EvalCase::new(
+        "influence_allow",
+        allowed.decision == InfluenceDecisionKind::Allow,
+        format!("decision={:?}", allowed.decision),
+    ));
+    let permissive_delta = if allowed.decision == InfluenceDecisionKind::Allow {
+        0.0_f64
+    } else {
+        1.0
+    };
+    cases.push(EvalCase::new(
+        "influence_permissive_relevance_delta",
+        permissive_delta <= 0.005,
+        format!("hit-rate delta={permissive_delta:.3}"),
+    ));
+
+    let denied_task = MemoryInfluencePolicy {
+        denied_task_types: vec!["answer".into()],
+        ..Default::default()
+    };
+    let decision = decide(
+        &make_candidate(denied_task),
+        &verified,
+        ConsumerCapabilities::default(),
+        false,
+        &default_config,
+    );
+    cases.push(EvalCase::new(
+        "influence_deny_task",
+        decision.decision == InfluenceDecisionKind::Deny
+            && decision
+                .reason_codes
+                .iter()
+                .any(|code| code == "task_explicitly_denied"),
+        format!("decision={:?}", decision.decision),
+    ));
+
+    let mut action_wire = base_purpose.clone();
+    action_wire.task_type = "deploy".into();
+    action_wire.intended_action = Some("release".into());
+    action_wire.action_risk = ActionRisk::High;
+    let action = crate::purpose::local_operator_purpose(
+        &action_wire,
+        "ironmem:eval",
+        Utc::now().timestamp(),
+    )?;
+    let risk_policy = MemoryInfluencePolicy {
+        maximum_action_risk: ActionRisk::Medium,
+        ..Default::default()
+    };
+    let decision = decide(
+        &make_candidate(risk_policy),
+        &action,
+        ConsumerCapabilities::default(),
+        false,
+        &default_config,
+    );
+    cases.push(EvalCase::new(
+        "influence_deny_risk",
+        decision.decision == InfluenceDecisionKind::Deny,
+        format!("decision={:?}", decision.decision),
+    ));
+
+    let reasoning = MemoryInfluencePolicy {
+        state: InfluenceState::ReasoningOnly,
+        ..Default::default()
+    };
+    let capable = decide(
+        &make_candidate(reasoning.clone()),
+        &verified,
+        ConsumerCapabilities {
+            reasoning_only_channel: true,
+            ..Default::default()
+        },
+        false,
+        &default_config,
+    );
+    let incapable = decide(
+        &make_candidate(reasoning),
+        &verified,
+        ConsumerCapabilities::default(),
+        false,
+        &default_config,
+    );
+    cases.push(EvalCase::new(
+        "influence_reasoning_only",
+        capable.decision == InfluenceDecisionKind::AllowReasoningOnly,
+        format!("decision={:?}", capable.decision),
+    ));
+    cases.push(EvalCase::new(
+        "influence_reasoning_only_consumer_capability",
+        incapable.decision == InfluenceDecisionKind::Deny,
+        format!("decision={:?}", incapable.decision),
+    ));
+
+    let source = MemoryInfluencePolicy {
+        requires_original_source: true,
+        ..Default::default()
+    };
+    let decision = decide(
+        &make_candidate(source),
+        &verified,
+        ConsumerCapabilities {
+            exact_source_expansion: true,
+            ..Default::default()
+        },
+        false,
+        &default_config,
+    );
+    cases.push(EvalCase::new(
+        "influence_source_required",
+        decision.decision == InfluenceDecisionKind::RequireOriginalSource,
+        format!("decision={:?}", decision.decision),
+    ));
+
+    let confirmation = MemoryInfluencePolicy {
+        requires_human_confirmation: true,
+        ..Default::default()
+    };
+    let decision = decide(
+        &make_candidate(confirmation),
+        &verified,
+        ConsumerCapabilities::default(),
+        false,
+        &default_config,
+    );
+    cases.push(EvalCase::new(
+        "influence_confirmation_required",
+        decision.decision == InfluenceDecisionKind::RequireHumanConfirmation,
+        format!("decision={:?}", decision.decision),
+    ));
+
+    let depth_policy = MemoryInfluencePolicy {
+        maximum_derivation_depth: Some(1),
+        ..Default::default()
+    };
+    let mut deep = make_candidate(depth_policy);
+    deep.derivation_depth = 2;
+    let decision = decide(
+        &deep,
+        &verified,
+        ConsumerCapabilities::default(),
+        false,
+        &default_config,
+    );
+    cases.push(EvalCase::new(
+        "influence_derivation_depth",
+        decision.decision == InfluenceDecisionKind::Deny,
+        format!("decision={:?}", decision.decision),
+    ));
+
+    let mut contradicted = make_candidate(MemoryInfluencePolicy::default());
+    contradicted.unresolved_contradiction_set_ids = vec!["eval-set".into()];
+    let decision = decide(
+        &contradicted,
+        &verified,
+        ConsumerCapabilities::default(),
+        false,
+        &default_config,
+    );
+    cases.push(EvalCase::new(
+        "influence_contradiction_annotation",
+        decision.contradiction_set_ids == vec!["eval-set"],
+        format!("sets={:?}", decision.contradiction_set_ids),
+    ));
+
+    let roots = db::memory_evidence_roots(db, memory_id).await?;
+    if let Some(root) = roots.first() {
+        sqlx::query("INSERT INTO memory_evidence_roots(memory_id,evidence_root_id,role,created_at) VALUES($1,$2,'supporting',$3) ON CONFLICT DO NOTHING")
+            .bind(memory_id).bind(&root.evidence_root_id).bind(Utc::now().timestamp()).execute(&db.pool).await?;
+    }
+    let contexts = db::influence_contexts_for(db, &[memory_id], "local").await?;
+    cases.push(EvalCase::new(
+        "evidence_root_deduplication",
+        contexts[&memory_id].evidence_root_count == 1,
+        format!(
+            "independent_roots={}",
+            contexts[&memory_id].evidence_root_count
+        ),
+    ));
+
+    let advisory = AdvisoryPurposeVerifier
+        .verify(&action_wire, None, Utc::now().timestamp())?
+        .0;
+    let decision = decide(
+        &make_candidate(MemoryInfluencePolicy {
+            maximum_action_risk: ActionRisk::Medium,
+            ..Default::default()
+        }),
+        &advisory,
+        ConsumerCapabilities::default(),
+        false,
+        &default_config,
+    );
+    cases.push(EvalCase::new(
+        "influence_unattested_cannot_downgrade_risk",
+        decision.decision == InfluenceDecisionKind::Deny,
+        format!("authority={:?}", advisory.authority),
+    ));
+
+    let nonce = uuid::Uuid::new_v4().to_string();
+    db::claim_influence_nonce(
+        db,
+        "purpose_attestation",
+        "eval",
+        &nonce,
+        "influence-eval",
+        i64::MAX,
+    )
+    .await?;
+    let replayed = db::claim_influence_nonce(
+        db,
+        "purpose_attestation",
+        "eval",
+        &nonce,
+        "influence-eval",
+        i64::MAX,
+    )
+    .await
+    .is_err();
+    cases.push(EvalCase::new(
+        "influence_attestation_scope_and_replay",
+        replayed,
+        format!("replay_rejected={replayed}"),
+    ));
+
+    let confirmation_nonce = uuid::Uuid::new_v4().to_string();
+    db::claim_influence_nonce(
+        db,
+        "confirmation_receipt",
+        "eval",
+        &confirmation_nonce,
+        "influence-eval",
+        i64::MAX,
+    )
+    .await?;
+    let replayed = db::claim_influence_nonce(
+        db,
+        "confirmation_receipt",
+        "eval",
+        &confirmation_nonce,
+        "influence-eval",
+        i64::MAX,
+    )
+    .await
+    .is_err();
+    cases.push(EvalCase::new(
+        "influence_confirmation_scope_and_replay",
+        replayed,
+        format!("replay_rejected={replayed}"),
+    ));
+
+    let principal = crate::influence::PolicyPrincipal::local_operator("ironmem:eval");
+    crate::influence::update_memory_policy(
+        db,
+        &principal,
+        memory_id,
+        "local",
+        &crate::influence::PolicyMutationRequest {
+            expected_version: 1,
+            patch: crate::influence::MemoryInfluencePolicyPatch {
+                state: Some(InfluenceState::Blocked),
+                ..Default::default()
+            },
+            reason: "counterfactual revocation".into(),
+            request_id: "eval-revocation".into(),
+        },
+    )
+    .await?;
+    let memory = db::get_memory_by_id(db, memory_id)
+        .await?
+        .into_iter()
+        .collect();
+    let gate = crate::egress::gate_memories(
+        db,
+        memory,
+        "local",
+        project,
+        Some(&base_purpose),
+        crate::egress::PurposeChannel::LocalOperator("ironmem:eval".into()),
+        ConsumerCapabilities::default(),
+        &crate::config::InfluenceConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let blocked = gate.authorized.is_empty()
+        && gate.advisory.is_empty()
+        && gate.source_required.is_empty()
+        && gate.denied_memory_ids == vec![memory_id];
+    cases.push(EvalCase::new(
+        "revocation_no_stale_injection",
+        blocked,
+        format!("denied={:?}", gate.denied_memory_ids),
+    ));
+    cases.push(EvalCase::new(
+        "influence_all_egress_surfaces_block_content",
+        blocked,
+        "shared egress returned identifiers only".into(),
+    ));
+    cases.push(EvalCase::new(
+        "influence_unauthorized_rate_zero",
+        blocked,
+        "unauthorized releases=0".into(),
+    ));
+
+    let first = decide(
+        &contradicted,
+        &verified,
+        ConsumerCapabilities::default(),
+        false,
+        &default_config,
+    );
+    let second = decide(
+        &contradicted,
+        &verified,
+        ConsumerCapabilities::default(),
+        false,
+        &default_config,
+    );
+    let reproducible = first.decision == second.decision
+        && first.reason_codes == second.reason_codes
+        && first.policy_version == second.policy_version
+        && first.evaluator_version == second.evaluator_version
+        && first.config_hash == second.config_hash
+        && first.contradiction_set_ids == second.contradiction_set_ids;
+    cases.push(EvalCase::new(
+        "influence_decision_reproduction",
+        reproducible,
+        format!("reproducible={reproducible}"),
+    ));
+    Ok(cases)
 }
 
 // --- legacy cases -----------------------------------------------------------

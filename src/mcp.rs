@@ -22,6 +22,25 @@ fn schema(val: serde_json::Value) -> Arc<JsonObject> {
     Arc::new(val.as_object().expect("schema must be an object").clone())
 }
 
+fn purpose_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Optional purpose envelope. Strict mode requires a trusted opaque attestation.",
+        "properties": {
+            "request_id": { "type": "string" },
+            "namespace": { "type": "string" },
+            "project": { "type": "string" },
+            "task_type": { "type": "string" },
+            "intended_action": { "type": ["string", "null"] },
+            "action_risk": { "type": "string", "enum": ["none", "low", "medium", "high", "critical"] },
+            "require_source_backing": { "type": "boolean" },
+            "purpose_attestation": { "type": ["string", "null"] },
+            "confirmation_receipt": { "type": ["string", "null"] }
+        },
+        "required": ["request_id", "namespace", "project", "task_type", "action_risk"]
+    })
+}
+
 /// A successful tool result whose payload reports a graceful, non-fatal error
 /// (e.g. unknown id / missing blob) — distinct from an MCP protocol error.
 fn error_result(message: impl Into<String>) -> CallToolResult {
@@ -68,9 +87,51 @@ pub struct IronMemServer {
     config: Arc<Config>,
     embedder: Option<Arc<dyn Embedder>>,
     store: Arc<dyn VectorStore>,
+    policy_principal: crate::influence::PolicyPrincipal,
 }
 
 impl IronMemServer {
+    fn purpose_arg(args: &JsonObject) -> Result<Option<crate::purpose::RecallPurpose>, ErrorData> {
+        args.get("purpose")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| ErrorData::invalid_params(format!("invalid purpose: {error}"), None))
+    }
+
+    async fn gate_memories(
+        &self,
+        memories: Vec<db::Memory>,
+        namespace: &str,
+        project: &str,
+        args: &JsonObject,
+        consumer: crate::egress::ConsumerCapabilities,
+    ) -> Result<crate::egress::GateResult, ErrorData> {
+        let purpose = Self::purpose_arg(args)?;
+        let channel = if self.policy_principal.authority == "local_operator" {
+            crate::egress::PurposeChannel::LocalOperator(self.policy_principal.actor.clone())
+        } else {
+            // Shared-token MCP is not per-agent identity. Strict calls must
+            // carry a trusted purpose attestation.
+            crate::egress::PurposeChannel::Remote {
+                authenticated_agent: None,
+            }
+        };
+        crate::egress::gate_memories_with_query(
+            &self.db,
+            memories,
+            namespace,
+            project,
+            purpose.as_ref(),
+            channel,
+            consumer,
+            &self.config.influence,
+            args.get("query").and_then(|value| value.as_str()),
+        )
+        .await
+        .map_err(|error| ErrorData::invalid_params(error.to_string(), None))
+    }
+
     fn build_tool_list() -> Vec<Tool> {
         vec![
             Tool::new(
@@ -130,7 +191,8 @@ impl IronMemServer {
                         "project": { "type": "string", "description": "Project root path" },
                         "limit": { "type": "integer", "description": "Max results (default 5)" },
                         "query": { "type": "string", "description": "Search query (optional)" },
-                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" }
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
+                        "purpose": purpose_schema()
                     },
                     "required": ["project"]
                 })),
@@ -144,7 +206,8 @@ impl IronMemServer {
                         "project": { "type": "string", "description": "Project root path. Omit when global=true." },
                         "limit": { "type": "integer", "description": "Max chunks (default 15)" },
                         "global": { "type": "boolean", "description": "When true, skim across all projects." },
-                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" }
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
+                        "purpose": purpose_schema()
                     }
                 })),
             ),
@@ -165,7 +228,9 @@ impl IronMemServer {
                         "chunk_id": { "type": "string", "description": "Chunk id returned by get_context or memory_skim; expands exact source span when available" },
                         "observation_id": { "type": "integer", "description": "Observation id whose full original output to retrieve" },
                         "memory_id": { "type": "integer", "description": "Memory id whose verbatim pre-LLM session transcript to retrieve" },
-                        "hash": { "type": "string", "description": "Blob content hash (alternative to chunk_id / observation_id / memory_id)" }
+                        "hash": { "type": "string", "description": "Blob content hash (alternative to chunk_id / observation_id / memory_id)" },
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
+                        "purpose": purpose_schema()
                     }
                 })),
             ),
@@ -177,7 +242,8 @@ impl IronMemServer {
                     "properties": {
                         "project": { "type": "string", "description": "Project root path" },
                         "limit": { "type": "integer", "description": "Max results (default 5)" },
-                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" }
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
+                        "purpose": purpose_schema()
                     },
                     "required": ["project"]
                 })),
@@ -192,7 +258,8 @@ impl IronMemServer {
                         "project": { "type": "string", "description": "Project root path" },
                         "limit": { "type": "integer", "description": "Max results (default 10)" },
                         "semantic": { "type": "boolean", "description": "Blend semantic vector search with keyword search (default true). Set false for keyword-only." },
-                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" }
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
+                        "purpose": purpose_schema()
                     },
                     "required": ["query", "project"]
                 })),
@@ -206,7 +273,8 @@ impl IronMemServer {
                         "query": { "type": "string", "description": "Search query" },
                         "limit": { "type": "integer", "description": "Max results (default 10)" },
                         "semantic": { "type": "boolean", "description": "Blend semantic vector search with keyword search (default true). Set false for keyword-only." },
-                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" }
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
+                        "purpose": purpose_schema()
                     },
                     "required": ["query"]
                 })),
@@ -240,7 +308,9 @@ impl IronMemServer {
                     "type": "object",
                     "properties": {
                         "project": { "type": "string", "description": "Project root path" },
-                        "limit": { "type": "integer", "description": "Max memories to inject (default 5)" }
+                        "limit": { "type": "integer", "description": "Max memories to inject (default 5)" },
+                        "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
+                        "purpose": purpose_schema()
                     },
                     "required": ["project"]
                 })),
@@ -270,6 +340,69 @@ impl IronMemServer {
                         "source_ref": { "type": "string", "description": "Optional source event, receipt, URL, or tool id" }
                     },
                     "required": ["project", "text"]
+                })),
+            ),
+            Tool::new(
+                "get_memory_influence",
+                "Read the versioned influence policy for a memory. Requires influence_policy:read on shared HTTP MCP; local stdio is a local-operator channel.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "memory_id": { "type": "integer", "description": "Memory id" },
+                        "namespace": { "type": "string", "description": "Governance namespace (default local)" }
+                    },
+                    "required": ["memory_id"]
+                })),
+            ),
+            Tool::new(
+                "set_memory_influence",
+                "Apply a version-checked influence-policy patch and append an atomic ledger receipt. Requires influence_policy:write on shared HTTP MCP; local stdio is a local-operator channel.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "memory_id": { "type": "integer", "description": "Memory id" },
+                        "namespace": { "type": "string", "description": "Governance namespace (default local)" },
+                        "expected_version": { "type": "integer", "minimum": 1, "description": "Current policy version for optimistic concurrency" },
+                        "reason": { "type": "string", "description": "Required audit reason" },
+                        "request_id": { "type": "string", "description": "Optional caller request id; generated when omitted" },
+                        "state": { "type": "string", "enum": ["eligible", "quarantined", "reasoning_only", "action_restricted", "blocked", "superseded"] },
+                        "allowed_task_types": { "type": "array", "items": { "type": "string" }, "maxItems": 64 },
+                        "denied_task_types": { "type": "array", "items": { "type": "string" }, "maxItems": 64 },
+                        "maximum_action_risk": { "type": "string", "enum": ["none", "low", "medium", "high", "critical"] },
+                        "requires_original_source": { "type": "boolean" },
+                        "requires_human_confirmation": { "type": "boolean" },
+                        "maximum_derivation_depth": { "type": "integer", "minimum": 0 },
+                        "clear_maximum_derivation_depth": { "type": "boolean", "description": "Clear an existing depth limit; mutually exclusive with maximum_derivation_depth" }
+                    },
+                    "required": ["memory_id", "expected_version", "reason"]
+                })),
+            ),
+            Tool::new(
+                "manage_contradiction",
+                "Create, inspect, prefer, or resolve a versioned contradiction set. Mutations require influence_policy:write; reads require influence_policy:read.",
+                schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "operation": { "type": "string", "enum": ["create", "get", "prefer", "resolve", "obsolete"] },
+                        "id": { "type": "string" },
+                        "namespace": { "type": "string", "description": "Governance namespace (default local)" },
+                        "realm": { "type": "string", "enum": ["project", "user"] },
+                        "project": { "type": "string" },
+                        "claim_key": { "type": "string" },
+                        "cardinality": { "type": "string", "enum": ["single", "set", "ordered", "custom"] },
+                        "members": {
+                            "type": "array", "minItems": 2, "maxItems": 32,
+                            "items": { "type": "object", "properties": {
+                                "memory_id": { "type": "integer" },
+                                "stance": { "type": "string", "enum": ["supports", "contradicts", "competing"] }
+                            }, "required": ["memory_id", "stance"] }
+                        },
+                        "reason": { "type": "string" },
+                        "expected_version": { "type": "integer", "minimum": 1 },
+                        "preferred_memory_id": { "type": "integer" },
+                        "basis": { "type": "string" }
+                    },
+                    "required": ["operation"]
                 })),
             ),
             Tool::new(
@@ -457,12 +590,58 @@ impl IronMemServer {
         &self,
         args: &JsonObject,
     ) -> Result<CallToolResult, ErrorData> {
+        let observation_id = args.get("observation_id").and_then(|v| v.as_i64());
+        let memory_id = args.get("memory_id").and_then(|v| v.as_i64());
+        let hash = args.get("hash").and_then(|v| v.as_str());
+        let chunk_id = args.get("chunk_id").and_then(|v| v.as_str());
+        let namespace = namespace_arg(args);
+        let ids = db::memory_ids_for_original_reference(
+            &self.db,
+            observation_id,
+            memory_id,
+            hash,
+            chunk_id,
+        )
+        .await
+        .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        let memories = db::memories_by_ids_in_namespace(&self.db, &ids, &namespace)
+            .await
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        if self.config.influence.enabled && memories.is_empty() {
+            return Ok(error_result(
+                "original_source_not_bound_to_authorized_memory".to_string(),
+            ));
+        }
+        let project = memories
+            .first()
+            .map(|memory| memory.project.clone())
+            .unwrap_or_else(|| "*".to_string());
+        let gate = self
+            .gate_memories(
+                memories,
+                &namespace,
+                &project,
+                args,
+                crate::egress::ConsumerCapabilities {
+                    reasoning_only_channel: true,
+                    exact_source_expansion: true,
+                    denial_diagnostics: false,
+                },
+            )
+            .await?;
+        if self.config.influence.enabled
+            && gate.authorized.is_empty()
+            && gate.advisory.is_empty()
+            && gate.source_required.is_empty()
+        {
+            return Ok(error_result("memory_influence_denied".to_string()));
+        }
         match crate::expansion::retrieve_original(
             &self.db,
-            args.get("observation_id").and_then(|v| v.as_i64()),
-            args.get("memory_id").and_then(|v| v.as_i64()),
-            args.get("hash").and_then(|v| v.as_str()),
-            args.get("chunk_id").and_then(|v| v.as_str()),
+            observation_id,
+            memory_id,
+            hash,
+            chunk_id,
         )
         .await
         {
@@ -470,6 +649,10 @@ impl IronMemServer {
                 let mut json = serde_json::to_value(expanded).unwrap();
                 if let Some(obj) = json.as_object_mut() {
                     obj.insert("ok".to_string(), serde_json::json!(true));
+                    obj.insert(
+                        "influence_decisions".to_string(),
+                        serde_json::to_value(gate.decisions).unwrap_or_default(),
+                    );
                 }
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&json).unwrap(),
@@ -559,6 +742,20 @@ impl IronMemServer {
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
         };
 
+        let gate = self
+            .gate_memories(
+                memories,
+                &namespace,
+                project,
+                args,
+                crate::egress::ConsumerCapabilities {
+                    reasoning_only_channel: true,
+                    exact_source_expansion: false,
+                    denial_diagnostics: self.policy_principal.authority == "local_operator",
+                },
+            )
+            .await?;
+        let memories = gate.authorized;
         let memory_ids: Vec<i64> = memories.iter().map(|m| m.id).collect();
         let chunks = db::chunks_for_memories(&self.db, &memory_ids)
             .await
@@ -576,7 +773,14 @@ impl IronMemServer {
 
         let event_times = self.event_times_map(&memories).await;
         let evidence_chains = self.evidence_chains_json(&memory_ids, &chunks).await;
-        let json = serde_json::json!({ "memories": memories, "expansions": expansions, "event_times": event_times, "evidence_chains": evidence_chains });
+        let json = serde_json::json!({
+            "memories": memories,
+            "advisory_memories": gate.advisory,
+            "influence_decisions": gate.decisions,
+            "expansions": expansions,
+            "event_times": event_times,
+            "evidence_chains": evidence_chains
+        });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -598,13 +802,49 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let mem_ids: Vec<i64> = chunks.iter().map(|c| c.memory_id).collect();
+        let memories = db::memories_by_ids_in_namespace(&self.db, &mem_ids, &namespace)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let gate = self
+            .gate_memories(
+                memories,
+                &namespace,
+                project.unwrap_or("*"),
+                args,
+                crate::egress::ConsumerCapabilities {
+                    reasoning_only_channel: true,
+                    exact_source_expansion: false,
+                    denial_diagnostics: false,
+                },
+            )
+            .await?;
+        let allowed_ids = gate
+            .authorized
+            .iter()
+            .map(|memory| memory.id)
+            .collect::<std::collections::HashSet<_>>();
+        let advisory_ids = gate
+            .advisory
+            .iter()
+            .map(|memory| memory.id)
+            .collect::<std::collections::HashSet<_>>();
+        let authorized_chunks = chunks
+            .iter()
+            .filter(|chunk| allowed_ids.contains(&chunk.memory_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let advisory_chunks = chunks
+            .iter()
+            .filter(|chunk| advisory_ids.contains(&chunk.memory_id))
+            .cloned()
+            .collect::<Vec<_>>();
         let event_times = serde_json::to_value(
             db::event_times_for(&self.db, &mem_ids)
                 .await
                 .unwrap_or_default(),
         )
         .unwrap_or_else(|_| serde_json::json!({}));
-        let json = serde_json::json!({ "chunks": chunks, "event_times": event_times });
+        let json = serde_json::json!({ "chunks": authorized_chunks, "advisory_chunks": advisory_chunks, "influence_decisions": gate.decisions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -624,6 +864,13 @@ impl IronMemServer {
             "memory_chunks": stats.total_memory_chunks,
             "db_path": self.config.db_path,
             "ccr": stats.ccr_json(),
+            "influence": {
+                "enabled": self.config.influence.enabled,
+                "mode": self.config.influence.mode,
+                "require_purpose": self.config.influence.require_purpose,
+                "require_trusted_attestation": self.config.influence.require_trusted_attestation,
+                "events": db::influence_event_status(&self.db).await.unwrap_or_else(|_| serde_json::json!({})),
+            },
         });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
@@ -642,8 +889,21 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let event_times = self.event_times_map(&memories).await;
-        let json = serde_json::json!({ "memories": memories, "event_times": event_times });
+        let gate = self
+            .gate_memories(
+                memories,
+                &namespace,
+                project,
+                args,
+                crate::egress::ConsumerCapabilities {
+                    reasoning_only_channel: true,
+                    exact_source_expansion: false,
+                    denial_diagnostics: false,
+                },
+            )
+            .await?;
+        let event_times = self.event_times_map(&gate.authorized).await;
+        let json = serde_json::json!({ "memories": gate.authorized, "advisory_memories": gate.advisory, "influence_decisions": gate.decisions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -667,8 +927,21 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let event_times = self.event_times_map(&memories).await;
-        let json = serde_json::json!({ "memories": memories, "event_times": event_times });
+        let gate = self
+            .gate_memories(
+                memories,
+                &namespace,
+                project,
+                args,
+                crate::egress::ConsumerCapabilities {
+                    reasoning_only_channel: true,
+                    exact_source_expansion: false,
+                    denial_diagnostics: false,
+                },
+            )
+            .await?;
+        let event_times = self.event_times_map(&gate.authorized).await;
+        let json = serde_json::json!({ "memories": gate.authorized, "advisory_memories": gate.advisory, "influence_decisions": gate.decisions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -688,8 +961,21 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let event_times = self.event_times_map(&memories).await;
-        let json = serde_json::json!({ "memories": memories, "event_times": event_times });
+        let gate = self
+            .gate_memories(
+                memories,
+                &namespace,
+                "*",
+                args,
+                crate::egress::ConsumerCapabilities {
+                    reasoning_only_channel: true,
+                    exact_source_expansion: false,
+                    denial_diagnostics: false,
+                },
+            )
+            .await?;
+        let event_times = self.event_times_map(&gate.authorized).await;
+        let json = serde_json::json!({ "memories": gate.authorized, "advisory_memories": gate.advisory, "influence_decisions": gate.decisions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
@@ -746,6 +1032,21 @@ impl IronMemServer {
         )
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let namespace = namespace_arg(args);
+        let gate = self
+            .gate_memories(
+                memories,
+                &namespace,
+                project,
+                args,
+                crate::egress::ConsumerCapabilities {
+                    reasoning_only_channel: false,
+                    exact_source_expansion: false,
+                    denial_diagnostics: false,
+                },
+            )
+            .await?;
+        let memories = gate.authorized;
 
         hooks::write_ironmem_file(project, &memories)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -755,6 +1056,8 @@ impl IronMemServer {
         let json = serde_json::json!({
             "injected": memories.len(),
             "project": project,
+            "denied_memory_ids": gate.denied_memory_ids,
+            "influence_decisions": gate.decisions,
         });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
@@ -885,6 +1188,130 @@ impl IronMemServer {
         )]))
     }
 
+    async fn handle_get_memory_influence(
+        &self,
+        args: &JsonObject,
+    ) -> Result<CallToolResult, ErrorData> {
+        let memory_id = args
+            .get("memory_id")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| ErrorData::invalid_params("missing 'memory_id'", None))?;
+        let namespace = namespace_arg(args);
+        match crate::influence::get_memory_policy(
+            &self.db,
+            &self.policy_principal,
+            memory_id,
+            &namespace,
+        )
+        .await
+        {
+            Ok(policy) => {
+                let value = serde_json::json!({ "ok": true, "record": policy });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&value).unwrap(),
+                )]))
+            }
+            Err(error) => Ok(policy_tool_error(error)),
+        }
+    }
+
+    async fn handle_set_memory_influence(
+        &self,
+        args: &JsonObject,
+    ) -> Result<CallToolResult, ErrorData> {
+        let memory_id = args
+            .get("memory_id")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| ErrorData::invalid_params("missing 'memory_id'", None))?;
+        let expected_version = args
+            .get("expected_version")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| ErrorData::invalid_params("missing 'expected_version'", None))?;
+        let reason = args
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| ErrorData::invalid_params("missing 'reason'", None))?;
+        let state = args
+            .get("state")
+            .and_then(|value| value.as_str())
+            .map(str::parse)
+            .transpose()
+            .map_err(|error: crate::influence::PolicyError| {
+                ErrorData::invalid_params(error.to_string(), None)
+            })?;
+        let maximum_action_risk = args
+            .get("maximum_action_risk")
+            .and_then(|value| value.as_str())
+            .map(str::parse)
+            .transpose()
+            .map_err(|error: crate::influence::PolicyError| {
+                ErrorData::invalid_params(error.to_string(), None)
+            })?;
+        let maximum_derivation_depth = args
+            .get("maximum_derivation_depth")
+            .and_then(|value| value.as_u64())
+            .map(|value| {
+                u32::try_from(value).map_err(|_| {
+                    ErrorData::invalid_params("'maximum_derivation_depth' exceeds u32 range", None)
+                })
+            })
+            .transpose()?;
+        let clear_depth = args
+            .get("clear_maximum_derivation_depth")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if clear_depth && maximum_derivation_depth.is_some() {
+            return Err(ErrorData::invalid_params(
+                "'maximum_derivation_depth' and 'clear_maximum_derivation_depth' are mutually exclusive",
+                None,
+            ));
+        }
+        let namespace = namespace_arg(args);
+        let request = crate::influence::PolicyMutationRequest {
+            expected_version,
+            patch: crate::influence::MemoryInfluencePolicyPatch {
+                state,
+                allowed_task_types: string_array_arg(args, "allowed_task_types")?,
+                denied_task_types: string_array_arg(args, "denied_task_types")?,
+                maximum_action_risk,
+                requires_original_source: args
+                    .get("requires_original_source")
+                    .and_then(|value| value.as_bool()),
+                requires_human_confirmation: args
+                    .get("requires_human_confirmation")
+                    .and_then(|value| value.as_bool()),
+                maximum_derivation_depth: if clear_depth {
+                    Some(None)
+                } else {
+                    maximum_derivation_depth.map(Some)
+                },
+            },
+            reason: reason.to_string(),
+            request_id: args
+                .get("request_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("mcp-policy-{}", uuid::Uuid::new_v4())),
+        };
+        match crate::influence::update_memory_policy(
+            &self.db,
+            &self.policy_principal,
+            memory_id,
+            &namespace,
+            &request,
+        )
+        .await
+        {
+            Ok(policy) => {
+                let value = serde_json::json!({ "ok": true, "record": policy });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&value).unwrap(),
+                )]))
+            }
+            Err(error) => Ok(policy_tool_error(error)),
+        }
+    }
+
     async fn handle_get_profile(&self) -> Result<CallToolResult, ErrorData> {
         let profile = db::get_profile_memory(&self.db)
             .await
@@ -995,6 +1422,105 @@ impl IronMemServer {
         let json = serde_json::json!({ "ok": true, "report": report });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
+        )]))
+    }
+
+    async fn handle_manage_contradiction(
+        &self,
+        args: &JsonObject,
+    ) -> Result<CallToolResult, ErrorData> {
+        let operation = args
+            .get("operation")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| ErrorData::invalid_params("missing 'operation'", None))?;
+        let namespace = namespace_arg(args);
+        let result = match operation {
+            "create" => {
+                let request = crate::contradiction::CreateContradictionRequest {
+                    namespace: namespace.clone(),
+                    realm: args
+                        .get("realm")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("project")
+                        .to_string(),
+                    project: args
+                        .get("project")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string),
+                    claim_key: args
+                        .get("claim_key")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| ErrorData::invalid_params("missing 'claim_key'", None))?
+                        .to_string(),
+                    cardinality: args
+                        .get("cardinality")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("single")
+                        .parse()
+                        .map_err(|error: anyhow::Error| {
+                            ErrorData::invalid_params(error.to_string(), None)
+                        })?,
+                    members: serde_json::from_value(
+                        args.get("members")
+                            .cloned()
+                            .ok_or_else(|| ErrorData::invalid_params("missing 'members'", None))?,
+                    )
+                    .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?,
+                    reason: args
+                        .get("reason")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| ErrorData::invalid_params("missing 'reason'", None))?
+                        .to_string(),
+                };
+                crate::contradiction::create(&self.db, &self.policy_principal, &request).await
+            }
+            "get" => {
+                let id = args
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| ErrorData::invalid_params("missing 'id'", None))?;
+                crate::contradiction::get(&self.db, &self.policy_principal, id, &namespace).await
+            }
+            "prefer" | "resolve" | "obsolete" => {
+                let id = args
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| ErrorData::invalid_params("missing 'id'", None))?;
+                let request = crate::contradiction::UpdateContradictionRequest {
+                    expected_version: args
+                        .get("expected_version")
+                        .and_then(|value| value.as_u64())
+                        .ok_or_else(|| {
+                            ErrorData::invalid_params("missing 'expected_version'", None)
+                        })?,
+                    status: match operation {
+                        "prefer" => crate::contradiction::ContradictionStatus::Preferred,
+                        "resolve" => crate::contradiction::ContradictionStatus::Resolved,
+                        _ => crate::contradiction::ContradictionStatus::Obsolete,
+                    },
+                    preferred_memory_id: args
+                        .get("preferred_memory_id")
+                        .and_then(|value| value.as_i64()),
+                    basis: args
+                        .get("basis")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| ErrorData::invalid_params("missing 'basis'", None))?
+                        .to_string(),
+                };
+                crate::contradiction::update(
+                    &self.db,
+                    &self.policy_principal,
+                    id,
+                    &namespace,
+                    &request,
+                )
+                .await
+            }
+            _ => return Err(ErrorData::invalid_params("unknown operation", None)),
+        }
+        .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
         )]))
     }
 
@@ -1140,6 +1666,51 @@ fn namespace_arg(args: &JsonObject) -> String {
     )
 }
 
+fn policy_tool_error(error: anyhow::Error) -> CallToolResult {
+    let value = if let Some(policy_error) = crate::influence::policy_error(&error) {
+        serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": policy_error.code(),
+                "message": policy_error.to_string(),
+                "current_version": policy_error.current_version(),
+            }
+        })
+    } else {
+        serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "influence_policy_storage_error",
+                "message": error.to_string(),
+            }
+        })
+    };
+    CallToolResult::error(vec![Content::text(
+        serde_json::to_string_pretty(&value).unwrap(),
+    )])
+}
+
+fn string_array_arg(
+    args: &JsonObject,
+    field: &str,
+) -> std::result::Result<Option<Vec<String>>, ErrorData> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| ErrorData::invalid_params(format!("'{field}' must be an array"), None))?;
+    values
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                ErrorData::invalid_params(format!("every '{field}' entry must be a string"), None)
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map(Some)
+}
+
 impl ServerHandler for IronMemServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -1176,6 +1747,9 @@ impl ServerHandler for IronMemServer {
             "list_sessions" => self.handle_list_sessions(&args).await,
             "inject_context" => self.handle_inject_context(&args).await,
             "remember" => self.handle_remember(&args).await,
+            "get_memory_influence" => self.handle_get_memory_influence(&args).await,
+            "set_memory_influence" => self.handle_set_memory_influence(&args).await,
+            "manage_contradiction" => self.handle_manage_contradiction(&args).await,
             "get_profile" => self.handle_get_profile().await,
             "refresh_profile" => self.handle_refresh_profile().await,
             "list_corrections" => self.handle_list_corrections(&args).await,
@@ -1198,6 +1772,7 @@ pub async fn run_stdio(db: Arc<Database>, config: Config) -> Result<()> {
         config: Arc::new(config),
         embedder,
         store,
+        policy_principal: crate::influence::PolicyPrincipal::local_operator("ironmem:mcp:stdio"),
     };
 
     let service = server.serve(rmcp::transport::stdio()).await?;
@@ -1211,11 +1786,18 @@ pub async fn run_streamable_http(
     bind: SocketAddr,
 ) -> Result<()> {
     let (embedder, store) = vectorstore::build_semantic(&db, &config).await;
+    let policy_principal = crate::influence::PolicyPrincipal::configured(
+        "ironmem:mcp:http",
+        "shared_mcp",
+        config.mcp_namespaces.clone(),
+        config.mcp_capabilities.clone(),
+    );
     let server = IronMemServer {
         db,
         config: Arc::new(config),
         embedder,
         store,
+        policy_principal,
     };
     let auth_token = server.config.auth_token.clone();
 
@@ -1342,6 +1924,9 @@ mod tests {
                 config,
                 embedder,
                 store,
+                policy_principal: crate::influence::PolicyPrincipal::local_operator(
+                    "ironmem:mcp:test",
+                ),
             },
             db_path_string,
         )
@@ -1396,6 +1981,228 @@ mod tests {
         let props = &v["inputSchema"]["properties"];
         assert!(props.get("dry_run").is_some(), "schema has dry_run");
         assert!(props.get("apply").is_some(), "schema has apply");
+    }
+
+    #[test]
+    fn tool_list_includes_influence_policy_crud() {
+        let tools = IronMemServer::build_tool_list();
+        let get_policy = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "get_memory_influence")
+            .expect("get_memory_influence tool registered");
+        let set_policy = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "set_memory_influence")
+            .expect("set_memory_influence tool registered");
+        let contradiction = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "manage_contradiction")
+            .expect("manage_contradiction tool registered");
+        let get_schema = serde_json::to_value(get_policy).unwrap();
+        let set_schema = serde_json::to_value(set_policy).unwrap();
+        let contradiction_schema = serde_json::to_value(contradiction).unwrap();
+        assert!(get_schema["inputSchema"]["properties"]["memory_id"].is_object());
+        assert!(set_schema["inputSchema"]["properties"]["expected_version"].is_object());
+        assert!(set_schema["inputSchema"]["properties"]["reason"].is_object());
+        assert!(contradiction_schema["inputSchema"]["properties"]["operation"].is_object());
+    }
+
+    #[tokio::test]
+    async fn influence_policy_tools_share_versioned_capability_checked_handlers() {
+        let (server, path) = test_server().await;
+        let session = db::create_session(&server.db, "/tmp/mcp-policy")
+            .await
+            .unwrap();
+        let memory_id = db::insert_memory(
+            &server.db,
+            "/tmp/mcp-policy",
+            &session,
+            "MCP policy memory",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut get_args = JsonObject::new();
+        get_args.insert("memory_id".into(), serde_json::json!(memory_id));
+        get_args.insert("namespace".into(), serde_json::json!("local"));
+        let initial: serde_json::Value = serde_json::from_str(&result_text(
+            &server.handle_get_memory_influence(&get_args).await.unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(initial["ok"], true);
+        assert_eq!(initial["record"]["policy"]["version"], 1);
+        assert_eq!(initial["record"]["explicit"], false);
+
+        let mut set_args = JsonObject::new();
+        set_args.insert("memory_id".into(), serde_json::json!(memory_id));
+        set_args.insert("namespace".into(), serde_json::json!("local"));
+        set_args.insert("expected_version".into(), serde_json::json!(1));
+        set_args.insert("reason".into(), serde_json::json!("MCP policy test"));
+        set_args.insert("request_id".into(), serde_json::json!("mcp-policy-test"));
+        set_args.insert("state".into(), serde_json::json!("reasoning_only"));
+        set_args.insert(
+            "allowed_task_types".into(),
+            serde_json::json!(["Code Review"]),
+        );
+        let updated: serde_json::Value = serde_json::from_str(&result_text(
+            &server.handle_set_memory_influence(&set_args).await.unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(updated["ok"], true);
+        assert_eq!(updated["record"]["policy"]["version"], 2);
+        assert_eq!(
+            updated["record"]["policy"]["allowed_task_types"][0],
+            "code_review"
+        );
+
+        let stale_result = server.handle_set_memory_influence(&set_args).await.unwrap();
+        assert_eq!(stale_result.is_error, Some(true));
+        let stale: serde_json::Value = serde_json::from_str(&result_text(&stale_result)).unwrap();
+        assert_eq!(stale["ok"], false);
+        assert_eq!(stale["error"]["code"], "policy_version_conflict");
+        assert_eq!(stale["error"]["current_version"], 2);
+
+        let mut shared_http = server.clone();
+        shared_http.policy_principal = crate::influence::PolicyPrincipal::configured(
+            "ironmem:mcp:http",
+            "shared_mcp",
+            vec!["local".to_string()],
+            Vec::new(),
+        );
+        let denied_result = shared_http
+            .handle_get_memory_influence(&get_args)
+            .await
+            .unwrap();
+        assert_eq!(denied_result.is_error, Some(true));
+        let denied: serde_json::Value = serde_json::from_str(&result_text(&denied_result)).unwrap();
+        assert_eq!(denied["ok"], false);
+        assert_eq!(
+            denied["error"]["code"],
+            "influence_policy_capability_required"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn manage_contradiction_uses_one_versioned_handler_for_create_get_and_prefer() {
+        let (server, path) = test_server().await;
+        let project = "/tmp/mcp-contradiction";
+        let session = db::create_session(&server.db, project).await.unwrap();
+        let first = db::insert_memory(&server.db, project, &session, "oauth", None)
+            .await
+            .unwrap();
+        let second = db::insert_memory(&server.db, project, &session, "passkey", None)
+            .await
+            .unwrap();
+        let mut create_args = JsonObject::new();
+        create_args.insert("operation".into(), serde_json::json!("create"));
+        create_args.insert("namespace".into(), serde_json::json!("local"));
+        create_args.insert("realm".into(), serde_json::json!("project"));
+        create_args.insert("project".into(), serde_json::json!(project));
+        create_args.insert("claim_key".into(), serde_json::json!("project.auth.mode"));
+        create_args.insert("cardinality".into(), serde_json::json!("single"));
+        create_args.insert("reason".into(), serde_json::json!("MCP contradiction test"));
+        create_args.insert(
+            "members".into(),
+            serde_json::json!([
+                {"memory_id": first, "stance": "competing"},
+                {"memory_id": second, "stance": "competing"}
+            ]),
+        );
+        let created: serde_json::Value = serde_json::from_str(&result_text(
+            &server
+                .handle_manage_contradiction(&create_args)
+                .await
+                .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(created["members"].as_array().unwrap().len(), 2);
+        let id = created["id"].as_str().unwrap();
+
+        let mut prefer_args = JsonObject::new();
+        prefer_args.insert("operation".into(), serde_json::json!("prefer"));
+        prefer_args.insert("id".into(), serde_json::json!(id));
+        prefer_args.insert("namespace".into(), serde_json::json!("local"));
+        prefer_args.insert("expected_version".into(), serde_json::json!(1));
+        prefer_args.insert("preferred_memory_id".into(), serde_json::json!(second));
+        prefer_args.insert("basis".into(), serde_json::json!("passing runtime"));
+        let preferred: serde_json::Value = serde_json::from_str(&result_text(
+            &server
+                .handle_manage_contradiction(&prefer_args)
+                .await
+                .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(preferred["status"], "preferred");
+        assert_eq!(preferred["version"], 2);
+        assert_eq!(preferred["members"].as_array().unwrap().len(), 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn blocked_memory_never_crosses_mcp_context_search_source_or_file_egress() {
+        let (mut server, path) = test_server().await;
+        Arc::make_mut(&mut server.config).influence.enabled = true;
+        let project_dir =
+            std::env::temp_dir().join(format!("ironmem-mcp-egress-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project = project_dir.to_string_lossy().to_string();
+        let session = db::create_session(&server.db, &project).await.unwrap();
+        let memory_id = db::insert_memory(
+            &server.db,
+            &project,
+            &session,
+            "mcp-blocked-content-marker",
+            None,
+        )
+        .await
+        .unwrap();
+        crate::influence::update_memory_policy(
+            &server.db,
+            &crate::influence::PolicyPrincipal::local_operator("test"),
+            memory_id,
+            "local",
+            &crate::influence::PolicyMutationRequest {
+                expected_version: 1,
+                patch: crate::influence::MemoryInfluencePolicyPatch {
+                    state: Some(crate::influence::InfluenceState::Blocked),
+                    ..Default::default()
+                },
+                reason: "egress test".into(),
+                request_id: "mcp-egress-policy".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut context_args = JsonObject::new();
+        context_args.insert("project".into(), serde_json::json!(project));
+        let context = server.handle_get_context(&context_args).await.unwrap();
+        assert!(!result_text(&context).contains("mcp-blocked-content-marker"));
+
+        let mut search_args = context_args.clone();
+        search_args.insert(
+            "query".into(),
+            serde_json::json!("mcp-blocked-content-marker"),
+        );
+        let search = server.handle_search_memories(&search_args).await.unwrap();
+        assert!(!result_text(&search).contains("mcp-blocked-content-marker"));
+
+        let mut source_args = JsonObject::new();
+        source_args.insert("memory_id".into(), serde_json::json!(memory_id));
+        let source = server.handle_retrieve_original(&source_args).await.unwrap();
+        assert!(!result_text(&source).contains("mcp-blocked-content-marker"));
+
+        let injected = server.handle_inject_context(&context_args).await.unwrap();
+        assert!(!result_text(&injected).contains("mcp-blocked-content-marker"));
+        if let Ok(file) = std::fs::read_to_string(project_dir.join("IRONMEM.md")) {
+            assert!(!file.contains("mcp-blocked-content-marker"));
+        }
+
+        let _ = std::fs::remove_dir_all(project_dir);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -1569,6 +2376,7 @@ mod tests {
             config,
             embedder,
             store,
+            policy_principal: crate::influence::PolicyPrincipal::local_operator("ironmem:mcp:test"),
         };
 
         // No profile yet.

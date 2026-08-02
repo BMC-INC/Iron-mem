@@ -3,12 +3,17 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::governance::{
-    classification_str, consent_state_str, ledger_entry_hash, memory_record_hash,
-    normalize_namespace, source_type_str, trust_tier_str, MemoryGovernance, DEFAULT_NAMESPACE,
+    classification_str, consent_state_str, evidence_root_id, ledger_entry_hash, memory_record_hash,
+    new_evidence_root_id, normalize_namespace, sha256_hex, source_type_str, trust_tier_str,
+    MemoryGovernance, DEFAULT_NAMESPACE,
+};
+use crate::influence::{
+    MemoryInfluencePolicy, MemoryInfluencePolicyRecord, PolicyError, PolicyMutationRequest,
+    PolicyPrincipal, StoredInfluencePolicy,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -293,6 +298,41 @@ pub struct SyncEvent {
     pub applied_at: Option<i64>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct MemoryEvidenceRoot {
+    pub evidence_root_id: String,
+    pub role: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct EvidenceRootMigrationReport {
+    pub version: u32,
+    pub meta_rows_created: usize,
+    pub roots_backfilled: usize,
+    pub inherited_roots: usize,
+    pub new_roots: usize,
+    pub broken_parent_memory_ids: Vec<i64>,
+    pub cycle_memory_ids: Vec<i64>,
+    pub last_memory_id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct EvidenceInventory {
+    pub memories: i64,
+    pub independent_roots: i64,
+    pub direct_memories: i64,
+    pub derived_memories: i64,
+    pub maximum_derivation_depth: i64,
+    pub missing_roots: i64,
+}
+
+const EVIDENCE_ROOT_MIGRATION_ID: &str = "2026-08-01-evidence-roots-v1";
+const EVIDENCE_ROOT_MIGRATION_VERSION: u32 = 1;
+const EVIDENCE_ROOT_BACKFILL_BATCH: i64 = 256;
+const INFLUENCE_POLICY_MIGRATION_ID: &str = "2026-08-02-influence-policy-v1";
+const INFLUENCE_POLICY_MIGRATION_VERSION: u32 = 1;
+
 async fn add_memory_meta_column(db: &Database, column_sql: &str) -> Result<()> {
     match db.backend {
         Backend::Sqlite => {
@@ -308,6 +348,541 @@ async fn add_memory_meta_column(db: &Database, column_sql: &str) -> Result<()> {
             .await?;
         }
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct EvidenceMetaRow {
+    memory_id: i64,
+    namespace: String,
+    source_type: String,
+    source_ref: Option<String>,
+    parent_memory_id: Option<i64>,
+    record_hash: Option<String>,
+    evidence_root_id: Option<String>,
+    derivation_depth: i64,
+}
+
+fn root_for_meta(row: &EvidenceMetaRow) -> String {
+    // Legacy rows can predate record_hash. The memory id is then the durable,
+    // backend-independent source reference; its hash is only a compatibility
+    // fallback for already-stored records, never the normal write path.
+    let legacy_ref = format!("legacy-memory:{}", row.memory_id);
+    let source_ref = row.source_ref.as_deref().unwrap_or(&legacy_ref);
+    let legacy_hash = sha256_hex(format!("ironmem:legacy-record:{}", row.memory_id).as_bytes());
+    evidence_root_id(
+        &row.namespace,
+        &row.source_type,
+        Some(source_ref),
+        row.record_hash.as_deref().unwrap_or(&legacy_hash),
+    )
+}
+
+async fn load_evidence_meta(db: &Database, memory_id: i64) -> Result<Option<EvidenceMetaRow>> {
+    let row = sqlx::query(
+        "SELECT memory_id, namespace, source_type, source_ref, parent_memory_id, record_hash,
+                evidence_root_id, derivation_depth
+         FROM memory_meta WHERE memory_id = $1",
+    )
+    .bind(memory_id)
+    .fetch_optional(&db.pool)
+    .await?;
+    Ok(row.map(|row| EvidenceMetaRow {
+        memory_id: row.get("memory_id"),
+        namespace: row
+            .try_get::<Option<String>, _>("namespace")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| DEFAULT_NAMESPACE.to_string()),
+        source_type: row
+            .try_get::<Option<String>, _>("source_type")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "derived".to_string()),
+        source_ref: row
+            .try_get::<Option<String>, _>("source_ref")
+            .ok()
+            .flatten(),
+        parent_memory_id: row
+            .try_get::<Option<i64>, _>("parent_memory_id")
+            .ok()
+            .flatten(),
+        record_hash: row
+            .try_get::<Option<String>, _>("record_hash")
+            .ok()
+            .flatten(),
+        evidence_root_id: row
+            .try_get::<Option<String>, _>("evidence_root_id")
+            .ok()
+            .flatten()
+            .filter(|root| !root.is_empty()),
+        derivation_depth: row.try_get::<i64, _>("derivation_depth").unwrap_or(0),
+    }))
+}
+
+async fn persist_primary_evidence_root(
+    db: &Database,
+    memory_id: i64,
+    evidence_root: &str,
+    derivation_depth: i64,
+    created_at: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE memory_meta
+         SET evidence_root_id = $1, derivation_depth = $2
+         WHERE memory_id = $3",
+    )
+    .bind(evidence_root)
+    .bind(derivation_depth)
+    .bind(memory_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id = $1 AND role = 'primary'")
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO memory_evidence_roots(memory_id, evidence_root_id, role, created_at)
+         VALUES($1, $2, 'primary', $3)
+         ON CONFLICT(memory_id, evidence_root_id) DO UPDATE SET role = 'primary'",
+    )
+    .bind(memory_id)
+    .bind(evidence_root)
+    .bind(created_at)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+async fn resolve_missing_evidence_root(
+    db: &Database,
+    start_memory_id: i64,
+    report: &mut EvidenceRootMigrationReport,
+) -> Result<bool> {
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor = start_memory_id;
+
+    let (root, mut depth) = loop {
+        if !seen.insert(cursor) {
+            let mut cycle: Vec<i64> = chain
+                .iter()
+                .map(|row: &EvidenceMetaRow| row.memory_id)
+                .skip_while(|id| *id != cursor)
+                .collect();
+            if cycle.is_empty() {
+                cycle.push(cursor);
+            }
+            cycle.sort_unstable();
+            cycle.dedup();
+            report.cycle_memory_ids = cycle;
+            return Ok(false);
+        }
+
+        let Some(row) = load_evidence_meta(db, cursor).await? else {
+            let Some(anchor) = chain.pop() else {
+                anyhow::bail!("memory_meta row disappeared during evidence backfill: {cursor}");
+            };
+            report.broken_parent_memory_ids.push(anchor.memory_id);
+            let root = root_for_meta(&anchor);
+            persist_primary_evidence_root(db, anchor.memory_id, &root, 0, Utc::now().timestamp())
+                .await?;
+            report.roots_backfilled += 1;
+            report.new_roots += 1;
+            break (root, 0_i64);
+        };
+
+        if let Some(root) = &row.evidence_root_id {
+            // Older partial migrations may have populated memory_meta without
+            // adding the normalized primary-root row. Repair that idempotently.
+            persist_primary_evidence_root(
+                db,
+                row.memory_id,
+                root,
+                row.derivation_depth,
+                Utc::now().timestamp(),
+            )
+            .await?;
+            break (root.clone(), row.derivation_depth);
+        }
+
+        let parent = row.parent_memory_id;
+        chain.push(row);
+        match parent {
+            Some(parent) => cursor = parent,
+            None => {
+                let anchor = chain.pop().expect("the just-pushed row is present");
+                let root = root_for_meta(&anchor);
+                persist_primary_evidence_root(
+                    db,
+                    anchor.memory_id,
+                    &root,
+                    0,
+                    Utc::now().timestamp(),
+                )
+                .await?;
+                report.roots_backfilled += 1;
+                report.new_roots += 1;
+                break (root, 0_i64);
+            }
+        }
+    };
+
+    while let Some(row) = chain.pop() {
+        depth = depth.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("derivation depth overflow at memory {}", row.memory_id)
+        })?;
+        persist_primary_evidence_root(db, row.memory_id, &root, depth, Utc::now().timestamp())
+            .await?;
+        report.roots_backfilled += 1;
+        report.inherited_roots += 1;
+    }
+    Ok(true)
+}
+
+async fn evidence_backfill_from_cursor(
+    db: &Database,
+    mut cursor: i64,
+    report: &mut EvidenceRootMigrationReport,
+    persist_progress: bool,
+) -> Result<()> {
+    loop {
+        let rows = sqlx::query(
+            "SELECT memory_id FROM memory_meta
+             WHERE memory_id > $1 AND (evidence_root_id IS NULL OR evidence_root_id = '')
+             ORDER BY memory_id ASC LIMIT $2",
+        )
+        .bind(cursor)
+        .bind(EVIDENCE_ROOT_BACKFILL_BATCH)
+        .fetch_all(&db.pool)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        let ids: Vec<i64> = rows.into_iter().map(|row| row.get("memory_id")).collect();
+        for memory_id in &ids {
+            if !resolve_missing_evidence_root(db, *memory_id, report).await? {
+                return Ok(());
+            }
+        }
+        cursor = *ids.last().expect("non-empty evidence migration batch");
+        report.last_memory_id = cursor;
+        report.broken_parent_memory_ids.sort_unstable();
+        report.broken_parent_memory_ids.dedup();
+        if persist_progress {
+            store_evidence_migration_state(db, "running", report).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn store_evidence_migration_state(
+    db: &Database,
+    status: &str,
+    report: &EvidenceRootMigrationReport,
+) -> Result<()> {
+    let now = Utc::now().timestamp();
+    let encoded = serde_json::to_string(report)?;
+    sqlx::query(
+        "INSERT INTO schema_migrations(migration_id, version, status, cursor, report, updated_at)
+         VALUES($1, $2, $3, $4, $5, $6)
+         ON CONFLICT(migration_id) DO UPDATE SET
+            version = excluded.version,
+            status = excluded.status,
+            cursor = excluded.cursor,
+            report = excluded.report,
+            updated_at = excluded.updated_at",
+    )
+    .bind(EVIDENCE_ROOT_MIGRATION_ID)
+    .bind(EVIDENCE_ROOT_MIGRATION_VERSION as i64)
+    .bind(status)
+    .bind(report.last_memory_id)
+    .bind(encoded)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+async fn migrate_evidence_roots(db: &Database) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            migration_id TEXT PRIMARY KEY,
+            version BIGINT NOT NULL,
+            status TEXT NOT NULL,
+            cursor BIGINT NOT NULL DEFAULT 0,
+            report TEXT NOT NULL,
+            updated_at BIGINT NOT NULL
+        )",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    // The side tables use memory_meta as their relational parent on both
+    // backends. Repair legacy databases before creating those foreign keys.
+    let inserted = match db.backend {
+        Backend::Sqlite => {
+            sqlx::query(
+                "INSERT INTO memory_meta(memory_id, importance, created_at)
+             SELECT m.rowid, 0.5, CAST(m.created_at AS INTEGER) FROM memories m
+             WHERE NOT EXISTS (
+                SELECT 1 FROM memory_meta mm WHERE mm.memory_id = m.rowid
+             )",
+            )
+            .execute(&db.pool)
+            .await?
+        }
+        Backend::Postgres => {
+            sqlx::query(
+                "INSERT INTO memory_meta(memory_id, importance, created_at)
+             SELECT m.id, 0.5, m.created_at FROM memories m
+             WHERE NOT EXISTS (
+                SELECT 1 FROM memory_meta mm WHERE mm.memory_id = m.id
+             )",
+            )
+            .execute(&db.pool)
+            .await?
+        }
+    };
+
+    add_memory_meta_column(db, "evidence_root_id TEXT").await?;
+    add_memory_meta_column(db, "derivation_depth BIGINT NOT NULL DEFAULT 0").await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_evidence_roots (
+            memory_id BIGINT NOT NULL,
+            evidence_root_id TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'supporting',
+            created_at BIGINT NOT NULL,
+            PRIMARY KEY(memory_id, evidence_root_id),
+            FOREIGN KEY(memory_id) REFERENCES memory_meta(memory_id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_meta_evidence_root
+         ON memory_meta(namespace, evidence_root_id)",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_evidence_roots_root
+         ON memory_evidence_roots(evidence_root_id, memory_id)",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO memory_evidence_roots(memory_id, evidence_root_id, role, created_at)
+         SELECT mm.memory_id, mm.evidence_root_id, 'primary', mm.created_at
+         FROM memory_meta mm
+         WHERE mm.evidence_root_id IS NOT NULL AND mm.evidence_root_id <> ''
+           AND NOT EXISTS (
+                SELECT 1 FROM memory_evidence_roots mer
+                WHERE mer.memory_id = mm.memory_id
+                  AND mer.evidence_root_id = mm.evidence_root_id
+           )
+         ON CONFLICT(memory_id, evidence_root_id) DO NOTHING",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let prior = sqlx::query("SELECT status, report FROM schema_migrations WHERE migration_id = $1")
+        .bind(EVIDENCE_ROOT_MIGRATION_ID)
+        .fetch_optional(&db.pool)
+        .await?;
+    let prior_status = prior.as_ref().map(|row| row.get::<String, _>("status"));
+    if prior_status.as_deref() == Some("complete") {
+        let missing: i64 = sqlx::query(
+            "SELECT COUNT(*) AS count FROM memory_meta
+             WHERE evidence_root_id IS NULL OR evidence_root_id = ''",
+        )
+        .fetch_one(&db.pool)
+        .await?
+        .get("count");
+        if missing == 0 {
+            return Ok(());
+        }
+    }
+
+    let mut report = prior
+        .as_ref()
+        .filter(|row| {
+            matches!(
+                row.get::<String, _>("status").as_str(),
+                "running" | "complete"
+            )
+        })
+        .and_then(|row| row.try_get::<String, _>("report").ok())
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_else(|| EvidenceRootMigrationReport {
+            version: EVIDENCE_ROOT_MIGRATION_VERSION,
+            ..Default::default()
+        });
+    if prior_status.as_deref() == Some("complete") {
+        // A completed database can still receive a legacy/direct SQL row. Scan
+        // from the beginning so an explicitly assigned lower id is repaired.
+        report.last_memory_id = 0;
+    }
+    report.meta_rows_created += inserted.rows_affected() as usize;
+    report.cycle_memory_ids.clear();
+    store_evidence_migration_state(db, "running", &report).await?;
+    evidence_backfill_from_cursor(db, report.last_memory_id, &mut report, true).await?;
+    if !report.cycle_memory_ids.is_empty() {
+        store_evidence_migration_state(db, "failed", &report).await?;
+        anyhow::bail!(
+            "evidence-root migration found a parent cycle; repair report stored for memories {:?}",
+            report.cycle_memory_ids
+        );
+    }
+    store_evidence_migration_state(db, "complete", &report).await?;
+    Ok(())
+}
+
+async fn migrate_influence_policy(db: &Database) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_influence_policy (
+            memory_id BIGINT PRIMARY KEY,
+            version BIGINT NOT NULL DEFAULT 1,
+            state TEXT NOT NULL DEFAULT 'eligible',
+            allowed_task_types TEXT NOT NULL DEFAULT '[]',
+            denied_task_types TEXT NOT NULL DEFAULT '[]',
+            maximum_action_risk TEXT NOT NULL DEFAULT 'critical',
+            requires_original_source BIGINT NOT NULL DEFAULT 0,
+            requires_human_confirmation BIGINT NOT NULL DEFAULT 0,
+            maximum_derivation_depth BIGINT,
+            updated_by TEXT,
+            updated_at BIGINT NOT NULL,
+            FOREIGN KEY(memory_id) REFERENCES memory_meta(memory_id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_influence_state
+         ON memory_influence_policy(state, memory_id)",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS influence_replay_nonces (
+            token_kind TEXT NOT NULL,
+            issuer TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            expires_at BIGINT NOT NULL,
+            consumed_at BIGINT NOT NULL,
+            PRIMARY KEY(token_kind, issuer, nonce)
+        )",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_influence_replay_expiry
+         ON influence_replay_nonces(expires_at)",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_influence_events (
+            id TEXT PRIMARY KEY,
+            decision_id TEXT NOT NULL UNIQUE,
+            request_id TEXT NOT NULL,
+            memory_id BIGINT NOT NULL,
+            project TEXT NOT NULL,
+            namespace TEXT NOT NULL,
+            agent_id TEXT,
+            purpose_authority TEXT NOT NULL,
+            attestation_id TEXT,
+            confirmation_receipt_id TEXT,
+            task_type TEXT NOT NULL,
+            intended_action_hash TEXT,
+            action_risk TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            reason_codes TEXT NOT NULL,
+            policy_version BIGINT NOT NULL,
+            evaluator_version TEXT NOT NULL,
+            config_hash TEXT NOT NULL,
+            purpose_hash TEXT NOT NULL,
+            query_hash TEXT,
+            memory_record_hash TEXT,
+            created_at BIGINT NOT NULL
+        )",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_influence_events_memory
+         ON memory_influence_events(namespace, memory_id, created_at)",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    let now = Utc::now().timestamp();
+    let report = serde_json::json!({
+        "version": INFLUENCE_POLICY_MIGRATION_VERSION,
+        "default_policy": "implicit_permissive",
+        "backfilled_rows": 0,
+    });
+    sqlx::query(
+        "INSERT INTO schema_migrations(migration_id, version, status, cursor, report, updated_at)
+         VALUES($1, $2, 'complete', 0, $3, $4)
+         ON CONFLICT(migration_id) DO NOTHING",
+    )
+    .bind(INFLUENCE_POLICY_MIGRATION_ID)
+    .bind(INFLUENCE_POLICY_MIGRATION_VERSION as i64)
+    .bind(report.to_string())
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+async fn migrate_contradictions(db: &Database) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS contradiction_sets (
+            id TEXT PRIMARY KEY,
+            namespace TEXT NOT NULL,
+            realm TEXT NOT NULL,
+            project TEXT,
+            claim_key TEXT NOT NULL,
+            claim_schema_version BIGINT NOT NULL,
+            cardinality TEXT NOT NULL,
+            preferred_memory_id BIGINT,
+            status TEXT NOT NULL DEFAULT 'unresolved',
+            resolution_basis TEXT,
+            resolved_by TEXT,
+            version BIGINT NOT NULL DEFAULT 1,
+            created_at BIGINT NOT NULL,
+            updated_at BIGINT NOT NULL
+        )",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_contradiction_claim
+         ON contradiction_sets(namespace, realm, COALESCE(project, ''), claim_key)",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS contradiction_members (
+            contradiction_set_id TEXT NOT NULL,
+            memory_id BIGINT NOT NULL,
+            stance TEXT NOT NULL DEFAULT 'competing',
+            created_at BIGINT NOT NULL,
+            PRIMARY KEY(contradiction_set_id, memory_id),
+            FOREIGN KEY(contradiction_set_id) REFERENCES contradiction_sets(id) ON DELETE CASCADE,
+            FOREIGN KEY(memory_id) REFERENCES memory_meta(memory_id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_contradiction_members_memory
+         ON contradiction_members(memory_id, contradiction_set_id)",
+    )
+    .execute(&db.pool)
+    .await?;
     Ok(())
 }
 
@@ -699,6 +1274,17 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // Governed influence phase 1: give every live memory an independent
+        // evidence root and derivation depth. The migration owns its durable
+        // cursor/report and remains restart-safe on large legacy databases.
+        migrate_evidence_roots(self).await?;
+
+        // Governed influence phase 2: policies are sparse. Memories without an
+        // explicit row read as version-1 permissive policy, so migration changes
+        // neither retrieval scores nor legacy behavior.
+        migrate_influence_policy(self).await?;
+        migrate_contradictions(self).await?;
+
         match self.backend {
             Backend::Sqlite => {
                 sqlx::query(
@@ -747,6 +1333,7 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+        crate::recovery::migrate(self).await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS memory_ledger_epochs (
                 namespace          TEXT NOT NULL,
@@ -1595,7 +2182,7 @@ pub async fn insert_memory(
 ) -> Result<i64> {
     let now = Utc::now().timestamp();
 
-    match db.backend {
+    let memory_id = match db.backend {
         Backend::Sqlite => {
             // `memories` is an FTS5 virtual table (no RETURNING support), and
             // `last_insert_rowid()` is per-connection — so the INSERT and the
@@ -1603,8 +2190,15 @@ pub async fn insert_memory(
             // can hand back a wrong/zero id.
             let mut conn = db.pool.acquire().await?;
             sqlx::query(
-                "INSERT INTO memories (project, session_id, summary, tags, created_at)
-                 VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO memories (rowid, project, session_id, summary, tags, created_at)
+                 VALUES (
+                    (SELECT COALESCE(MAX(id), 0) + 1 FROM (
+                        SELECT rowid AS id FROM memories
+                        UNION ALL
+                        SELECT memory_id AS id FROM memory_meta
+                    )),
+                    $1, $2, $3, $4, $5
+                 )",
             )
             .bind(project)
             .bind(session_id)
@@ -1617,7 +2211,7 @@ pub async fn insert_memory(
             let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() as id")
                 .fetch_one(&mut *conn)
                 .await?;
-            Ok(row.get("id"))
+            row.get("id")
         }
         Backend::Postgres => {
             let row: sqlx::any::AnyRow = sqlx::query(
@@ -1634,9 +2228,54 @@ pub async fn insert_memory(
             .bind(tags)
             .fetch_one(&db.pool)
             .await?;
-            Ok(row.get("id"))
+            row.get("id")
         }
+    };
+
+    // memory_meta is the cross-backend relational parent for evidence and all
+    // later governance side tables. Create it with a stable-source hash or a
+    // durable UUID before returning the live memory id. apply_memory_governance
+    // replaces this root when a derived parent or more specific provenance is supplied.
+    let governance = MemoryGovernance::default();
+    let record_hash = memory_record_hash(
+        project,
+        session_id,
+        summary,
+        tags,
+        "project",
+        "session",
+        &governance,
+    );
+    let initial_source_ref = (session_id != "remember").then(|| format!("session:{session_id}"));
+    let root = match initial_source_ref.as_deref() {
+        Some(source_ref) => evidence_root_id(
+            DEFAULT_NAMESPACE,
+            source_type_str(governance.source_type),
+            Some(source_ref),
+            &record_hash,
+        ),
+        None => new_evidence_root_id(),
+    };
+    if let Err(error) = sqlx::query(
+        "INSERT INTO memory_meta(
+            memory_id, importance, created_at, evidence_root_id, derivation_depth
+         ) VALUES($1, 0.5, $2, $3, 0)",
+    )
+    .bind(memory_id)
+    .bind(now)
+    .bind(&root)
+    .execute(&db.pool)
+    .await
+    {
+        let _ = delete_memory(db, memory_id).await;
+        return Err(error.into());
     }
+    if let Err(error) = persist_primary_evidence_root(db, memory_id, &root, 0, now).await {
+        let _ = delete_memory(db, memory_id).await;
+        let _ = delete_memory_meta(db, memory_id).await;
+        return Err(error);
+    }
+    Ok(memory_id)
 }
 
 pub async fn get_recent_memories(db: &Database, project: &str, limit: i64) -> Result<Vec<Memory>> {
@@ -2316,6 +2955,8 @@ pub struct MemoryMetaInfo {
     pub writer_identity: Option<String>,
     pub source_ref: Option<String>,
     pub parent_memory_id: Option<i64>,
+    pub evidence_root_id: Option<String>,
+    pub derivation_depth: u32,
     pub classification: String,
     pub consent_state: Option<String>,
     pub residency: Option<String>,
@@ -2340,6 +2981,8 @@ impl Default for MemoryMetaInfo {
             writer_identity: None,
             source_ref: None,
             parent_memory_id: None,
+            evidence_root_id: None,
+            derivation_depth: 0,
             classification: "internal".to_string(),
             consent_state: None,
             residency: None,
@@ -2358,7 +3001,8 @@ impl Default for MemoryMetaInfo {
 pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<MemoryMetaInfo> {
     let row: Option<sqlx::any::AnyRow> = sqlx::query(
         "SELECT importance, scope, kind, event_time, namespace, source_type, trust_tier,
-                writer_identity, source_ref, parent_memory_id, classification, consent_state,
+                writer_identity, source_ref, parent_memory_id, evidence_root_id,
+                derivation_depth, classification, consent_state,
                 residency, retention_policy_id, expires_at, legal_hold, record_hash,
                 tombstoned_at, tombstone_reason
          FROM memory_meta WHERE memory_id = $1",
@@ -2404,6 +3048,12 @@ pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<Memor
                 .try_get::<Option<i64>, _>("parent_memory_id")
                 .ok()
                 .flatten(),
+            evidence_root_id: r
+                .try_get::<Option<String>, _>("evidence_root_id")
+                .ok()
+                .flatten()
+                .filter(|root| !root.is_empty()),
+            derivation_depth: r.try_get::<i64, _>("derivation_depth").unwrap_or(0).max(0) as u32,
             classification: r
                 .try_get::<Option<String>, _>("classification")
                 .ok()
@@ -2429,6 +3079,188 @@ pub async fn get_memory_meta_full(db: &Database, memory_id: i64) -> Result<Memor
         },
         None => MemoryMetaInfo::default(),
     })
+}
+
+/// All independent evidence roots attached to a memory, primary first.
+pub async fn memory_evidence_roots(
+    db: &Database,
+    memory_id: i64,
+) -> Result<Vec<MemoryEvidenceRoot>> {
+    let rows = sqlx::query(
+        "SELECT evidence_root_id, role, created_at
+         FROM memory_evidence_roots WHERE memory_id = $1
+         ORDER BY CASE role WHEN 'primary' THEN 0 WHEN 'supporting' THEN 1 ELSE 2 END,
+                  evidence_root_id ASC",
+    )
+    .bind(memory_id)
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| MemoryEvidenceRoot {
+            evidence_root_id: row.get("evidence_root_id"),
+            role: row.get("role"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
+/// Add the distinct roots of source memories to a multi-source synthesis.
+/// Namespace boundaries are enforced here so one tenant cannot manufacture
+/// apparent corroboration from another tenant's evidence.
+pub async fn add_supporting_evidence_from_memories(
+    db: &Database,
+    memory_id: i64,
+    source_memory_ids: &[i64],
+) -> Result<usize> {
+    let target = load_evidence_meta(db, memory_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("memory metadata not found: {memory_id}"))?;
+    let target_namespace = normalize_namespace(&target.namespace);
+    let primary = target
+        .evidence_root_id
+        .ok_or_else(|| anyhow::anyhow!("memory {memory_id} has no primary evidence root"))?;
+    let mut roots = BTreeSet::new();
+    for source_memory_id in source_memory_ids {
+        let source = load_evidence_meta(db, *source_memory_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("source memory metadata not found: {source_memory_id}")
+            })?;
+        if normalize_namespace(&source.namespace) != target_namespace {
+            anyhow::bail!(
+                "source memory {} namespace '{}' does not match target namespace '{}'",
+                source_memory_id,
+                source.namespace,
+                target_namespace
+            );
+        }
+        let root = source.evidence_root_id.ok_or_else(|| {
+            anyhow::anyhow!("source memory {source_memory_id} has no evidence root")
+        })?;
+        if root != primary {
+            roots.insert(root);
+        }
+    }
+
+    let now = Utc::now().timestamp();
+    let mut inserted = 0;
+    for root in roots {
+        let result = sqlx::query(
+            "INSERT INTO memory_evidence_roots(memory_id, evidence_root_id, role, created_at)
+             VALUES($1, $2, 'supporting', $3)
+             ON CONFLICT(memory_id, evidence_root_id) DO NOTHING",
+        )
+        .bind(memory_id)
+        .bind(root)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+        inserted += result.rows_affected() as usize;
+    }
+    Ok(inserted)
+}
+
+/// Restore previously captured evidence metadata after a snapshot has remapped
+/// memory ids. New snapshots supply the complete root set; legacy snapshots do
+/// not call this and retain the safe root created by insert_memory.
+pub async fn restore_memory_evidence(
+    db: &Database,
+    memory_id: i64,
+    parent_memory_id: Option<i64>,
+    evidence_root: &str,
+    derivation_depth: u32,
+    roots: &[MemoryEvidenceRoot],
+) -> Result<()> {
+    if evidence_root.trim().is_empty() {
+        anyhow::bail!("snapshot evidence root may not be empty");
+    }
+    sqlx::query(
+        "UPDATE memory_meta
+         SET parent_memory_id = $1, evidence_root_id = $2, derivation_depth = $3
+         WHERE memory_id = $4",
+    )
+    .bind(parent_memory_id)
+    .bind(evidence_root)
+    .bind(derivation_depth as i64)
+    .bind(memory_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id = $1")
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
+
+    let mut has_primary = false;
+    for root in roots {
+        let role = match root.role.as_str() {
+            "primary" => {
+                if root.evidence_root_id != evidence_root {
+                    anyhow::bail!(
+                        "snapshot primary root '{}' does not match metadata root '{}'",
+                        root.evidence_root_id,
+                        evidence_root
+                    );
+                }
+                has_primary = true;
+                "primary"
+            }
+            "contradicting" => "contradicting",
+            _ => "supporting",
+        };
+        sqlx::query(
+            "INSERT INTO memory_evidence_roots(memory_id, evidence_root_id, role, created_at)
+             VALUES($1, $2, $3, $4)
+             ON CONFLICT(memory_id, evidence_root_id) DO UPDATE SET role = excluded.role",
+        )
+        .bind(memory_id)
+        .bind(&root.evidence_root_id)
+        .bind(role)
+        .bind(root.created_at)
+        .execute(&db.pool)
+        .await?;
+    }
+    if !has_primary {
+        persist_primary_evidence_root(
+            db,
+            memory_id,
+            evidence_root,
+            derivation_depth as i64,
+            Utc::now().timestamp(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Re-run the deterministic evidence repair over rows whose roots are missing.
+/// This is intentionally separate from startup migration state so operators can
+/// fix malformed parents and validate the result before restarting.
+#[allow(dead_code)] // operator repair seam; exercised by deterministic tests
+pub async fn repair_evidence_roots(db: &Database) -> Result<EvidenceRootMigrationReport> {
+    let mut report = EvidenceRootMigrationReport {
+        version: EVIDENCE_ROOT_MIGRATION_VERSION,
+        ..Default::default()
+    };
+    evidence_backfill_from_cursor(db, 0, &mut report, false).await?;
+    report.broken_parent_memory_ids.sort_unstable();
+    report.broken_parent_memory_ids.dedup();
+    Ok(report)
+}
+
+pub async fn evidence_root_migration_report(
+    db: &Database,
+) -> Result<Option<(String, EvidenceRootMigrationReport)>> {
+    let row = sqlx::query("SELECT status, report FROM schema_migrations WHERE migration_id = $1")
+        .bind(EVIDENCE_ROOT_MIGRATION_ID)
+        .fetch_optional(&db.pool)
+        .await?;
+    row.map(|row| {
+        let status: String = row.get("status");
+        let report: String = row.get("report");
+        Ok((status, serde_json::from_str(&report)?))
+    })
+    .transpose()
 }
 
 /// Set a memory's scope + kind, clamping both to the known sets. Upserts the
@@ -2500,6 +3332,51 @@ pub async fn apply_memory_governance(
         kind,
         governance,
     );
+    let (resolved_root, derivation_depth) = match governance.parent_memory_id {
+        Some(parent_memory_id) => {
+            let parent = load_evidence_meta(db, parent_memory_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("parent memory metadata not found: {parent_memory_id}")
+                })?;
+            if normalize_namespace(&parent.namespace) != namespace {
+                anyhow::bail!(
+                    "derived memory namespace '{}' does not match parent {} namespace '{}'",
+                    namespace,
+                    parent_memory_id,
+                    parent.namespace
+                );
+            }
+            let parent_root = parent.evidence_root_id.ok_or_else(|| {
+                anyhow::anyhow!("parent memory {parent_memory_id} has no evidence root")
+            })?;
+            let depth = parent.derivation_depth.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("derivation depth overflow at memory {memory_id}")
+            })?;
+            (parent_root, depth)
+        }
+        None => {
+            let session_source_ref =
+                (memory.session_id != "remember").then(|| format!("session:{}", memory.session_id));
+            let stable_source_ref = governance
+                .source_ref
+                .as_deref()
+                .or(session_source_ref.as_deref());
+            let root = match stable_source_ref {
+                Some(source_ref) => evidence_root_id(
+                    &namespace,
+                    source_type_str(governance.source_type),
+                    Some(source_ref),
+                    &record_hash,
+                ),
+                None => load_evidence_meta(db, memory_id)
+                    .await?
+                    .and_then(|existing| existing.evidence_root_id)
+                    .unwrap_or_else(new_evidence_root_id),
+            };
+            (root, 0)
+        }
+    };
     let now = Utc::now().timestamp();
     // trust_first_seen_at is stamped once and preserved across upserts (it is
     // deliberately omitted from DO UPDATE SET), so a memory's trajectory origin
@@ -2510,9 +3387,9 @@ pub async fn apply_memory_governance(
             memory_id, importance, created_at, scope, kind, namespace, source_type, trust_tier,
             writer_identity, source_ref, parent_memory_id, classification, consent_state,
             residency, retention_policy_id, expires_at, legal_hold, record_hash,
-            trust_first_seen_at
+            trust_first_seen_at, evidence_root_id, derivation_depth
          )
-         VALUES($1, 0.5, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+         VALUES($1, 0.5, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
          ON CONFLICT(memory_id) DO UPDATE SET
             scope = excluded.scope,
             kind = excluded.kind,
@@ -2528,7 +3405,9 @@ pub async fn apply_memory_governance(
             retention_policy_id = excluded.retention_policy_id,
             expires_at = excluded.expires_at,
             legal_hold = excluded.legal_hold,
-            record_hash = excluded.record_hash",
+            record_hash = excluded.record_hash,
+            evidence_root_id = excluded.evidence_root_id,
+            derivation_depth = excluded.derivation_depth",
     )
     .bind(memory_id)
     .bind(now)
@@ -2548,8 +3427,11 @@ pub async fn apply_memory_governance(
     .bind(if governance.legal_hold { 1_i64 } else { 0_i64 })
     .bind(&record_hash)
     .bind(now)
+    .bind(&resolved_root)
+    .bind(derivation_depth)
     .execute(&db.pool)
     .await?;
+    persist_primary_evidence_root(db, memory_id, &resolved_root, derivation_depth, now).await?;
     crate::metrics::record(crate::metrics::GovOp::GovernedWrite, _gw.elapsed());
 
     let payload = serde_json::json!({
@@ -2560,6 +3442,8 @@ pub async fn apply_memory_governance(
         "legal_hold": governance.legal_hold,
         "namespace": namespace,
         "parent_memory_id": governance.parent_memory_id,
+        "evidence_root_id": resolved_root,
+        "derivation_depth": derivation_depth,
         "project": memory.project,
         "record_hash": record_hash,
         "residency": governance.residency.as_deref(),
@@ -2579,6 +3463,1188 @@ pub async fn apply_memory_governance(
         &payload.to_string(),
     )
     .await
+}
+
+fn influence_policy_record_from_row(
+    row: &sqlx::any::AnyRow,
+) -> Result<MemoryInfluencePolicyRecord> {
+    let memory_id: i64 = row.get("memory_id");
+    let namespace: String = row.get("namespace");
+    let version: Option<i64> = row.try_get("policy_version").ok().flatten();
+    let Some(version) = version else {
+        return Ok(MemoryInfluencePolicyRecord {
+            memory_id,
+            namespace,
+            policy: MemoryInfluencePolicy::default(),
+            explicit: false,
+            updated_by: None,
+            updated_at: None,
+        });
+    };
+    let state: String = row.get("policy_state");
+    let allowed_task_types: String = row.get("allowed_task_types");
+    let denied_task_types: String = row.get("denied_task_types");
+    let maximum_action_risk: String = row.get("maximum_action_risk");
+    let requires_original_source = row.get::<i64, _>("requires_original_source") != 0;
+    let requires_human_confirmation = row.get::<i64, _>("requires_human_confirmation") != 0;
+    let maximum_derivation_depth: Option<i64> =
+        row.try_get("maximum_derivation_depth").ok().flatten();
+    let policy = MemoryInfluencePolicy::from_storage(StoredInfluencePolicy {
+        version,
+        state: &state,
+        allowed_task_types: &allowed_task_types,
+        denied_task_types: &denied_task_types,
+        maximum_action_risk: &maximum_action_risk,
+        requires_original_source,
+        requires_human_confirmation,
+        maximum_derivation_depth,
+    })
+    .map_err(anyhow::Error::new)?;
+    Ok(MemoryInfluencePolicyRecord {
+        memory_id,
+        namespace,
+        policy,
+        explicit: true,
+        updated_by: row.try_get("updated_by").ok().flatten(),
+        updated_at: row.try_get("policy_updated_at").ok().flatten(),
+    })
+}
+
+const INFLUENCE_POLICY_SELECT: &str = "SELECT mm.memory_id, mm.namespace,
+            p.version AS policy_version,
+            p.state AS policy_state,
+            p.allowed_task_types,
+            p.denied_task_types,
+            p.maximum_action_risk,
+            p.requires_original_source,
+            p.requires_human_confirmation,
+            p.maximum_derivation_depth,
+            p.updated_by,
+            p.updated_at AS policy_updated_at
+     FROM memory_meta mm
+     LEFT JOIN memory_influence_policy p ON p.memory_id = mm.memory_id
+     WHERE mm.memory_id = $1 AND mm.namespace = $2";
+
+pub async fn get_memory_influence_policy(
+    db: &Database,
+    memory_id: i64,
+    namespace: &str,
+) -> Result<MemoryInfluencePolicyRecord> {
+    let namespace = normalize_namespace(namespace);
+    let row = sqlx::query(INFLUENCE_POLICY_SELECT)
+        .bind(memory_id)
+        .bind(&namespace)
+        .fetch_optional(&db.pool)
+        .await?;
+    row.as_ref()
+        .map(influence_policy_record_from_row)
+        .transpose()?
+        .ok_or_else(|| {
+            anyhow::Error::new(PolicyError::MemoryNotFound {
+                memory_id,
+                namespace,
+            })
+        })
+}
+
+pub async fn get_explicit_memory_influence_policy(
+    db: &Database,
+    memory_id: i64,
+    namespace: &str,
+) -> Result<Option<MemoryInfluencePolicyRecord>> {
+    let record = get_memory_influence_policy(db, memory_id, namespace).await?;
+    Ok(record.explicit.then_some(record))
+}
+
+/// Batch-load every policy and lineage field required by the shared egress
+/// evaluator. One query avoids an N+1 policy lookup after ranking.
+pub async fn influence_contexts_for(
+    db: &Database,
+    memory_ids: &[i64],
+    namespace: &str,
+) -> Result<std::collections::HashMap<i64, crate::egress::CandidatePolicyContext>> {
+    let mut contexts = std::collections::HashMap::new();
+    if memory_ids.is_empty() {
+        return Ok(contexts);
+    }
+    let in_list = memory_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT mm.memory_id, mm.namespace, mm.derivation_depth, mm.record_hash,
+                (SELECT COUNT(DISTINCT mer.evidence_root_id)
+                   FROM memory_evidence_roots mer
+                  WHERE mer.memory_id = mm.memory_id) AS evidence_root_count,
+                p.version AS policy_version, p.state AS policy_state,
+                p.allowed_task_types, p.denied_task_types, p.maximum_action_risk,
+                p.requires_original_source, p.requires_human_confirmation,
+                p.maximum_derivation_depth, p.updated_by,
+                p.updated_at AS policy_updated_at
+           FROM memory_meta mm
+           LEFT JOIN memory_influence_policy p ON p.memory_id = mm.memory_id
+          WHERE mm.namespace = $1 AND mm.memory_id IN ({in_list})"
+    );
+    let namespace = normalize_namespace(namespace);
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql)
+        .bind(&namespace)
+        .fetch_all(&db.pool)
+        .await?;
+    for row in rows {
+        let record = influence_policy_record_from_row(&row)?;
+        let derivation_depth =
+            u32::try_from(row.try_get::<i64, _>("derivation_depth").unwrap_or(0))
+                .unwrap_or(u32::MAX);
+        let evidence_root_count =
+            usize::try_from(row.try_get::<i64, _>("evidence_root_count").unwrap_or(0))
+                .unwrap_or(usize::MAX);
+        contexts.insert(
+            record.memory_id,
+            crate::egress::CandidatePolicyContext {
+                record,
+                derivation_depth,
+                evidence_root_count,
+                record_hash: row.try_get("record_hash").ok().flatten(),
+                unresolved_contradiction_set_ids: Vec::new(),
+            },
+        );
+    }
+    let membership_rows = sqlx::query(&format!(
+        "SELECT cm.memory_id, cm.contradiction_set_id
+           FROM contradiction_members cm
+           JOIN contradiction_sets cs ON cs.id = cm.contradiction_set_id
+          WHERE cs.namespace = $1 AND cs.status = 'unresolved'
+            AND cm.memory_id IN ({in_list})
+          ORDER BY cm.memory_id, cm.contradiction_set_id"
+    ))
+    .bind(&namespace)
+    .fetch_all(&db.pool)
+    .await?;
+    for row in membership_rows {
+        let memory_id: i64 = row.get("memory_id");
+        if let Some(context) = contexts.get_mut(&memory_id) {
+            context
+                .unresolved_contradiction_set_ids
+                .push(row.get("contradiction_set_id"));
+        }
+    }
+    Ok(contexts)
+}
+
+pub async fn claim_influence_nonce(
+    db: &Database,
+    token_kind: &str,
+    issuer: &str,
+    nonce: &str,
+    request_id: &str,
+    expires_at: i64,
+) -> Result<()> {
+    let now = Utc::now().timestamp();
+    sqlx::query("DELETE FROM influence_replay_nonces WHERE expires_at < $1")
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+    let inserted = sqlx::query(
+        "INSERT INTO influence_replay_nonces(
+            token_kind, issuer, nonce, request_id, expires_at, consumed_at
+         ) VALUES($1, $2, $3, $4, $5, $6)
+         ON CONFLICT(token_kind, issuer, nonce) DO NOTHING",
+    )
+    .bind(token_kind)
+    .bind(issuer)
+    .bind(nonce)
+    .bind(request_id)
+    .bind(expires_at)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    if inserted.rows_affected() != 1 {
+        anyhow::bail!("{}_replayed", token_kind);
+    }
+    Ok(())
+}
+
+pub async fn record_influence_decisions(
+    db: &Database,
+    decisions: &[crate::egress::InfluenceDecision],
+    contexts: &std::collections::HashMap<i64, crate::egress::CandidatePolicyContext>,
+    record_denials: bool,
+    query_hash: Option<&str>,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let now = Utc::now().timestamp();
+    for decision in decisions {
+        if !record_denials
+            && matches!(
+                decision.decision,
+                crate::egress::InfluenceDecisionKind::Deny
+                    | crate::egress::InfluenceDecisionKind::RequireHumanConfirmation
+            )
+        {
+            continue;
+        }
+        let purpose_hash = crate::purpose::purpose_hash(&decision.purpose);
+        let intended_action_hash = decision
+            .purpose
+            .intended_action
+            .as_ref()
+            .map(|value| format!("{:x}", Sha256::digest(value.as_bytes())));
+        let authority = serde_json::to_value(decision.purpose.authority)?
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
+        let decision_kind = serde_json::to_value(decision.decision)?
+            .as_str()
+            .unwrap_or("deny")
+            .to_string();
+        sqlx::query(
+            "INSERT INTO memory_influence_events(
+                id, decision_id, request_id, memory_id, project, namespace,
+                agent_id, purpose_authority, attestation_id,
+                confirmation_receipt_id, task_type, intended_action_hash,
+                action_risk, decision, reason_codes, policy_version,
+                evaluator_version, config_hash, purpose_hash, query_hash,
+                memory_record_hash, created_at
+             ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+             ON CONFLICT(decision_id) DO NOTHING",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&decision.decision_id)
+        .bind(&decision.request_id)
+        .bind(decision.memory_id)
+        .bind(&decision.purpose.project)
+        .bind(&decision.purpose.namespace)
+        .bind(&decision.purpose.subject_agent_id)
+        .bind(authority)
+        .bind(&decision.purpose.attestation_id)
+        .bind(&decision.purpose.confirmation_receipt_id)
+        .bind(&decision.purpose.task_type)
+        .bind(intended_action_hash)
+        .bind(decision.purpose.action_risk.to_string())
+        .bind(decision_kind)
+        .bind(serde_json::to_string(&decision.reason_codes)?)
+        .bind(i64::try_from(decision.policy_version)?)
+        .bind(&decision.evaluator_version)
+        .bind(&decision.config_hash)
+        .bind(purpose_hash)
+        .bind(query_hash)
+        .bind(
+            contexts
+                .get(&decision.memory_id)
+                .and_then(|context| context.record_hash.as_deref()),
+        )
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+    }
+    Ok(())
+}
+
+pub async fn influence_event_status(db: &Database) -> Result<serde_json::Value> {
+    let rows = sqlx::query(
+        "SELECT decision, reason_codes FROM memory_influence_events ORDER BY created_at DESC",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    let mut decisions = std::collections::BTreeMap::<String, i64>::new();
+    let mut denials = std::collections::BTreeMap::<String, i64>::new();
+    for row in rows {
+        let decision: String = row.get("decision");
+        *decisions.entry(decision).or_default() += 1;
+        let reasons: String = row.get("reason_codes");
+        for reason in serde_json::from_str::<Vec<String>>(&reasons).unwrap_or_default() {
+            *denials.entry(reason).or_default() += 1;
+        }
+    }
+    Ok(serde_json::json!({
+        "total_decisions": decisions.values().sum::<i64>(),
+        "decisions": decisions,
+        "reason_codes": denials,
+    }))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InfluenceEventInfo {
+    pub decision_id: String,
+    pub request_id: String,
+    pub memory_id: i64,
+    pub project: String,
+    pub namespace: String,
+    pub purpose_authority: String,
+    pub confirmation_receipt_id: Option<String>,
+    pub task_type: String,
+    pub action_risk: String,
+    pub decision: String,
+    pub reason_codes: Vec<String>,
+    pub policy_version: i64,
+    pub evaluator_version: String,
+    pub created_at: i64,
+}
+
+pub async fn influence_events_for_memory(
+    db: &Database,
+    memory_id: i64,
+    limit: i64,
+) -> Result<Vec<InfluenceEventInfo>> {
+    let rows = sqlx::query(
+        "SELECT decision_id, request_id, memory_id, project, namespace,
+                purpose_authority, confirmation_receipt_id, task_type, action_risk, decision,
+                reason_codes, policy_version, evaluator_version, created_at
+           FROM memory_influence_events
+          WHERE memory_id = $1
+          ORDER BY created_at DESC, decision_id DESC LIMIT $2",
+    )
+    .bind(memory_id)
+    .bind(limit.max(1))
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| InfluenceEventInfo {
+            decision_id: row.get("decision_id"),
+            request_id: row.get("request_id"),
+            memory_id: row.get("memory_id"),
+            project: row.get("project"),
+            namespace: row.get("namespace"),
+            purpose_authority: row.get("purpose_authority"),
+            confirmation_receipt_id: row.try_get("confirmation_receipt_id").ok().flatten(),
+            task_type: row.get("task_type"),
+            action_risk: row.get("action_risk"),
+            decision: row.get("decision"),
+            reason_codes: serde_json::from_str(&row.get::<String, _>("reason_codes"))
+                .unwrap_or_default(),
+            policy_version: row.get("policy_version"),
+            evaluator_version: row.get("evaluator_version"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
+pub async fn influence_compliance_status(db: &Database) -> Result<serde_json::Value> {
+    let policy_rows = sqlx::query(
+        "SELECT COALESCE(p.state, 'eligible') AS state, COUNT(*) AS count
+           FROM memory_meta mm LEFT JOIN memory_influence_policy p ON p.memory_id=mm.memory_id
+          WHERE mm.tombstoned_at IS NULL GROUP BY COALESCE(p.state, 'eligible')",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    let mut policy_states = std::collections::BTreeMap::new();
+    for row in policy_rows {
+        policy_states.insert(row.get::<String, _>("state"), row.get::<i64, _>("count"));
+    }
+    let depth_row = sqlx::query(
+        "SELECT COUNT(*) AS count
+           FROM memory_meta mm JOIN memory_influence_policy p ON p.memory_id=mm.memory_id
+          WHERE p.maximum_derivation_depth IS NOT NULL
+            AND mm.derivation_depth > p.maximum_derivation_depth",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    let high_risk_row = sqlx::query(
+        "SELECT COUNT(DISTINCT e.decision_id) AS count
+           FROM memory_influence_events e
+           JOIN contradiction_members cm ON cm.memory_id=e.memory_id
+           JOIN contradiction_sets cs ON cs.id=cm.contradiction_set_id
+          WHERE cs.status='unresolved' AND e.action_risk IN ('high','critical')",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    Ok(serde_json::json!({
+        "policy_states": policy_states,
+        "influence_events": influence_event_status(db).await?,
+        "high_risk_requests_with_unresolved_contradictions": high_risk_row.get::<i64, _>("count"),
+        "memories_exceeding_policy_derivation_depth": depth_row.get::<i64, _>("count"),
+        "contradictions": contradiction_status(db).await?,
+    }))
+}
+
+async fn influence_policy_record_on_connection(
+    connection: &mut sqlx::AnyConnection,
+    memory_id: i64,
+    namespace: &str,
+) -> Result<MemoryInfluencePolicyRecord> {
+    let row = sqlx::query(INFLUENCE_POLICY_SELECT)
+        .bind(memory_id)
+        .bind(namespace)
+        .fetch_optional(&mut *connection)
+        .await?;
+    row.as_ref()
+        .map(influence_policy_record_from_row)
+        .transpose()?
+        .ok_or_else(|| {
+            anyhow::Error::new(PolicyError::MemoryNotFound {
+                memory_id,
+                namespace: namespace.to_string(),
+            })
+        })
+}
+
+async fn update_memory_influence_policy_on_connection(
+    connection: &mut sqlx::AnyConnection,
+    memory_id: i64,
+    namespace: &str,
+    principal: &PolicyPrincipal,
+    request: &PolicyMutationRequest,
+) -> Result<MemoryInfluencePolicyRecord> {
+    let current = influence_policy_record_on_connection(connection, memory_id, namespace).await?;
+    if current.policy.version != request.expected_version {
+        return Err(anyhow::Error::new(PolicyError::VersionConflict {
+            expected: request.expected_version,
+            actual: current.policy.version,
+        }));
+    }
+    let mut next = request
+        .patch
+        .apply(&current.policy)
+        .map_err(anyhow::Error::new)?;
+    if next == current.policy {
+        return Err(anyhow::Error::new(PolicyError::NoChange));
+    }
+    next.version = current.policy.version.checked_add(1).ok_or_else(|| {
+        anyhow::Error::new(PolicyError::InvalidPolicy(
+            "policy version overflow".to_string(),
+        ))
+    })?;
+    let version = i64::try_from(next.version).map_err(|_| {
+        anyhow::Error::new(PolicyError::InvalidPolicy(
+            "policy version exceeds storage range".to_string(),
+        ))
+    })?;
+    let maximum_derivation_depth = next.maximum_derivation_depth.map(i64::from);
+    let allowed_task_types = serde_json::to_string(&next.allowed_task_types)?;
+    let denied_task_types = serde_json::to_string(&next.denied_task_types)?;
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO memory_influence_policy(
+            memory_id, version, state, allowed_task_types, denied_task_types,
+            maximum_action_risk, requires_original_source,
+            requires_human_confirmation, maximum_derivation_depth,
+            updated_by, updated_at
+         ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT(memory_id) DO UPDATE SET
+            version = excluded.version,
+            state = excluded.state,
+            allowed_task_types = excluded.allowed_task_types,
+            denied_task_types = excluded.denied_task_types,
+            maximum_action_risk = excluded.maximum_action_risk,
+            requires_original_source = excluded.requires_original_source,
+            requires_human_confirmation = excluded.requires_human_confirmation,
+            maximum_derivation_depth = excluded.maximum_derivation_depth,
+            updated_by = excluded.updated_by,
+            updated_at = excluded.updated_at",
+    )
+    .bind(memory_id)
+    .bind(version)
+    .bind(next.state.to_string())
+    .bind(&allowed_task_types)
+    .bind(&denied_task_types)
+    .bind(next.maximum_action_risk.to_string())
+    .bind(if next.requires_original_source {
+        1_i64
+    } else {
+        0_i64
+    })
+    .bind(if next.requires_human_confirmation {
+        1_i64
+    } else {
+        0_i64
+    })
+    .bind(maximum_derivation_depth)
+    .bind(&principal.actor)
+    .bind(now)
+    .execute(&mut *connection)
+    .await?;
+
+    let payload = serde_json::json!({
+        "actor": principal.actor,
+        "authority": principal.authority,
+        "new_policy": next,
+        "new_version": version,
+        "old_policy": current.policy,
+        "old_version": request.expected_version,
+        "reason": request.reason.trim(),
+        "request_id": request.request_id.trim(),
+    });
+    append_memory_ledger_on_connection(
+        connection,
+        namespace,
+        Some(memory_id),
+        "influence_policy_update",
+        Some(&principal.actor),
+        &payload.to_string(),
+        None,
+    )
+    .await?;
+
+    Ok(MemoryInfluencePolicyRecord {
+        memory_id,
+        namespace: namespace.to_string(),
+        policy: next,
+        explicit: true,
+        updated_by: Some(principal.actor.clone()),
+        updated_at: Some(now),
+    })
+}
+
+pub async fn update_memory_influence_policy(
+    db: &Database,
+    memory_id: i64,
+    namespace: &str,
+    principal: &PolicyPrincipal,
+    request: &PolicyMutationRequest,
+) -> Result<MemoryInfluencePolicyRecord> {
+    request.validate().map_err(anyhow::Error::new)?;
+    let namespace = normalize_namespace(namespace);
+    match db.backend {
+        Backend::Sqlite => {
+            let _write_guard = sqlite_ledger_write_lock().lock().await;
+            let mut connection = db.pool.acquire().await?;
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *connection)
+                .await?;
+            match update_memory_influence_policy_on_connection(
+                &mut connection,
+                memory_id,
+                &namespace,
+                principal,
+                request,
+            )
+            .await
+            {
+                Ok(record) => {
+                    sqlx::query("COMMIT").execute(&mut *connection).await?;
+                    Ok(record)
+                }
+                Err(error) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    Err(error)
+                }
+            }
+        }
+        Backend::Postgres => {
+            let mut transaction = db.pool.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(&namespace)
+                .execute(&mut *transaction)
+                .await?;
+            let record = update_memory_influence_policy_on_connection(
+                &mut transaction,
+                memory_id,
+                &namespace,
+                principal,
+                request,
+            )
+            .await?;
+            transaction.commit().await?;
+            Ok(record)
+        }
+    }
+}
+
+pub async fn restore_memory_influence_policy(
+    db: &Database,
+    memory_id: i64,
+    policy: &MemoryInfluencePolicy,
+    updated_by: Option<&str>,
+    updated_at: Option<i64>,
+) -> Result<()> {
+    anyhow::ensure!(policy.version >= 1, "cannot restore policy version zero");
+    let allowed_task_types = serde_json::to_string(&policy.allowed_task_types)?;
+    let denied_task_types = serde_json::to_string(&policy.denied_task_types)?;
+    sqlx::query(
+        "INSERT INTO memory_influence_policy(
+            memory_id, version, state, allowed_task_types, denied_task_types,
+            maximum_action_risk, requires_original_source,
+            requires_human_confirmation, maximum_derivation_depth,
+            updated_by, updated_at
+         ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT(memory_id) DO UPDATE SET
+            version = excluded.version,
+            state = excluded.state,
+            allowed_task_types = excluded.allowed_task_types,
+            denied_task_types = excluded.denied_task_types,
+            maximum_action_risk = excluded.maximum_action_risk,
+            requires_original_source = excluded.requires_original_source,
+            requires_human_confirmation = excluded.requires_human_confirmation,
+            maximum_derivation_depth = excluded.maximum_derivation_depth,
+            updated_by = excluded.updated_by,
+            updated_at = excluded.updated_at",
+    )
+    .bind(memory_id)
+    .bind(i64::try_from(policy.version)?)
+    .bind(policy.state.to_string())
+    .bind(allowed_task_types)
+    .bind(denied_task_types)
+    .bind(policy.maximum_action_risk.to_string())
+    .bind(if policy.requires_original_source {
+        1_i64
+    } else {
+        0_i64
+    })
+    .bind(if policy.requires_human_confirmation {
+        1_i64
+    } else {
+        0_i64
+    })
+    .bind(policy.maximum_derivation_depth.map(i64::from))
+    .bind(updated_by)
+    .bind(updated_at.unwrap_or_else(|| Utc::now().timestamp()))
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+async fn validate_contradiction_members(
+    db: &Database,
+    request: &crate::contradiction::CreateContradictionRequest,
+    namespace: &str,
+) -> Result<()> {
+    let ids = request
+        .members
+        .iter()
+        .map(|member| member.memory_id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let memory_id_column = match db.backend {
+        Backend::Sqlite => "m.rowid",
+        Backend::Postgres => "m.id",
+    };
+    let rows = sqlx::query(&format!(
+        "SELECT mm.memory_id, mm.namespace, mm.scope, m.project
+           FROM memory_meta mm JOIN memories m ON {memory_id_column} = mm.memory_id
+          WHERE mm.memory_id IN ({ids})"
+    ))
+    .fetch_all(&db.pool)
+    .await?;
+    if rows.len() != request.members.len() {
+        return Err(anyhow::Error::new(PolicyError::InvalidPolicy(
+            "one or more contradiction members do not exist".to_string(),
+        )));
+    }
+    for row in rows {
+        let member_namespace: String = row.get("namespace");
+        let scope: String = row.get("scope");
+        let project: String = row.get("project");
+        if member_namespace != namespace {
+            return Err(anyhow::Error::new(PolicyError::InvalidPolicy(
+                "contradiction members must share the requested namespace".to_string(),
+            )));
+        }
+        match request.realm.as_str() {
+            "user" if scope != "user" => {
+                return Err(anyhow::Error::new(PolicyError::InvalidPolicy(
+                    "user-realm contradiction members must have user scope".to_string(),
+                )))
+            }
+            "project" if request.project.as_deref() != Some(project.as_str()) => {
+                return Err(anyhow::Error::new(PolicyError::InvalidPolicy(
+                    "project-realm contradiction members must share the project".to_string(),
+                )))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+async fn contradiction_set_on_connection(
+    connection: &mut sqlx::AnyConnection,
+    id: &str,
+    namespace: &str,
+) -> Result<crate::contradiction::ContradictionSet> {
+    let row = sqlx::query(
+        "SELECT id, namespace, realm, project, claim_key, claim_schema_version,
+                cardinality, preferred_memory_id, status, resolution_basis,
+                resolved_by, version, created_at, updated_at
+           FROM contradiction_sets WHERE id = $1 AND namespace = $2",
+    )
+    .bind(id)
+    .bind(namespace)
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| anyhow::Error::new(PolicyError::ContradictionNotFound { id: id.to_string() }))?;
+    let member_rows = sqlx::query(
+        "SELECT memory_id, stance FROM contradiction_members
+          WHERE contradiction_set_id = $1 ORDER BY memory_id",
+    )
+    .bind(id)
+    .fetch_all(&mut *connection)
+    .await?;
+    Ok(crate::contradiction::ContradictionSet {
+        id: row.get("id"),
+        namespace: row.get("namespace"),
+        realm: row.get("realm"),
+        project: row.try_get("project").ok().flatten(),
+        claim_key: row.get("claim_key"),
+        claim_schema_version: u32::try_from(row.get::<i64, _>("claim_schema_version"))?,
+        cardinality: row.get::<String, _>("cardinality").parse()?,
+        preferred_memory_id: row.try_get("preferred_memory_id").ok().flatten(),
+        status: row.get::<String, _>("status").parse()?,
+        resolution_basis: row.try_get("resolution_basis").ok().flatten(),
+        resolved_by: row.try_get("resolved_by").ok().flatten(),
+        version: u64::try_from(row.get::<i64, _>("version"))?,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        members: member_rows
+            .into_iter()
+            .map(|member| {
+                Ok(crate::contradiction::ContradictionMember {
+                    memory_id: member.get("memory_id"),
+                    stance: member.get::<String, _>("stance").parse()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+async fn create_contradiction_set_on_connection(
+    connection: &mut sqlx::AnyConnection,
+    principal: &PolicyPrincipal,
+    request: &crate::contradiction::CreateContradictionRequest,
+    namespace: &str,
+    claim_key: &str,
+) -> Result<crate::contradiction::ContradictionSet> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "INSERT INTO contradiction_sets(
+            id, namespace, realm, project, claim_key, claim_schema_version,
+            cardinality, status, version, created_at, updated_at
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,'unresolved',1,$8,$9)",
+    )
+    .bind(&id)
+    .bind(namespace)
+    .bind(&request.realm)
+    .bind(&request.project)
+    .bind(claim_key)
+    .bind(i64::from(crate::contradiction::CLAIM_SCHEMA_VERSION))
+    .bind(request.cardinality.to_string())
+    .bind(now)
+    .bind(now)
+    .execute(&mut *connection)
+    .await?;
+    for member in &request.members {
+        sqlx::query(
+            "INSERT INTO contradiction_members(contradiction_set_id, memory_id, stance, created_at)
+             VALUES($1,$2,$3,$4)",
+        )
+        .bind(&id)
+        .bind(member.memory_id)
+        .bind(member.stance.to_string())
+        .bind(now)
+        .execute(&mut *connection)
+        .await?;
+    }
+    let payload = serde_json::json!({
+        "contradiction_set_id": id,
+        "claim_key": claim_key,
+        "claim_schema_version": crate::contradiction::CLAIM_SCHEMA_VERSION,
+        "cardinality": request.cardinality,
+        "realm": request.realm,
+        "project": request.project,
+        "member_ids": request.members.iter().map(|member| member.memory_id).collect::<Vec<_>>(),
+        "reason": request.reason.trim(),
+    });
+    append_memory_ledger_on_connection(
+        connection,
+        namespace,
+        request.members.first().map(|member| member.memory_id),
+        "contradiction_create",
+        Some(&principal.actor),
+        &payload.to_string(),
+        None,
+    )
+    .await?;
+    contradiction_set_on_connection(connection, &id, namespace).await
+}
+
+pub async fn create_contradiction_set(
+    db: &Database,
+    principal: &PolicyPrincipal,
+    request: &crate::contradiction::CreateContradictionRequest,
+    namespace: &str,
+    claim_key: &str,
+) -> Result<crate::contradiction::ContradictionSet> {
+    validate_contradiction_members(db, request, namespace).await?;
+    match db.backend {
+        Backend::Sqlite => {
+            let _guard = sqlite_ledger_write_lock().lock().await;
+            let mut connection = db.pool.acquire().await?;
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *connection)
+                .await?;
+            match create_contradiction_set_on_connection(
+                &mut connection,
+                principal,
+                request,
+                namespace,
+                claim_key,
+            )
+            .await
+            {
+                Ok(set) => {
+                    sqlx::query("COMMIT").execute(&mut *connection).await?;
+                    Ok(set)
+                }
+                Err(error) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    Err(error)
+                }
+            }
+        }
+        Backend::Postgres => {
+            let mut tx = db.pool.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(namespace)
+                .execute(&mut *tx)
+                .await?;
+            let set = create_contradiction_set_on_connection(
+                &mut tx, principal, request, namespace, claim_key,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(set)
+        }
+    }
+}
+
+pub async fn get_contradiction_set(
+    db: &Database,
+    id: &str,
+    namespace: &str,
+) -> Result<crate::contradiction::ContradictionSet> {
+    let mut connection = db.pool.acquire().await?;
+    contradiction_set_on_connection(&mut connection, id, namespace).await
+}
+
+pub async fn contradiction_sets_for_memory(
+    db: &Database,
+    memory_id: i64,
+    namespace: &str,
+) -> Result<Vec<crate::contradiction::ContradictionSet>> {
+    let rows = sqlx::query(
+        "SELECT cs.id
+           FROM contradiction_sets cs
+           JOIN contradiction_members cm ON cm.contradiction_set_id=cs.id
+          WHERE cm.memory_id=$1 AND cs.namespace=$2
+          ORDER BY cs.updated_at DESC, cs.id",
+    )
+    .bind(memory_id)
+    .bind(normalize_namespace(namespace))
+    .fetch_all(&db.pool)
+    .await?;
+    let mut sets = Vec::with_capacity(rows.len());
+    let mut connection = db.pool.acquire().await?;
+    for row in rows {
+        sets.push(
+            contradiction_set_on_connection(
+                &mut connection,
+                &row.get::<String, _>("id"),
+                namespace,
+            )
+            .await?,
+        );
+    }
+    Ok(sets)
+}
+
+pub async fn contradiction_status(db: &Database) -> Result<serde_json::Value> {
+    let rows =
+        sqlx::query("SELECT status, COUNT(*) AS count FROM contradiction_sets GROUP BY status")
+            .fetch_all(&db.pool)
+            .await?;
+    let mut statuses = std::collections::BTreeMap::new();
+    for row in rows {
+        statuses.insert(row.get::<String, _>("status"), row.get::<i64, _>("count"));
+    }
+    Ok(serde_json::json!({
+        "total": statuses.values().sum::<i64>(),
+        "unresolved": statuses.get("unresolved").copied().unwrap_or(0),
+        "statuses": statuses,
+    }))
+}
+
+pub async fn delete_project_contradiction_sets(db: &Database, project: &str) -> Result<()> {
+    sqlx::query("DELETE FROM contradiction_sets WHERE realm='project' AND project=$1")
+        .bind(project)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn restore_contradiction_set(
+    db: &Database,
+    set: &crate::contradiction::ContradictionSet,
+    id_map: &std::collections::HashMap<i64, i64>,
+) -> Result<bool> {
+    let members = set
+        .members
+        .iter()
+        .filter_map(|member| {
+            id_map
+                .get(&member.memory_id)
+                .copied()
+                .map(|memory_id| (memory_id, member.stance))
+        })
+        .collect::<Vec<_>>();
+    if members.len() < 2 {
+        return Ok(false);
+    }
+    let preferred = set
+        .preferred_memory_id
+        .and_then(|memory_id| id_map.get(&memory_id).copied());
+    sqlx::query(
+        "INSERT INTO contradiction_sets(
+            id, namespace, realm, project, claim_key, claim_schema_version,
+            cardinality, preferred_memory_id, status, resolution_basis,
+            resolved_by, version, created_at, updated_at
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         ON CONFLICT(id) DO UPDATE SET preferred_memory_id=excluded.preferred_memory_id,
+            status=excluded.status, resolution_basis=excluded.resolution_basis,
+            resolved_by=excluded.resolved_by, version=excluded.version,
+            updated_at=excluded.updated_at",
+    )
+    .bind(&set.id)
+    .bind(&set.namespace)
+    .bind(&set.realm)
+    .bind(&set.project)
+    .bind(&set.claim_key)
+    .bind(i64::from(set.claim_schema_version))
+    .bind(set.cardinality.to_string())
+    .bind(preferred)
+    .bind(set.status.to_string())
+    .bind(&set.resolution_basis)
+    .bind(&set.resolved_by)
+    .bind(i64::try_from(set.version)?)
+    .bind(set.created_at)
+    .bind(set.updated_at)
+    .execute(&db.pool)
+    .await?;
+    for (memory_id, stance) in members {
+        sqlx::query(
+            "INSERT INTO contradiction_members(contradiction_set_id,memory_id,stance,created_at)
+             VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+        )
+        .bind(&set.id)
+        .bind(memory_id)
+        .bind(stance.to_string())
+        .bind(set.created_at)
+        .execute(&db.pool)
+        .await?;
+    }
+    Ok(true)
+}
+
+async fn update_contradiction_set_on_connection(
+    connection: &mut sqlx::AnyConnection,
+    principal: &PolicyPrincipal,
+    id: &str,
+    namespace: &str,
+    request: &crate::contradiction::UpdateContradictionRequest,
+) -> Result<crate::contradiction::ContradictionSet> {
+    let current = contradiction_set_on_connection(connection, id, namespace).await?;
+    if current.version != request.expected_version {
+        return Err(anyhow::Error::new(PolicyError::VersionConflict {
+            expected: request.expected_version,
+            actual: current.version,
+        }));
+    }
+    if matches!(
+        request.status,
+        crate::contradiction::ContradictionStatus::Preferred
+            | crate::contradiction::ContradictionStatus::Resolved
+    ) && request.preferred_memory_id.is_none()
+    {
+        return Err(anyhow::Error::new(PolicyError::InvalidPolicy(
+            "preferred and resolved states require a preferred memory".to_string(),
+        )));
+    }
+    if let Some(preferred) = request.preferred_memory_id {
+        if !current
+            .members
+            .iter()
+            .any(|member| member.memory_id == preferred)
+        {
+            return Err(anyhow::Error::new(PolicyError::InvalidPolicy(
+                "preferred memory must be a contradiction-set member".to_string(),
+            )));
+        }
+    }
+    let next_version = current
+        .version
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("version overflow"))?;
+    let now = Utc::now().timestamp();
+    sqlx::query(
+        "UPDATE contradiction_sets
+            SET preferred_memory_id=$1, status=$2, resolution_basis=$3,
+                resolved_by=$4, version=$5, updated_at=$6
+          WHERE id=$7 AND namespace=$8",
+    )
+    .bind(request.preferred_memory_id)
+    .bind(request.status.to_string())
+    .bind(request.basis.trim())
+    .bind(&principal.actor)
+    .bind(i64::try_from(next_version)?)
+    .bind(now)
+    .bind(id)
+    .bind(namespace)
+    .execute(&mut *connection)
+    .await?;
+    let payload = serde_json::json!({
+        "contradiction_set_id": id,
+        "old_status": current.status,
+        "new_status": request.status,
+        "old_version": current.version,
+        "new_version": next_version,
+        "preferred_memory_id": request.preferred_memory_id,
+        "basis": request.basis.trim(),
+    });
+    append_memory_ledger_on_connection(
+        connection,
+        namespace,
+        request
+            .preferred_memory_id
+            .or_else(|| current.members.first().map(|member| member.memory_id)),
+        "contradiction_update",
+        Some(&principal.actor),
+        &payload.to_string(),
+        None,
+    )
+    .await?;
+    contradiction_set_on_connection(connection, id, namespace).await
+}
+
+pub async fn update_contradiction_set(
+    db: &Database,
+    principal: &PolicyPrincipal,
+    id: &str,
+    namespace: &str,
+    request: &crate::contradiction::UpdateContradictionRequest,
+) -> Result<crate::contradiction::ContradictionSet> {
+    match db.backend {
+        Backend::Sqlite => {
+            let _guard = sqlite_ledger_write_lock().lock().await;
+            let mut connection = db.pool.acquire().await?;
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *connection)
+                .await?;
+            match update_contradiction_set_on_connection(
+                &mut connection,
+                principal,
+                id,
+                namespace,
+                request,
+            )
+            .await
+            {
+                Ok(set) => {
+                    sqlx::query("COMMIT").execute(&mut *connection).await?;
+                    Ok(set)
+                }
+                Err(error) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    Err(error)
+                }
+            }
+        }
+        Backend::Postgres => {
+            let mut tx = db.pool.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(namespace)
+                .execute(&mut *tx)
+                .await?;
+            let set =
+                update_contradiction_set_on_connection(&mut tx, principal, id, namespace, request)
+                    .await?;
+            tx.commit().await?;
+            Ok(set)
+        }
+    }
+}
+
+pub async fn ensure_graph_contradiction_set(
+    db: &Database,
+    namespace: &str,
+    realm: &str,
+    project: Option<&str>,
+    claim_key: &str,
+    memory_ids: &[i64],
+) -> Result<String> {
+    let namespace = normalize_namespace(namespace);
+    let now = Utc::now().timestamp();
+    let proposed_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO contradiction_sets(
+            id, namespace, realm, project, claim_key, claim_schema_version,
+            cardinality, status, version, created_at, updated_at
+         ) VALUES($1,$2,$3,$4,$5,$6,'single','unresolved',1,$7,$8)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&proposed_id)
+    .bind(&namespace)
+    .bind(realm)
+    .bind(project)
+    .bind(claim_key)
+    .bind(i64::from(crate::contradiction::CLAIM_SCHEMA_VERSION))
+    .bind(now)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    let row = sqlx::query(
+        "SELECT id FROM contradiction_sets
+          WHERE namespace=$1 AND realm=$2 AND COALESCE(project, '')=COALESCE($3, '')
+            AND claim_key=$4",
+    )
+    .bind(&namespace)
+    .bind(realm)
+    .bind(project)
+    .bind(claim_key)
+    .fetch_one(&db.pool)
+    .await?;
+    let id: String = row.get("id");
+    let mut inserted = 0_u64;
+    for memory_id in memory_ids {
+        inserted += sqlx::query(
+            "INSERT INTO contradiction_members(contradiction_set_id, memory_id, stance, created_at)
+             VALUES($1,$2,'competing',$3) ON CONFLICT DO NOTHING",
+        )
+        .bind(&id)
+        .bind(memory_id)
+        .bind(now)
+        .execute(&db.pool)
+        .await?
+        .rows_affected();
+    }
+    if inserted > 0 {
+        sqlx::query(
+            "UPDATE contradiction_sets SET status='unresolved', preferred_memory_id=NULL,
+                    resolution_basis=NULL, resolved_by=NULL, version=version+1, updated_at=$1
+              WHERE id=$2 AND id<>$3",
+        )
+        .bind(now)
+        .bind(&id)
+        .bind(&proposed_id)
+        .execute(&db.pool)
+        .await?;
+        let payload = serde_json::json!({
+            "contradiction_set_id": id,
+            "claim_key": claim_key,
+            "member_ids": memory_ids,
+            "detector": "graph_reconciliation_v1",
+        });
+        append_memory_ledger(
+            db,
+            &namespace,
+            memory_ids.first().copied(),
+            "contradiction_detected",
+            Some("ironmem:graph-reconciler"),
+            &payload.to_string(),
+        )
+        .await?;
+    }
+    Ok(id)
 }
 
 pub async fn append_memory_ledger(
@@ -2994,6 +5060,33 @@ pub async fn governance_inventory(db: &Database) -> Result<Vec<GovernanceInvento
         .collect())
 }
 
+/// Store-wide evidence-lineage totals used by compliance output and migration
+/// verification. Counts are derived only from memory_meta, so they are
+/// identical for SQLite FTS rowids and Postgres memory ids.
+pub async fn evidence_inventory(db: &Database) -> Result<EvidenceInventory> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS memories,
+                (SELECT COUNT(DISTINCT evidence_root_id) FROM memory_evidence_roots)
+                    AS independent_roots,
+                SUM(CASE WHEN derivation_depth = 0 THEN 1 ELSE 0 END) AS direct_memories,
+                SUM(CASE WHEN derivation_depth > 0 THEN 1 ELSE 0 END) AS derived_memories,
+                COALESCE(MAX(derivation_depth), 0) AS maximum_derivation_depth,
+                SUM(CASE WHEN evidence_root_id IS NULL OR evidence_root_id = '' THEN 1 ELSE 0 END)
+                    AS missing_roots
+         FROM memory_meta",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    Ok(EvidenceInventory {
+        memories: row.try_get("memories").unwrap_or(0),
+        independent_roots: row.try_get("independent_roots").unwrap_or(0),
+        direct_memories: row.try_get("direct_memories").unwrap_or(0),
+        derived_memories: row.try_get("derived_memories").unwrap_or(0),
+        maximum_derivation_depth: row.try_get("maximum_derivation_depth").unwrap_or(0),
+        missing_roots: row.try_get("missing_roots").unwrap_or(0),
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct InjectionEventInfo {
     pub project: String,
@@ -3379,6 +5472,7 @@ async fn reconcile_inserted_memory_edge(
     target_norm: &str,
     observed_at: i64,
 ) -> Result<()> {
+    detect_graph_contradiction(db, edge, source_norm, relation_norm, target_norm).await?;
     sqlx::query(
         "UPDATE memory_edges
          SET superseded_by = $1, superseded_reason = 'duplicate'
@@ -3426,6 +5520,71 @@ async fn reconcile_inserted_memory_edge(
         .await?;
     }
 
+    Ok(())
+}
+
+async fn detect_graph_contradiction(
+    db: &Database,
+    edge: &NewMemoryEdge,
+    source_norm: &str,
+    relation_norm: &str,
+    target_norm: &str,
+) -> Result<()> {
+    if crate::contradiction::relation_cardinality(relation_norm)
+        != Some(crate::contradiction::ClaimCardinality::Single)
+        || edge.valid_until.is_some()
+    {
+        return Ok(());
+    }
+    let owner = sqlx::query("SELECT namespace, scope FROM memory_meta WHERE memory_id=$1")
+        .bind(edge.memory_id)
+        .fetch_optional(&db.pool)
+        .await?;
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    let namespace: String = owner.get("namespace");
+    let scope: String = owner.get("scope");
+    let rows = sqlx::query(
+        "SELECT DISTINCT me.memory_id
+           FROM memory_edges me
+           JOIN memory_meta mm ON mm.memory_id = me.memory_id
+          WHERE me.project=$1 AND me.source_norm=$2 AND me.relation_norm=$3
+            AND me.target_norm<>$4 AND me.superseded_by IS NULL
+            AND mm.namespace=$5 AND mm.scope=$6",
+    )
+    .bind(&edge.project)
+    .bind(source_norm)
+    .bind(relation_norm)
+    .bind(target_norm)
+    .bind(&namespace)
+    .bind(&scope)
+    .fetch_all(&db.pool)
+    .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut memory_ids = rows
+        .into_iter()
+        .map(|row| row.get::<i64, _>("memory_id"))
+        .collect::<BTreeSet<_>>();
+    memory_ids.insert(edge.memory_id);
+    let claim_key =
+        crate::contradiction::canonical_claim_key(&format!("{}.{}", source_norm, relation_norm))?;
+    let (realm, project) = if scope == "user" {
+        ("user", None)
+    } else {
+        ("project", Some(edge.project.as_str()))
+    };
+    ensure_graph_contradiction_set(
+        db,
+        &namespace,
+        realm,
+        project,
+        &claim_key,
+        &memory_ids.into_iter().collect::<Vec<_>>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -3963,6 +6122,65 @@ pub async fn get_memory_chunk(db: &Database, chunk_id: &str) -> Result<Option<Me
     .fetch_optional(&db.pool)
     .await?;
     Ok(row.map(memory_chunk_from_row))
+}
+
+pub async fn memory_ids_for_original_reference(
+    db: &Database,
+    observation_id: Option<i64>,
+    memory_id: Option<i64>,
+    hash: Option<&str>,
+    chunk_id: Option<&str>,
+) -> Result<Vec<i64>> {
+    let mut ids = std::collections::BTreeSet::new();
+    if let Some(memory_id) = memory_id {
+        ids.insert(memory_id);
+    }
+    if let Some(chunk_id) = chunk_id {
+        if let Some(chunk) = get_memory_chunk(db, chunk_id).await? {
+            ids.insert(chunk.memory_id);
+        }
+    }
+    let id_col = match db.backend {
+        Backend::Sqlite => "rowid",
+        Backend::Postgres => "id",
+    };
+    if let Some(observation_id) = observation_id {
+        let sql = format!(
+            "SELECT m.{id_col} AS memory_id
+               FROM observations o
+               JOIN memories m ON m.session_id = o.session_id
+              WHERE o.id = $1"
+        );
+        for row in sqlx::query(&sql)
+            .bind(observation_id)
+            .fetch_all(&db.pool)
+            .await?
+        {
+            ids.insert(row.get("memory_id"));
+        }
+    }
+    if let Some(hash) = hash {
+        for row in sqlx::query(
+            "SELECT memory_id FROM memory_meta WHERE session_blob = $1
+             UNION SELECT memory_id FROM memory_chunks WHERE source_hash = $1",
+        )
+        .bind(hash)
+        .fetch_all(&db.pool)
+        .await?
+        {
+            ids.insert(row.get("memory_id"));
+        }
+        let sql = format!(
+            "SELECT m.{id_col} AS memory_id
+               FROM observations o
+               JOIN memories m ON m.session_id = o.session_id
+              WHERE o.output_blob = $1"
+        );
+        for row in sqlx::query(&sql).bind(hash).fetch_all(&db.pool).await? {
+            ids.insert(row.get("memory_id"));
+        }
+    }
+    Ok(ids.into_iter().collect())
 }
 
 pub async fn chunks_for_memories(
@@ -5260,6 +7478,16 @@ pub async fn get_memories_by_kind(
 }
 
 pub async fn delete_memory_meta(db: &Database, memory_id: i64) -> Result<()> {
+    // Explicit child-first cleanup keeps this correct even when a SQLite
+    // connection has foreign-key enforcement disabled.
+    sqlx::query("DELETE FROM memory_influence_policy WHERE memory_id = $1")
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id = $1")
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
     sqlx::query("DELETE FROM memory_meta WHERE memory_id = $1")
         .bind(memory_id)
         .execute(&db.pool)
@@ -5553,6 +7781,52 @@ pub async fn get_memory_by_id_in_namespace(
         tags: r.try_get("tags").ok().flatten(),
         created_at: r.get("created_at"),
     }))
+}
+
+pub async fn memories_by_ids_in_namespace(
+    db: &Database,
+    ids: &[i64],
+    namespace: &str,
+) -> Result<Vec<Memory>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let in_list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let id_col = match db.backend {
+        Backend::Sqlite => "rowid",
+        Backend::Postgres => "id",
+    };
+    let namespace = normalize_namespace(namespace);
+    let now = Utc::now().timestamp();
+    let sql = format!(
+        "SELECT m.{id_col} AS id, m.project, m.session_id, m.summary, m.tags, m.created_at
+           FROM memories m
+           LEFT JOIN memory_meta mm ON mm.memory_id = m.{id_col}
+          WHERE m.{id_col} IN ({in_list})
+            AND COALESCE(mm.namespace, 'local') = $1
+            AND mm.tombstoned_at IS NULL
+            AND (mm.expires_at IS NULL OR mm.expires_at > $2)"
+    );
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql)
+        .bind(namespace)
+        .bind(now)
+        .fetch_all(&db.pool)
+        .await?;
+    let by_id = rows
+        .into_iter()
+        .map(|row| {
+            let memory = Memory {
+                id: row.get("id"),
+                project: row.get("project"),
+                session_id: row.get("session_id"),
+                summary: row.get("summary"),
+                tags: row.try_get("tags").ok().flatten(),
+                created_at: row.get("created_at"),
+            };
+            (memory.id, memory)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
 }
 
 /// All memory ids + their text (for `embed --force` full re-index).
@@ -6786,6 +9060,358 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_and_derived_writes_preserve_one_evidence_root() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = create_session(&db, "/tmp/evidence").await?;
+
+        let root_id = insert_memory(&db, "/tmp/evidence", &session, "direct source", None).await?;
+        apply_memory_governance(
+            &db,
+            root_id,
+            "project",
+            "fact",
+            &crate::governance::MemoryGovernance::explicit(),
+            Some("test"),
+            "remember",
+        )
+        .await?;
+        let child_id = insert_memory(&db, "/tmp/evidence", &session, "derived child", None).await?;
+        apply_memory_governance(
+            &db,
+            child_id,
+            "project",
+            "fact",
+            &crate::governance::MemoryGovernance::derived_from(root_id),
+            Some("test"),
+            "derive",
+        )
+        .await?;
+        let grandchild_id =
+            insert_memory(&db, "/tmp/evidence", &session, "derived grandchild", None).await?;
+        apply_memory_governance(
+            &db,
+            grandchild_id,
+            "project",
+            "fact",
+            &crate::governance::MemoryGovernance::derived_from(child_id),
+            Some("test"),
+            "derive",
+        )
+        .await?;
+
+        let root = get_memory_meta_full(&db, root_id).await?;
+        let child = get_memory_meta_full(&db, child_id).await?;
+        let grandchild = get_memory_meta_full(&db, grandchild_id).await?;
+        assert_eq!(root.derivation_depth, 0);
+        assert_eq!(child.derivation_depth, 1);
+        assert_eq!(grandchild.derivation_depth, 2);
+        assert_eq!(child.evidence_root_id, root.evidence_root_id);
+        assert_eq!(grandchild.evidence_root_id, root.evidence_root_id);
+        assert_eq!(memory_evidence_roots(&db, grandchild_id).await?.len(), 1);
+
+        let inventory = evidence_inventory(&db).await?;
+        assert_eq!(inventory.memories, 3);
+        assert_eq!(inventory.independent_roots, 1);
+        assert_eq!(inventory.direct_memories, 1);
+        assert_eq!(inventory.derived_memories, 2);
+        assert_eq!(inventory.maximum_derivation_depth, 2);
+        assert_eq!(inventory.missing_roots, 0);
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_less_direct_writes_receive_distinct_durable_roots() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let first = insert_memory(&db, "/tmp/evidence", "remember", "same fact", None).await?;
+        let second = insert_memory(&db, "/tmp/evidence", "remember", "same fact", None).await?;
+        let governance = crate::governance::MemoryGovernance::explicit();
+        apply_memory_governance(
+            &db,
+            first,
+            "project",
+            "fact",
+            &governance,
+            Some("test"),
+            "remember",
+        )
+        .await?;
+        let first_root = get_memory_meta_full(&db, first)
+            .await?
+            .evidence_root_id
+            .expect("first root");
+        apply_memory_governance(
+            &db,
+            first,
+            "project",
+            "fact",
+            &governance,
+            Some("test"),
+            "update",
+        )
+        .await?;
+        assert_eq!(
+            get_memory_meta_full(&db, first).await?.evidence_root_id,
+            Some(first_root.clone()),
+            "a stored UUID root must survive later governance updates"
+        );
+
+        apply_memory_governance(
+            &db,
+            second,
+            "project",
+            "fact",
+            &governance,
+            Some("test"),
+            "remember",
+        )
+        .await?;
+        let second_root = get_memory_meta_full(&db, second)
+            .await?
+            .evidence_root_id
+            .expect("second root");
+        assert_ne!(
+            first_root, second_root,
+            "separate direct observations are independent even when text matches"
+        );
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multi_source_evidence_deduplicates_roots_and_enforces_namespace() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = create_session(&db, "/tmp/evidence").await?;
+        let first = insert_memory(&db, "/tmp/evidence", &session, "source one", None).await?;
+        let second = insert_memory(&db, "/tmp/evidence", &session, "source two", None).await?;
+        for id in [first, second] {
+            apply_memory_governance(
+                &db,
+                id,
+                "project",
+                "fact",
+                &crate::governance::MemoryGovernance::explicit(),
+                Some("test"),
+                "remember",
+            )
+            .await?;
+        }
+        let derived = insert_memory(&db, "/tmp/evidence", &session, "synthesis", None).await?;
+        apply_memory_governance(
+            &db,
+            derived,
+            "project",
+            "inference",
+            &crate::governance::MemoryGovernance::derived_from(first),
+            Some("test"),
+            "derive",
+        )
+        .await?;
+        assert_eq!(
+            add_supporting_evidence_from_memories(&db, derived, &[first, second, second]).await?,
+            1
+        );
+        assert_eq!(memory_evidence_roots(&db, derived).await?.len(), 2);
+
+        let foreign = insert_memory(&db, "/tmp/evidence", &session, "foreign", None).await?;
+        let mut foreign_governance = crate::governance::MemoryGovernance::explicit();
+        foreign_governance.namespace = "tenant-b".to_string();
+        apply_memory_governance(
+            &db,
+            foreign,
+            "project",
+            "fact",
+            &foreign_governance,
+            Some("test"),
+            "remember",
+        )
+        .await?;
+        assert!(
+            add_supporting_evidence_from_memories(&db, derived, &[foreign])
+                .await
+                .is_err(),
+            "cross-namespace evidence must be rejected"
+        );
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn evidence_repair_is_idempotent_and_reports_broken_parents() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = create_session(&db, "/tmp/evidence").await?;
+        let id = insert_memory(&db, "/tmp/evidence", &session, "legacy orphan", None).await?;
+        sqlx::query(
+            "UPDATE memory_meta
+             SET parent_memory_id = 999999, evidence_root_id = NULL, derivation_depth = 0
+             WHERE memory_id = $1",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id = $1")
+            .bind(id)
+            .execute(&db.pool)
+            .await?;
+
+        let repaired = repair_evidence_roots(&db).await?;
+        assert_eq!(repaired.broken_parent_memory_ids, vec![id]);
+        assert_eq!(repaired.new_roots, 1);
+        assert_eq!(repaired.roots_backfilled, 1);
+        let meta = get_memory_meta_full(&db, id).await?;
+        assert!(meta.evidence_root_id.is_some());
+        assert_eq!(meta.derivation_depth, 0);
+
+        let repeated = repair_evidence_roots(&db).await?;
+        assert_eq!(repeated.roots_backfilled, 0);
+        assert!(repeated.broken_parent_memory_ids.is_empty());
+
+        let migration = evidence_root_migration_report(&db)
+            .await?
+            .expect("startup migration report");
+        assert_eq!(migration.0, "complete");
+        assert!(migration.1.cycle_memory_ids.is_empty());
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn evidence_repair_detects_parent_cycles_without_assigning_roots() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = create_session(&db, "/tmp/evidence").await?;
+        let first = insert_memory(&db, "/tmp/evidence", &session, "cycle one", None).await?;
+        let second = insert_memory(&db, "/tmp/evidence", &session, "cycle two", None).await?;
+        sqlx::query(
+            "UPDATE memory_meta
+             SET parent_memory_id = CASE memory_id WHEN $1 THEN $2 ELSE $1 END,
+                 evidence_root_id = NULL,
+                 derivation_depth = 0
+             WHERE memory_id IN ($1, $2)",
+        )
+        .bind(first)
+        .bind(second)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id IN ($1, $2)")
+            .bind(first)
+            .bind(second)
+            .execute(&db.pool)
+            .await?;
+
+        let report = repair_evidence_roots(&db).await?;
+        assert_eq!(report.cycle_memory_ids, vec![first, second]);
+        assert!(get_memory_meta_full(&db, first)
+            .await?
+            .evidence_root_id
+            .is_none());
+        assert!(get_memory_meta_full(&db, second)
+            .await?
+            .evidence_root_id
+            .is_none());
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_migration_backfills_legacy_memories_without_meta_rows() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "ironmem-evidence-legacy-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let path = path.to_string_lossy().to_string();
+        let db = Database::new(&path).await?;
+        sqlx::query(
+            "CREATE VIRTUAL TABLE memories USING fts5(
+                project, session_id, summary, tags, created_at UNINDEXED
+             )",
+        )
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO memories(project, session_id, summary, tags, created_at)
+             VALUES('/legacy', 'legacy-session', 'legacy source', NULL, 10)",
+        )
+        .execute(&db.pool)
+        .await?;
+
+        db.migrate().await?;
+        let meta = get_memory_meta_full(&db, 1).await?;
+        assert!(meta.evidence_root_id.is_some());
+        assert_eq!(meta.derivation_depth, 0);
+        assert_eq!(memory_evidence_roots(&db, 1).await?.len(), 1);
+        let (status, report) = evidence_root_migration_report(&db)
+            .await?
+            .expect("migration report");
+        assert_eq!(status, "complete");
+        assert_eq!(report.meta_rows_created, 1);
+        assert_eq!(report.roots_backfilled, 1);
+
+        // A direct legacy writer can add a row after the migration was marked
+        // complete. The next startup must repair it instead of trusting the old
+        // completion marker forever.
+        sqlx::query(
+            "INSERT INTO memories(project, session_id, summary, tags, created_at)
+             VALUES('/legacy', 'legacy-session', 'late legacy source', NULL, 11)",
+        )
+        .execute(&db.pool)
+        .await?;
+        db.migrate().await?;
+        let late = get_memory_meta_full(&db, 2).await?;
+        assert!(late.evidence_root_id.is_some());
+        assert_eq!(memory_evidence_roots(&db, 2).await?.len(), 1);
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_migration_fails_closed_and_stores_cycle_report() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = create_session(&db, "/tmp/evidence").await?;
+        let first = insert_memory(&db, "/tmp/evidence", &session, "cycle a", None).await?;
+        let second = insert_memory(&db, "/tmp/evidence", &session, "cycle b", None).await?;
+        sqlx::query(
+            "UPDATE memory_meta
+             SET parent_memory_id = CASE memory_id WHEN $1 THEN $2 ELSE $1 END,
+                 evidence_root_id = NULL,
+                 derivation_depth = 0
+             WHERE memory_id IN ($1, $2)",
+        )
+        .bind(first)
+        .bind(second)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id IN ($1, $2)")
+            .bind(first)
+            .bind(second)
+            .execute(&db.pool)
+            .await?;
+        sqlx::query("DELETE FROM schema_migrations WHERE migration_id = $1")
+            .bind(EVIDENCE_ROOT_MIGRATION_ID)
+            .execute(&db.pool)
+            .await?;
+
+        let error = db
+            .migrate()
+            .await
+            .expect_err("lineage cycles must fail migration");
+        assert!(error.to_string().contains("parent cycle"));
+        let (status, report) = evidence_root_migration_report(&db)
+            .await?
+            .expect("failed migration report");
+        assert_eq!(status, "failed");
+        assert_eq!(report.cycle_memory_ids, vec![first, second]);
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn namespace_filters_recall_boundaries() -> Result<()> {
         let (db, path) = test_db().await?;
         let s = create_session(&db, "/tmp/p").await?;
@@ -6846,9 +9472,152 @@ mod tests {
 
         assert!(governed_delete_memory(&db, id, Some("test"), Some("unit test")).await?);
         assert!(get_memory_by_id(&db, id).await?.is_none());
+        let replacement = insert_memory(&db, "/tmp/p", &s, "replacement", None).await?;
+        assert!(
+            replacement > id,
+            "SQLite must not reuse a row id whose audit metadata is retained"
+        );
         let ledger = memory_ledger_for_memory(&db, id).await?;
         assert!(ledger.iter().any(|e| e.op_type == "remember"));
         assert!(ledger.iter().any(|e| e.op_type == "forget"));
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn influence_policy_is_sparse_versioned_ledgered_and_legal_hold_safe() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = create_session(&db, "/tmp/policy").await?;
+        let memory_id = insert_memory(
+            &db,
+            "/tmp/policy",
+            &session,
+            "policy-controlled memory",
+            None,
+        )
+        .await?;
+        let mut governance = crate::governance::MemoryGovernance::explicit();
+        governance.legal_hold = true;
+        apply_memory_governance(
+            &db,
+            memory_id,
+            "project",
+            "fact",
+            &governance,
+            Some("test"),
+            "remember",
+        )
+        .await?;
+
+        let count: i64 = sqlx::query("SELECT COUNT(*) AS count FROM memory_influence_policy")
+            .fetch_one(&db.pool)
+            .await?
+            .get("count");
+        assert_eq!(count, 0, "permissive defaults must stay implicit");
+        let default = get_memory_influence_policy(&db, memory_id, "local").await?;
+        assert!(!default.explicit);
+        assert!(default.policy.is_permissive());
+
+        let principal = PolicyPrincipal::local_operator("operator:test");
+        let first_request = PolicyMutationRequest {
+            expected_version: 1,
+            patch: crate::influence::MemoryInfluencePolicyPatch {
+                state: Some(crate::influence::InfluenceState::Blocked),
+                denied_task_types: Some(vec!["Deploy Prod".to_string()]),
+                ..Default::default()
+            },
+            reason: "prevent action use while evidence is reviewed".to_string(),
+            request_id: "policy-test-1".to_string(),
+        };
+        let updated =
+            update_memory_influence_policy(&db, memory_id, "local", &principal, &first_request)
+                .await?;
+        assert_eq!(updated.policy.version, 2);
+        assert_eq!(
+            updated.policy.state,
+            crate::influence::InfluenceState::Blocked
+        );
+        assert_eq!(updated.policy.denied_task_types, ["deploy_prod"]);
+
+        let ledger = memory_ledger_for_memory(&db, memory_id).await?;
+        let transition = ledger
+            .iter()
+            .find(|entry| entry.op_type == "influence_policy_update")
+            .expect("policy transition ledger entry");
+        let payload: serde_json::Value = serde_json::from_str(&transition.payload)?;
+        assert_eq!(payload["old_version"], 1);
+        assert_eq!(payload["new_version"], 2);
+        assert_eq!(payload["authority"], "local_operator");
+        assert_eq!(payload["request_id"], "policy-test-1");
+
+        let stale = update_memory_influence_policy(
+            &db,
+            memory_id,
+            "local",
+            &principal,
+            &PolicyMutationRequest {
+                expected_version: 1,
+                patch: crate::influence::MemoryInfluencePolicyPatch {
+                    state: Some(crate::influence::InfluenceState::Eligible),
+                    ..Default::default()
+                },
+                reason: "stale writer".to_string(),
+                request_id: "policy-test-stale".to_string(),
+            },
+        )
+        .await
+        .expect_err("stale policy update must fail");
+        assert!(matches!(
+            crate::influence::policy_error(&stale),
+            Some(PolicyError::VersionConflict {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        assert_eq!(
+            get_memory_influence_policy(&db, memory_id, "local")
+                .await?
+                .policy
+                .state,
+            crate::influence::InfluenceState::Blocked
+        );
+
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn influence_policy_cleanup_is_explicitly_child_first() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = create_session(&db, "/tmp/policy-cleanup").await?;
+        let memory_id =
+            insert_memory(&db, "/tmp/policy-cleanup", &session, "cleanup policy", None).await?;
+        update_memory_influence_policy(
+            &db,
+            memory_id,
+            "local",
+            &PolicyPrincipal::local_operator("operator:test"),
+            &PolicyMutationRequest {
+                expected_version: 1,
+                patch: crate::influence::MemoryInfluencePolicyPatch {
+                    state: Some(crate::influence::InfluenceState::Blocked),
+                    ..Default::default()
+                },
+                reason: "cleanup test".to_string(),
+                request_id: "policy-cleanup".to_string(),
+            },
+        )
+        .await?;
+        delete_memory_meta(&db, memory_id).await?;
+        let count: i64 = sqlx::query(
+            "SELECT COUNT(*) AS count FROM memory_influence_policy WHERE memory_id = $1",
+        )
+        .bind(memory_id)
+        .fetch_one(&db.pool)
+        .await?
+        .get("count");
+        assert_eq!(count, 0);
 
         let _ = std::fs::remove_file(path);
         Ok(())
