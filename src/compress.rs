@@ -161,6 +161,7 @@ fn local_explicit_relations(observations: &[db::Observation]) -> Vec<MemoryRelat
 /// through CCR and observation chunks immediately after persistence.
 fn local_compression_result(observations: &[db::Observation]) -> CompressionResult {
     let transcript = build_transcript(observations);
+    let extraction = crate::local_extractor::extract(observations);
     CompressionResult {
         summary: format!(
             "Local session archive ({} observations)\n{}",
@@ -170,6 +171,8 @@ fn local_compression_result(observations: &[db::Observation]) -> CompressionResu
         tags: "local-compression session-archive".to_string(),
         importance: 5,
         kind: "session".to_string(),
+        facts: extraction.facts,
+        procedures: extraction.procedures,
         relations: local_explicit_relations(observations),
         ..CompressionResult::default()
     }
@@ -1402,7 +1405,10 @@ mod tests {
         assert!(result.tags.contains("local-compression"));
         assert!(result.summary.contains("cargo test"));
         assert!(result.summary.contains("test result: ok"));
-        assert!(result.facts.is_empty());
+        assert_eq!(
+            result.facts,
+            vec!["Command `cargo test` completed successfully."]
+        );
         assert_eq!(result.relations.len(), 2);
         assert_eq!(result.relations[0].source, "Run:proof-1");
         assert_eq!(result.relations[0].relation, "completed_for");

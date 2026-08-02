@@ -16,6 +16,7 @@ mod eval;
 mod expansion;
 mod governance;
 mod hooks;
+mod local_extractor;
 mod mcp;
 mod metrics;
 mod observer;
