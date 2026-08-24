@@ -455,7 +455,7 @@ Restart your terminal and Claude Code. That's it.
 
 ```bash
 ironmem server              # Start REST + MCP SSE server
-ironmem mcp                 # Start MCP stdio server (for Claude Desktop/Code)
+ironmem mcp                 # Start MCP stdio server (for Claude Desktop/Code and Codex)
 ironmem serve               # Start SSE server with bearer token auth
 ironmem serve --public      # Same + Cloudflare Tunnel for remote MCP clients
 ironmem serve --public --no-auth  # Authless public tunnel for claude.ai personal use
@@ -521,6 +521,7 @@ IronMem works as an **MCP server** (native integration) or via **IRONMEM.md** (p
 | -------- | :--------: | :--------: | ----- |
 | **Claude Code** | **Yes** | Yes | [Setup →](#claude-code-mcp-setup) |
 | **Claude Desktop** | **Yes** | Yes | [Setup →](#claude-desktop-mcp-setup) |
+| **Codex** | **Yes** | Yes | [Setup →](#codex-mcp-setup) |
 | **claude.ai** | **Yes** | Yes | [Setup →](#claudeai-web) |
 | **Cursor** | **Yes** | Yes | [Setup →](#cursor--windsurf-mcp-setup) |
 | **Windsurf** | **Yes** | Yes | [Setup →](#cursor--windsurf-mcp-setup) |
@@ -536,7 +537,7 @@ IronMem works as an **MCP server** (native integration) or via **IRONMEM.md** (p
 
 IronMem supports two MCP transports:
 
-- **stdio** - for local clients that launch the server themselves (Claude Code, Claude Desktop, Cursor)
+- **stdio** - for local clients that launch the server themselves (Claude Code, Claude Desktop, Codex, Cursor)
 - **Streamable HTTP** - for remote/cloud clients that connect over HTTP. Uses
   request/response and bearer-token auth, so it works through tunnels and reverse
   proxies for clients that support static bearer tokens.
@@ -599,16 +600,59 @@ Add to your `claude_desktop_config.json`:
 
 Replace `/Users/YOU` with your actual home directory path. Restart Claude Desktop after saving.
 
+### Codex MCP Setup
+
+Codex connects locally through **stdio**:
+
+```bash
+codex mcp add ironmem -- ~/.ironmem/bin/ironmem mcp
+codex mcp get ironmem
+```
+
+Open a new Codex task after adding the server. MCP tools are loaded when a task
+starts, so an already-open task will not hot-load the new tool list.
+
 ### claude.ai (Web)
 
 claude.ai runs in the cloud, so it **cannot** reach `localhost`.
 
-IronMem is a local-first tool. The recommended setup for full MCP access is **Claude Code** or **Claude Desktop** using stdio.
+IronMem is a local-first tool. The recommended setup for full MCP access is
+**Claude Code**, **Claude Desktop**, or **Codex** using stdio.
 
 Anthropic's current `claude.ai` custom connector UI supports **authless** and
 **OAuth-based** remote MCP servers, but not a manual static bearer-token field.
-For personal use, the honest compatibility path is an **authless ephemeral
-tunnel**:
+The recommended web setup is a **stable HTTPS endpoint protected by OAuth**.
+Keep IronMem and its database local, expose only the loopback MCP origin through
+a named tunnel or hardened reverse proxy, and enforce authentication before any
+request reaches `/mcp`.
+
+One supported deployment shape is a named Cloudflare Tunnel plus a self-hosted
+Cloudflare Access application with Managed OAuth:
+
+1. Start the loopback-only MCP HTTP origin with `ironmem serve --no-auth`.
+2. Route a stable hostname such as `ironmem.example.com` through a named tunnel
+   to `http://127.0.0.1:37779`. Do not publish the REST port `37778`.
+3. Protect the hostname with a Cloudflare Access allow policy and enable Managed
+   OAuth. Restrict the policy to the intended user identity.
+4. Install both IronMem and the named tunnel as operating-system services so
+   they restart after a reboot.
+5. Add `https://ironmem.example.com/mcp` as the claude.ai custom connector and
+   complete the OAuth login.
+6. Verify that a request without OAuth returns `401` before doing a live
+   `get_status`, `remember`, and `search_memories` round trip.
+
+In this topology, `--no-auth` applies only to the loopback origin. Cloudflare
+Access is the public authentication boundary. Never expose that origin directly
+or create a DNS route that bypasses Access.
+
+IronMem's first-class OAuth 2.1 remote transport is tracked in
+[issue #44](https://github.com/BMC-INC/Iron-mem/issues/44). Until it ships,
+Access Managed OAuth is the recommended authenticated bridge for claude.ai.
+
+#### Temporary authless troubleshooting only
+
+If you explicitly accept unauthenticated internet exposure for a short-lived
+diagnostic session, IronMem can still create an ephemeral Quick Tunnel:
 
 ```bash
 ironmem serve --public --no-auth
@@ -646,8 +690,9 @@ The `trycloudflare.com` URL is ephemeral and changes whenever you restart the pu
 
 **This is no longer local-only.** The tunnel exposes your MCP endpoint over the internet for as long as it is running.
 
-For a personal local tool, this tradeoff is often acceptable because the URL is
-short-lived and changes on each restart. Still, use `--no-auth` deliberately.
+The random URL is not an authentication control. Anyone who obtains it can call
+the exposed tools. Do not use this mode with real memories or as a persistent
+claude.ai connector.
 
 **Without `--no-auth`:** `ironmem serve` and `ironmem serve --public` use bearer-token auth for clients that support static bearer tokens.
 

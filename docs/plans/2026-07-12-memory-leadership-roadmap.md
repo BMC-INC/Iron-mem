@@ -168,6 +168,20 @@ Remaining Phase 2: enable-by-default decision + the coverage-diff pass (log vs t
 - **SDKs shipped** (`sdk/python`, `sdk/typescript`): zero-dependency typed clients over the REST surface — session lifecycle, remember (full governance fields), context/skim, feedback, lineage, compliance report, snapshots, status, profile; bearer/agent-key auth. Python smoke-tested against a live server (remember → context → lineage → compliance chain-valid); TypeScript compiles clean under `tsc --strict`. Registry publishing (PyPI/npm) intentionally deferred.
 Remaining Phase 5: publish harness results page + registry publishing — both blocked on the benchmark runs by design.
 
+### Phase 6 - Authenticated remote MCP transport
+
+1. **OAuth 2.1 resource server:** protect Streamable HTTP with RFC 9728 resource metadata, RFC 8414 or OpenID Connect discovery, PKCE S256, and RFC 8707 audience binding.
+2. **Client interoperability:** support Client ID Metadata Documents, Dynamic Client Registration, and explicit preregistration so claude.ai, Codex, and other compliant MCP clients can connect without a shared static token.
+3. **Governed authorization:** map authenticated subjects and scopes onto agent identities, namespace allowlists, read/write permissions, ledger attribution, and governed deletion boundaries.
+4. **Security floor:** validate issuer, signature, audience, expiry, not-before, and scopes on every request; redact secrets from logs; prohibit token passthrough; test redirect URI matching, replay boundaries, namespace isolation, and key rotation.
+5. **Operator experience:** ship a stable HTTPS deployment runbook, IdP configuration, reboot recovery, revocation, and an authenticated end-to-end connector test for claude.ai and Codex.
+
+**Tracking:** [issue #44](https://github.com/BMC-INC/Iron-mem/issues/44).
+
+**Interim:** use a named Cloudflare Tunnel with Cloudflare Access Managed OAuth in front of a loopback-only IronMem MCP origin. The unauthenticated Quick Tunnel remains a temporary diagnostic mode, not the recommended web deployment.
+
+**Exit criteria:** claude.ai and Codex complete OAuth login and pass `get_status`, `remember`, and `search_memories`; invalid or insufficient tokens cannot initialize MCP; local stdio remains unchanged; the threat model and operator runbook are complete.
+
 ---
 
 ## 4. Sequencing
@@ -178,6 +192,7 @@ Phase 0 (measure) ──► Phase 1 (retrieval) ──► Phase 2 (extraction) �
         └─► Phase 3.1/3.2 (governance parity/positive) ─────────────────────┘
 Phase 3.3–3.5 (compliance report/marketing) — independent, start early (Aug 2026 deadline)
 Phase 5 (ecosystem) — independent, interleave
+Phase 6 (authenticated remote MCP) — independent, security-gated
 ```
 
 - Every change lands behind config/env flags with eval-gated defaults, so live deployments are never at risk.
