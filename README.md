@@ -51,83 +51,83 @@
 > temporal graph recall, source-backed retrieval, adaptive skim/expand context,
 > sleep-cycle compression, governed influence controls, and 24 MCP tools.
 
-- **CCR — losslessly reversible memory** (Headroom pattern) — every truncated tool
+- **CCR - losslessly reversible memory** (Headroom pattern) - every truncated tool
   output and the verbatim pre-LLM session transcript is preserved in a
   content-addressed, deduplicated, byte-exact compressed blob store inside the DB.
   **`retrieve_original`** pulls the exact original back by `observation_id`,
   `memory_id`, raw blob `hash`, or the `chunk_id` expansion handle.
-- **Memory scoping & typed memories** (Supermemory patterns) — memories carry a
+- **Memory scoping & typed memories** (Supermemory patterns) - memories carry a
   **scope** (`project` vs. `user`/cross-project) and a **kind** (`session`, `fact`,
   `error_solution`, `preference`, `procedural`, `architecture`, `learned_pattern`,
   `project_config`, `profile`). Session-start injection ranks **project ∪ user**
   memories and boosts durable kinds.
-- **Local-first typed extraction** — deterministic on-device extraction is the
+- **Local-first typed extraction** - deterministic on-device extraction is the
   default and requires no cloud credential. It produces a searchable archive,
   typed facts, reusable procedures, chunks, and a lossless CCR transcript.
   Optional cloud enrichment is explicit opt-in and always falls back to the
   complete local path if the provider is unavailable.
-- **Recoverable extraction** — receipt-backed, idempotent transcript backfill has
+- **Recoverable extraction** - receipt-backed, idempotent transcript backfill has
   dry-run, checkpoint/resume, source-hash verification, deny-safe deduplication,
   provenance-preserving child writes, yield/coverage metrics, and zero-yield
   streak alerts. Source archives are never rewritten or deleted.
-- **Record-run retrieval stack** — hybrid FTS/vector/graph recall now includes
+- **Record-run retrieval stack** - hybrid FTS/vector/graph recall now includes
   routed weighted fusion, source-fact retention, temporal event boosts, multi-hop
   query expansion, deterministic query decomposition, entity alias expansion,
   temporal conflict handling, structured-evidence reranking, rerank re-anchoring,
   and optional cross-encoder reranking.
-- **Adaptive working-memory skim** — every compressed or explicit memory gets
+- **Adaptive working-memory skim** - every compressed or explicit memory gets
   durable `memory_chunks` with density, kind, title, token estimate, and optional
   exact transcript offsets. Agents can skim broadly with **`memory_skim`**, then
   expand exact evidence with **`retrieve_original(chunk_id=...)`**.
-- **Governed recall** — memories carry namespace, source type, trust tier,
+- **Governed recall** - memories carry namespace, source type, trust tier,
   writer/source provenance, classification, consent state, residency, retention
   metadata, legal hold, tombstone state, record hash, and an append-only ledger
   hash chain. Reads are namespace-scoped and active-only by default; PHI/PII
   writes fail closed unless consent is granted.
-- **Governed influence and purpose-bound egress** — versioned per-memory policy
+- **Governed influence and purpose-bound egress** - versioned per-memory policy
   can quarantine, block, restrict task types or action risk, require original
   evidence, require human confirmation, and cap derivation depth. One shared gate
   protects REST, MCP, CLI, Workbench, source expansion, and file injection;
   remote strict-mode purpose attestations and confirmations are scoped,
   expiring, and replay-protected, while audit receipts retain hashes instead of
   raw queries or intended actions.
-- **Contradiction governance** — competing claims remain preserved in versioned
+- **Contradiction governance** - competing claims remain preserved in versioned
   project- or user-realm sets. Operators can inspect, prefer, resolve, or mark
   sets obsolete without deleting evidence; high-risk retrieval can fail closed
   on unresolved contradictions.
-- **Closed-loop memory quality** — injection events and explicit feedback reinforce
+- **Closed-loop memory quality** - injection events and explicit feedback reinforce
   useful memories and decay repeatedly ignored or corrected memories without
   deleting provenance.
-- **Sleep-cycle auto-compression** — `ironmem sweep` and `ironmem scheduler run`
+- **Sleep-cycle auto-compression** - `ironmem sweep` and `ironmem scheduler run`
   compact idle or high-volume sessions without manual `session_end`, with DB
   leases, dry-run mode, audit events, and slower dream/reflection passes.
-- **GPU-ready cross-encoder reranking** — `rerank.backend = "cross_encoder"` uses
+- **GPU-ready cross-encoder reranking** - `rerank.backend = "cross_encoder"` uses
   the local ONNX reranker when available, with a `gpu` feature for CUDA-backed
   benchmark-scale runs and a safe fallback when the model is unavailable.
-- **AST-bound Rust anchors** — `ironmem code-relink` uses Tree-sitter to hash Rust
+- **AST-bound Rust anchors** - `ironmem code-relink` uses Tree-sitter to hash Rust
   symbols and relink memories when code moves across files.
-- **Reflection, snapshots, and sync** — dry-run-first consolidation proposals,
+- **Reflection, snapshots, and sync** - dry-run-first consolidation proposals,
   CCR-backed project brain snapshots, and an idempotent Lamport-clock sync event
   log support long-lived and multi-agent memory workflows.
-- **`remember` tool** — store an explicit, typed memory in one call (`scope`, `kind`,
+- **`remember` tool** - store an explicit, typed memory in one call (`scope`, `kind`,
   `text`, `tags`). User-scope facts follow you into every project and also enter
   the skim layer.
-- **User profile** — cross-project memories are distilled into a single
+- **User profile** - cross-project memories are distilled into a single
   always-injected profile. Read/regenerate with **`get_profile`** /
   **`refresh_profile`**.
-- **Correction miner** — error→fix loops are mined into `error_solution` memories
+- **Correction miner** - error→fix loops are mined into `error_solution` memories
   and surfaced via **`list_corrections`**, so past fixes resurface when work recurs.
-- **24 MCP tools** now — including `memory_skim`, `retrieve_original`, `remember`,
+- **24 MCP tools** now - including `memory_skim`, `retrieve_original`, `remember`,
   `get_memory_influence`, `set_memory_influence`, `manage_contradiction`,
   `get_profile`, `list_corrections`, `memory_graph`, and `dream_memory`.
-- **Temporal recall + graph recall** — dated facts and `event_time` metadata power timestamp lookup, while `memory_edges` stores structured `source | relation | target` edges with valid-time filters and provenance. Temporal questions route toward date-bearing facts; relationship questions route toward graph edges.
-- **Memory Graph Workbench** — the built-in local UI is now a temporal graph
+- **Temporal recall + graph recall** - dated facts and `event_time` metadata power timestamp lookup, while `memory_edges` stores structured `source | relation | target` edges with valid-time filters and provenance. Temporal questions route toward date-bearing facts; relationship questions route toward graph edges.
+- **Memory Graph Workbench** - the built-in local UI is now a temporal graph
   investigation surface with project/query/date/history filters, an interactive
   canvas, retrieval-trace highlighting, governed memory metadata, structured
   chunks, graph provenance, influence-policy state, contradiction sets,
   authorized influence receipts, read-only policy simulation, and one-click
   expansion to exact original source.
-- **Benchmarked on LoCoMo:** 68.4% overall (Gemini 2.5 Pro answerer + Pro judge, 1,540 scored questions, 0 errors) with governance-off retrieval, +2.1 points over the governed baseline. Full harness, result files, and reproduction: **[ironmem-locomo-benchmark](https://github.com/BMC-INC/ironmem-locomo-benchmark)**. See [Benchmarks](#benchmarks).
+- **Benchmarked on LoCoMo:** 72.4% overall (Gemini 2.5 Pro answerer + Pro judge, 1,540 scored questions, 0 errors) using hybrid retrieval, pool 100, retrieve-limit 25, the v2 answer prompt, synthesis, and deterministic normalized-hint recall supplements. Full harness, result files, and reproduction: **[ironmem-locomo-benchmark](https://github.com/BMC-INC/ironmem-locomo-benchmark)**. See [Benchmarks](#benchmarks).
 - **External storage adapters:** a `StorageBackend` trait with a HYBRID mode lets vector and graph layers run on real external backends (Qdrant over HTTP for vectors, Neo4j for the graph) instead of only the embedded SQLite store, while keeping the native path the default.
 - **Retrieval + governance instrumentation:** governance-cost timings in `/status`, a temporal-trust trajectory signal, a compression coverage pass, and the path-to-70 retrieval batch (routed fusion, structured evidence, pool/context tuning, multi-hop decomposition, entity aliases, temporal conflict handling, and source-backed evidence chains).
 - **Valid-time temporal recall:** `remember` accepts an optional `event_at` (an ISO `YYYY-MM-DD` date or a `YYYY-MM-DD..YYYY-MM-DD` range) for when an event actually occurred, distinct from the storage time (`created_at`). Valid-time dates are surfaced through an `event_times` side map on search, list, context, and skim results, powering time-aware retrieval.
@@ -141,25 +141,25 @@
 <details>
 <summary>v0.3.0</summary>
 
-- **Multi-provider compression** — use OpenAI, Google Gemini, or Anthropic as your LLM. Set `"provider": "openai"` in settings.
-- **Neovim plugin** — native Lua plugin with auto session lifecycle, `:IronMemSearch`, `:IronMemStatus`
-- **Windows support** — `install.ps1`, platform-aware messages, robust home directory detection
-- **Web UI** — browse, search, and delete memories at `http://localhost:37778/ui`
-- **Discovery tools** — list known projects, search across all projects, and inspect per-project session history
+- **Multi-provider compression** - use OpenAI, Google Gemini, or Anthropic as your LLM. Set `"provider": "openai"` in settings.
+- **Neovim plugin** - native Lua plugin with auto session lifecycle, `:IronMemSearch`, `:IronMemStatus`
+- **Windows support** - `install.ps1`, platform-aware messages, robust home directory detection
+- **Web UI** - browse, search, and delete memories at `http://localhost:37778/ui`
+- **Discovery tools** - list known projects, search across all projects, and inspect per-project session history
 - **Still zero telemetry. Still local-first. Your data stays yours.**
 </details>
 
 <details>
 <summary>v0.2.0</summary>
 
-- **Initial 13 MCP tools** — session_start, session_end, record_event,
+- **Initial 13 MCP tools** - session_start, session_end, record_event,
   compress_session, get_context, get_status, list_memories, search_memories,
   search_global, list_projects, list_sessions, inject_context, wipe_project
-- **Dual database** — SQLite (local, FTS5 full-text search) + Postgres (self-hosted, tsvector) via `DATABASE_URL`
-- **Every MCP client** — Claude Desktop, Claude Code, Cursor, Windsurf, ChatGPT Desktop, Zed, and more
-- **Docker deployment** — `docker-compose up` for remote/team setups with Postgres
-- **`ironmem mcp`** — new subcommand for direct MCP stdio transport (Claude Desktop/Code)
-- **REST server still works** — existing hooks and curl-based workflows unaffected
+- **Dual database** - SQLite (local, FTS5 full-text search) + Postgres (self-hosted, tsvector) via `DATABASE_URL`
+- **Every MCP client** - Claude Desktop, Claude Code, Cursor, Windsurf, ChatGPT Desktop, Zed, and more
+- **Docker deployment** - `docker-compose up` for remote/team setups with Postgres
+- **`ironmem mcp`** - new subcommand for direct MCP stdio transport (Claude Desktop/Code)
+- **REST server still works** - existing hooks and curl-based workflows unaffected
 </details>
 
 ---
@@ -171,9 +171,9 @@ No copy-pasting.
 No rebuilding context from scratch.
 No "remember when we refactored auth yesterday?"
 
-**Works with every major AI coding tool** — Claude Code, Claude Desktop, Cursor, Windsurf, ChatGPT Desktop, GitHub Copilot, Zed, VS Code, and any MCP-compatible client.
+**Works with every major AI coding tool** - Claude Code, Claude Desktop, Cursor, Windsurf, ChatGPT Desktop, GitHub Copilot, Zed, VS Code, and any MCP-compatible client.
 
-**Optional enrichment with the LLM you already pay for** — Anthropic Claude,
+**Optional enrichment with the LLM you already pay for** - Anthropic Claude,
 OpenAI GPT-4o, Google Gemini, or Vertex AI Gemini. Local extraction remains the
 default, and enabling enrichment takes one configuration change.
 
@@ -329,9 +329,9 @@ summary:
 - **Adaptive skim chunks:** `memory_chunks` rows with `chunk_id`, density, kind,
   title, token estimate, and optional exact transcript byte offsets.
 - **Observation logs (opt-in):** the Observer pass emits an append-only,
-  timestamped, priority-tagged log beside the narrative — each line its own
+  timestamped, priority-tagged log beside the narrative - each line its own
   governed `kind=observation` memory with the event's own date and lineage back
-  to its session — so specifics survive that summarization would generalize away.
+  to its session - so specifics survive that summarization would generalize away.
 - **Maturity tiers:** memories graduate `draft → stable → core` via the dream
   sweep as they earn injections and positive feedback, feeding the optional
   activation ranking lever.
@@ -355,14 +355,13 @@ remote MCP clients can share the same backing memory.
 
 IronMem is evaluated on [LoCoMo](https://github.com/snap-research/locomo) (Maharana et al., ACL 2024), a long-term conversational memory benchmark. The full harness, result files, and reproduction steps live in a dedicated repo: **[ironmem-locomo-benchmark](https://github.com/BMC-INC/ironmem-locomo-benchmark)**.
 
-Headline (Gemini 2.5 Pro answerer + Pro judge, hybrid retrieval, pool 100, retrieve-limit 25, v2 answer prompt, 1,986 questions of which 1,540 are scored, 0 errors):
+Headline (Gemini 2.5 Pro answerer + Pro judge, hybrid retrieval, pool 100, retrieve-limit 25, v2 answer prompt with synthesis and deterministic normalized-hint recall supplements, 1,986 questions of which 1,540 are scored, 0 errors):
 
 | Configuration | Overall | single_hop | multi_hop | temporal | open_domain |
 |---|---|---|---|---|---|
-| Governed (trust-tier ranking on) | 66.3% | 69.0% | 50.0% | 77.9% | 52.1% |
-| **Governance-off (pure relevance ranking)** | **68.4%** | 72.1% | 52.5% | 78.2% | 50.0% |
+| **normhints9 (headline)** | **72.4%** | 77.2% | 58.2% | 77.0% | 57.3% |
 
-Setting the writer-tier and temporal-trust retrieval weights to 0 (ranking on pure relevance) scores **68.4%**, **+2.1 points** over the governed configuration. Governance metadata (writer identity, trust tier, provenance, ledger) is still recorded and queryable on every memory; the finding is only that letting trust tier tilt retrieval ranking was net-negative on this benchmark. The benchmark repo has the per-category analysis, second-judge agreement (Cohen's kappa 0.88), and the documented path past 70%.
+The **72.4%** result is recorded in `results/full_gpu_p100_k25_v2agg_normhints9_20260701T233607Z.json` in the benchmark repository. It improves the prior 65.9% Pro-judged headline by 6.5 percentage points. The benchmark repo contains the full per-question result file, configuration, methodology, and reproduction steps.
 
 ### LongMemEval
 
@@ -376,7 +375,7 @@ ironmem bench longmemeval --data longmemeval_s.json \
   --stratified-per-ability 2 --min-accuracy 0.50                    # representative paid gate
 ```
 
-Every report records the answer model, judge model, embedder, and retrieval depth so runs are comparable — scores are only published next to a same-model full-context baseline. Deterministic retrieval-quality regression checks (42 cases across multi-hop, temporal, open-domain, knowledge-update, abstention, governance-parity, entity, and chunk clusters) run via `ironmem eval` and gate CI on every change.
+Every report records the answer model, judge model, embedder, and retrieval depth so runs are comparable - scores are only published next to a same-model full-context baseline. Deterministic retrieval-quality regression checks (42 cases across multi-hop, temporal, open-domain, knowledge-update, abstention, governance-parity, entity, and chunk clusters) run via `ironmem eval` and gate CI on every change.
 
 LongMemEval writes each completed question to an atomic checkpoint inside the
 `--out` directory before advancing. Restart the same command with the same
@@ -525,11 +524,11 @@ IronMem works as an **MCP server** (native integration) or via **IRONMEM.md** (p
 | **claude.ai** | **Yes** | Yes | [Setup →](#claudeai-web) |
 | **Cursor** | **Yes** | Yes | [Setup →](#cursor--windsurf-mcp-setup) |
 | **Windsurf** | **Yes** | Yes | [Setup →](#cursor--windsurf-mcp-setup) |
-| **ChatGPT Desktop** | **Yes** | — | [Setup →](#other-mcp-clients) |
-| **Zed** | **Yes** | — | [Setup →](#other-mcp-clients) |
+| **ChatGPT Desktop** | **Yes** | - | [Setup →](#other-mcp-clients) |
+| **Zed** | **Yes** | - | [Setup →](#other-mcp-clients) |
 | **VS Code (Copilot/Continue/Cline)** | **Yes** | Yes | [Setup →](#other-mcp-clients) |
-| **Any MCP Client** | **Yes** | — | stdio or SSE transport |
-| **Any AI Tool** | — | Yes | Read `IRONMEM.md` as project context |
+| **Any MCP Client** | **Yes** | - | stdio or SSE transport |
+| **Any AI Tool** | - | Yes | Read `IRONMEM.md` as project context |
 
 ---
 
@@ -537,8 +536,8 @@ IronMem works as an **MCP server** (native integration) or via **IRONMEM.md** (p
 
 IronMem supports two MCP transports:
 
-- **stdio** — for local clients that launch the server themselves (Claude Code, Claude Desktop, Cursor)
-- **Streamable HTTP** — for remote/cloud clients that connect over HTTP. Uses
+- **stdio** - for local clients that launch the server themselves (Claude Code, Claude Desktop, Cursor)
+- **Streamable HTTP** - for remote/cloud clients that connect over HTTP. Uses
   request/response and bearer-token auth, so it works through tunnels and reverse
   proxies for clients that support static bearer tokens.
 
@@ -546,7 +545,7 @@ Once connected over MCP, clients can record sessions, retrieve memories, inspect
 
 ### Claude Code MCP Setup
 
-Claude Code connects via **stdio** — it launches `ironmem mcp` directly.
+Claude Code connects via **stdio** - it launches `ironmem mcp` directly.
 
 **Option A: CLI (recommended)**
 
@@ -889,11 +888,11 @@ mode, unresolved competing claims can deny influence until reviewed.
 ### Compliance product
 
 The governance envelope is auditable end-to-end, mapped to the EU AI Act's
-record-keeping (Art. 12) and transparency (Art. 13) obligations — see
+record-keeping (Art. 12) and transparency (Art. 13) obligations - see
 [`docs/compliance/eu-ai-act-mapping.md`](docs/compliance/eu-ai-act-mapping.md):
 
 - **`ironmem compliance-report`** (also `GET /compliance/report`) walks every
-  namespace's ledger and **re-derives every SHA-256 entry hash** — any edit,
+  namespace's ledger and **re-derives every SHA-256 entry hash** - any edit,
   deletion, or reordering of history is detected and the first broken entry
   named. It also emits a governance inventory (namespace × classification ×
   consent with legal-hold/tombstone/expiry/retention counts) and snapshot
@@ -991,7 +990,7 @@ The `auto_compress`/`scheduler` blocks are inert until you run `ironmem sweep`,
 
 Newer optional sections (all default to pre-existing behavior when absent):
 
-- **`ranking`** — Phase 1 retrieval levers: `chunk_fusion_weight` (chunk-level
+- **`ranking`** - Phase 1 retrieval levers: `chunk_fusion_weight` (chunk-level
   recall for open-domain queries, default on), `graph_chain_depth`,
   `stale_demotion_weight`, `activation_weight` / `activation_halflife_days`,
   `abstention_min_overlap`, `tier_early_exit`. Each is env-overridable at
@@ -999,19 +998,19 @@ Newer optional sections (all default to pre-existing behavior when absent):
   `IRONMEM_STALE_DEMOTION_WEIGHT`, `IRONMEM_ACTIVATION_WEIGHT`,
   `IRONMEM_ABSTENTION_MIN_OVERLAP`, `IRONMEM_TIER_EARLY_EXIT`); resolved
   weights are logged at startup and tier exit rates published on `/status`.
-- **`rerank.escalate_margin`** — T2→T3 escalation: when the cross-encoder's
+- **`rerank.escalate_margin`** - T2→T3 escalation: when the cross-encoder's
   top-two score margin is below this, the LLM reranker runs instead
   (0.0 = cross-encoder results are final).
-- **`observer`** — `{enabled, model, max_lines}`: the append-only observation
+- **`observer`** - `{enabled, model, max_lines}`: the append-only observation
   log emitted beside narrative compression (one extra LLM call per
   compression; set a cheap `model` to control cost).
-- **`storage`** — external engines: `vector_backend: "qdrant"` (+
+- **`storage`** - external engines: `vector_backend: "qdrant"` (+
   `qdrant_url/collection/dim`) and/or `graph_backend: "neo4j"` (+
   `neo4j_url/database/user/pass`). Down engines degrade to native with a
   warning; recall never breaks.
-- **`agent_keys`** — `[{token, agent_id, namespaces}]` per-agent REST access
+- **`agent_keys`** - `[{token, agent_id, namespaces}]` per-agent REST access
   with namespace allowlists and ledger-attributed writes.
-- **`influence`** — governed downstream-use controls. It is disabled and
+- **`influence`** - governed downstream-use controls. It is disabled and
   advisory by default for compatibility. Strict mode requires verified purpose,
   trusted remote attestations, and fail-closed policy evaluation; unresolved
   high-risk contradictions can be annotated or denied according to policy.
@@ -1084,7 +1083,7 @@ macOS unattended mode can use `GOOGLE_APPLICATION_CREDENTIALS` explicitly, store
 outside the repo. Full setup details:
 [Sleep Cycle Auto-Compression](docs/sleep-cycle-autocompress.md).
 
-**Backfill existing memories** — after enabling embeddings, index memories created before:
+**Backfill existing memories** - after enabling embeddings, index memories created before:
 
 ```bash
 ironmem embed              # embed memories missing a vector (all projects)
@@ -1254,12 +1253,12 @@ Rust was chosen for IronMem to deliver:
 
 ## Design Principles
 
-- **Zero friction** — hooks run silently, never interrupt your workflow
-- **Local-first** — runs on your machine by default, your data stays yours
-- **MCP-native** — speaks the protocol every major AI client is adopting
-- **Provider-agnostic** — MCP for native integration, plain markdown for everything else
-- **Self-hostable** — Docker + Postgres for team deployments, still zero cloud dependencies
-- **Fail-safe** — if IronMem crashes, your coding session is unaffected
+- **Zero friction** - hooks run silently, never interrupt your workflow
+- **Local-first** - runs on your machine by default, your data stays yours
+- **MCP-native** - speaks the protocol every major AI client is adopting
+- **Provider-agnostic** - MCP for native integration, plain markdown for everything else
+- **Self-hostable** - Docker + Postgres for team deployments, still zero cloud dependencies
+- **Fail-safe** - if IronMem crashes, your coding session is unaffected
 
 ---
 
@@ -1299,7 +1298,7 @@ IronMem is **automatic and session-aware:**
 | **Scope** | Static project rules | Dynamic session history |
 | **Rotation** | You manage it | Old memories age out automatically |
 | **Search** | Ctrl+F | Full-text search across all sessions |
-| **Effort** | High | Zero — hooks handle everything |
+| **Effort** | High | Zero - hooks handle everything |
 
 They work together. `CLAUDE.md` holds your project rules. IronMem holds what happened.
 
