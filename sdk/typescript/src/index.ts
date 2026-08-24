@@ -127,13 +127,19 @@ export class IronMemError extends Error {
   }
 }
 
+function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end -= 1;
+  return end === value.length ? value : value.slice(0, end);
+}
+
 export class IronMem {
   private baseUrl: string;
   private token?: string;
   private timeoutMs: number;
 
   constructor(baseUrl = "http://127.0.0.1:37778", opts: IronMemOptions = {}) {
-    this.baseUrl = baseUrl.replace(/\/+$/, "");
+    this.baseUrl = trimTrailingSlashes(baseUrl);
     this.token = opts.token;
     this.timeoutMs = opts.timeoutMs ?? 30_000;
   }
