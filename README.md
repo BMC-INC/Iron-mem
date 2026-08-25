@@ -49,7 +49,7 @@
 
 > IronMem is now a full durable memory stack: reversible originals, typed memories,
 > temporal graph recall, source-backed retrieval, adaptive skim/expand context,
-> sleep-cycle compression, governed influence controls, and 24 MCP tools.
+> sleep-cycle compression, governed influence controls, and 25 MCP tools.
 
 - **CCR - losslessly reversible memory** (Headroom pattern) - every truncated tool
   output and the verbatim pre-LLM session transcript is preserved in a
@@ -117,7 +117,7 @@
   **`refresh_profile`**.
 - **Correction miner** - error→fix loops are mined into `error_solution` memories
   and surfaced via **`list_corrections`**, so past fixes resurface when work recurs.
-- **24 MCP tools** now - including `memory_skim`, `retrieve_original`, `remember`,
+- **25 MCP tools** now - including `memory_skim`, `retrieve_original`, `remember`,
   `get_memory_influence`, `set_memory_influence`, `manage_contradiction`,
   `get_profile`, `list_corrections`, `memory_graph`, and `dream_memory`.
 - **Temporal recall + graph recall** - dated facts and `event_time` metadata power timestamp lookup, while `memory_edges` stores structured `source | relation | target` edges with valid-time filters and provenance. Temporal questions route toward date-bearing facts; relationship questions route toward graph edges.
@@ -133,9 +133,10 @@
 - **Valid-time temporal recall:** `remember` accepts an optional `event_at` (an ISO `YYYY-MM-DD` date or a `YYYY-MM-DD..YYYY-MM-DD` range) for when an event actually occurred, distinct from the storage time (`created_at`). Valid-time dates are surfaced through an `event_times` side map on search, list, context, and skim results, powering time-aware retrieval.
 - **Derived (inferred) memories:** reflection can derive new memories from existing ones, governed as `source_type=derived` / `kind=inference` with a `derives` provenance edge and a ledger entry per inference. Derived memories are quarantined from default retrieval until a caller explicitly asks for them, so inferences never silently pollute primary recall.
 - **Opt-in auto-dream trigger:** a thin background watcher (`auto_dream.enabled`, default off, with a `gap_minutes` idle threshold) fires a consolidation and synthesis pass on projects that have gone idle. Every auto-triggered pass is recorded in the governance ledger with a `trigger_reason`, so it stays auditable instead of a black box.
-- **Current verification:** `cargo test --all-targets` passes **275 tests** with
-  **1 intentionally ignored benchmark**, MCP stdio cleanliness passes, and
-  strict clippy plus the embedded Workbench JavaScript syntax check are clean.
+- **Current verification:** `cargo test --all-targets` passes **276 unit tests**
+  plus **1 MCP integration test**, with **1 intentionally ignored benchmark**.
+  MCP stdio cleanliness passes, and strict clippy plus the embedded Workbench
+  JavaScript syntax check are clean.
 - **Still zero telemetry. Still local-first. Your data stays yours.**
 
 <details>
@@ -306,7 +307,9 @@ flowchart LR
     style E fill:#0ea5e9,color:#fff,stroke:none
 ```
 
-Everything runs locally. Your data stays on your machine.
+The default deployment runs locally. Your data stays on your machine. The
+optional authenticated remote gateway described below provides a network path
+to that local store; it does not move the store into Cloudflare.
 
 ---
 
@@ -538,9 +541,9 @@ IronMem works as an **MCP server** (native integration) or via **IRONMEM.md** (p
 IronMem supports two MCP transports:
 
 - **stdio** - for local clients that launch the server themselves (Claude Code, Claude Desktop, Codex, Cursor)
-- **Streamable HTTP** - for remote/cloud clients that connect over HTTP. Uses
-  request/response and bearer-token auth, so it works through tunnels and reverse
-  proxies for clients that support static bearer tokens.
+- **Streamable HTTP** - for remote/cloud clients that connect over HTTP. The
+  native transport supports bearer-token auth for clients that accept static
+  tokens. OAuth-only clients can use the fail-closed Cloudflare gateway below.
 
 Once connected over MCP, clients can record sessions, retrieve memories, inspect graph state, scan adaptive skims, and expand exact originals directly.
 
@@ -625,6 +628,37 @@ The recommended web setup is a **stable HTTPS endpoint protected by OAuth**.
 Keep IronMem and its database local, expose only the loopback MCP origin through
 a named tunnel or hardened reverse proxy, and enforce authentication before any
 request reaches `/mcp`.
+
+#### Where the memories live
+
+Cloudflare does **not** become the IronMem database in this architecture. With
+the default SQLite configuration, the only durable memory store remains:
+
+```text
+~/.ironmem/mem.db
+```
+
+The authenticated request path is:
+
+```mermaid
+flowchart LR
+    A["claude.ai"] -->|"HTTPS + OAuth"| B["Cloudflare Access"]
+    B --> C["Fail-closed Worker"]
+    C --> D["Workers VPC"]
+    D --> E["Named tunnel"]
+    E --> F["IronMem on 127.0.0.1:37779"]
+    F --> G[("Local ~/.ironmem/mem.db")]
+```
+
+Cloudflare processes the encrypted MCP connection and the Worker proxies the
+request and response, but the IronMem gateway does not write memory payloads to
+Workers KV, D1, R2, Durable Objects, or any other Cloudflare database. Cloudflare
+may retain authentication, security, and request metadata according to the
+account's logging settings. No cloud backup of `mem.db` is created.
+
+The Mac, the local IronMem service, and the named tunnel must be running for a
+web client to reach the store. If any of them is offline, remote MCP access is
+unavailable; the memories remain on the Mac.
 
 Two supported Cloudflare deployment shapes are:
 
@@ -746,7 +780,7 @@ ironmem serve
 
 ## MCP Tools
 
-IronMem currently exposes **24 MCP tools**:
+IronMem currently exposes **25 MCP tools**:
 
 | Tool | Purpose |
 | ---- | ------- |
@@ -1218,9 +1252,9 @@ cargo clippy --bin ironmem --features local-onnx -- -D warnings
 
 Result:
 
-- **275 tests passed** (including the deterministic retrieval, governance, and
-  governed-influence evaluation gates)
-- **MCP stdio cleanliness passed**
+- **276 unit tests passed** (including the deterministic retrieval, governance,
+  and governed-influence evaluation gates)
+- **1 MCP stdio integration test passed**
 - **1 benchmark intentionally ignored** (`bench_ccr_dict_vs_floor`)
 - **0 failed**
 - **Clippy clean with `local-onnx` enabled and `-D warnings`**
