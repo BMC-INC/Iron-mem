@@ -1,0 +1,14 @@
+{
+  "name": "ironmem-cloudflare-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "npm test && wrangler deploy --dry-run",
+    "deploy": "wrangler deploy",
+    "test": "node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "wrangler": "4.125.0"
+  }
+}

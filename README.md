@@ -456,9 +456,9 @@ Restart your terminal and Claude Code. That's it.
 ```bash
 ironmem server              # Start REST + MCP SSE server
 ironmem mcp                 # Start MCP stdio server (for Claude Desktop/Code and Codex)
-ironmem serve               # Start SSE server with bearer token auth
+ironmem serve               # Start Streamable HTTP server with bearer token auth
 ironmem serve --public      # Same + Cloudflare Tunnel for remote MCP clients
-ironmem serve --public --no-auth  # Authless public tunnel for claude.ai personal use
+ironmem serve --public --no-auth  # Unsafe temporary authless tunnel; troubleshooting only
 ironmem status              # Health check + DB stats
 ironmem projects            # All projects with stored memories
 ironmem list                # Recent memories for current project
@@ -626,24 +626,34 @@ Keep IronMem and its database local, expose only the loopback MCP origin through
 a named tunnel or hardened reverse proxy, and enforce authentication before any
 request reaches `/mcp`.
 
-One supported deployment shape is a named Cloudflare Tunnel plus a self-hosted
-Cloudflare Access application with Managed OAuth:
+Two supported Cloudflare deployment shapes are:
+
+- **No Cloudflare-managed domain:** deploy the fail-closed Worker in
+  [`deploy/cloudflare-gateway`](deploy/cloudflare-gateway/README.md). Workers
+  VPC carries requests from its stable `workers.dev` URL through a named tunnel
+  to the loopback-only IronMem origin.
+- **Cloudflare-managed domain:** route a hostname through a named tunnel to the
+  loopback origin.
+
+Both shapes require a Cloudflare Access application with Managed OAuth:
 
 1. Start the loopback-only MCP HTTP origin with `ironmem serve --no-auth`.
-2. Route a stable hostname such as `ironmem.example.com` through a named tunnel
-   to `http://127.0.0.1:37779`. Do not publish the REST port `37778`.
-3. Protect the hostname with a Cloudflare Access allow policy and enable Managed
-   OAuth. Restrict the policy to the intended user identity.
+2. Route only `http://127.0.0.1:37779` through Workers VPC or a named tunnel.
+   Do not publish the REST port `37778`.
+3. Protect the Worker or hostname with a Cloudflare Access allow policy and
+   enable Managed OAuth. Restrict the policy to the intended user identity.
 4. Install both IronMem and the named tunnel as operating-system services so
    they restart after a reboot.
-5. Add `https://ironmem.example.com/mcp` as the claude.ai custom connector and
-   complete the OAuth login.
+5. Add the stable HTTPS URL ending in `/mcp` as the claude.ai custom connector
+   and complete the OAuth login.
 6. Verify that a request without OAuth returns `401` before doing a live
    `get_status`, `remember`, and `search_memories` round trip.
 
-In this topology, `--no-auth` applies only to the loopback origin. Cloudflare
-Access is the public authentication boundary. Never expose that origin directly
-or create a DNS route that bypasses Access.
+In either topology, `--no-auth` applies only to the loopback origin. Cloudflare
+Access is the public authentication boundary. The Worker also fails closed when
+Access identity context is absent, strips edge credentials before proxying, and
+exposes only `/mcp`. Never expose the origin directly or create a route that
+bypasses Access.
 
 IronMem's first-class OAuth 2.1 remote transport is tracked in
 [issue #44](https://github.com/BMC-INC/Iron-mem/issues/44). Until it ships,

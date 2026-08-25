@@ -789,14 +789,13 @@ enum Commands {
     /// Start the MCP server (stdio transport, for Claude Desktop/Code)
     Mcp,
 
-    /// Start the SSE server for remote MCP clients
+    /// Start the Streamable HTTP server for remote MCP clients
     Serve {
         /// Expose via Cloudflare Tunnel for remote access
         #[arg(long)]
         public: bool,
-        /// Disable auth entirely. Useful for claude.ai custom connectors, which
-        /// currently support authless and OAuth remote MCP servers but not static
-        /// bearer-token auth.
+        /// Disable origin bearer auth. Use only on loopback behind an authenticated
+        /// gateway or for a short-lived troubleshooting session.
         #[arg(long)]
         no_auth: bool,
     },
@@ -1679,7 +1678,7 @@ async fn run_serve(mut cfg: config::Config, public: bool, no_auth: bool) -> Resu
     let db = std::sync::Arc::new(database);
 
     let sse_port = cfg.mcp_sse_port;
-    let bind: std::net::SocketAddr = format!("0.0.0.0:{}", sse_port).parse().unwrap();
+    let bind = serve_bind_addr(sse_port);
     let auth_token = if no_auth {
         cfg.auth_token = None;
         None
@@ -1712,6 +1711,10 @@ async fn run_serve(mut cfg: config::Config, public: bool, no_auth: bool) -> Resu
     mcp::run_streamable_http(db, serve_cfg, bind).await?;
 
     Ok(())
+}
+
+fn serve_bind_addr(port: u16) -> std::net::SocketAddr {
+    format!("127.0.0.1:{port}").parse().unwrap()
 }
 
 async fn run_cloudflare_tunnel(port: u16, auth_token: Option<String>) {
@@ -3024,5 +3027,18 @@ fn format_timestamp(timestamp: i64) -> String {
     match Local.timestamp_opt(timestamp, 0).single() {
         Some(dt) => dt.format("%Y-%m-%d %H:%M:%S %Z").to_string(),
         None => timestamp.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_mcp_origin_is_loopback_only() {
+        let bind = serve_bind_addr(37779);
+
+        assert!(bind.ip().is_loopback(), "remote MCP origin bound to {bind}");
+        assert_eq!(bind.port(), 37779);
     }
 }

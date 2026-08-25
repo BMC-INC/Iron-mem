@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ironmem-mcp-gateway",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-24",
+  "workers_dev": true,
+  "access": {
+    "dev": {
+      "aud": "ironmem-local-integration-test",
+      "identity": {
+        "email": "developer@example.com"
+      }
+    }
+  },
+  "vpc_services": [
+    {
+      "binding": "IRONMEM_ORIGIN",
+      "service_id": "01a03622-48b3-71a1-bc96-3fcab03961a6",
+      "remote": true
+    }
+  ]
+}
