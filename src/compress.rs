@@ -154,7 +154,14 @@ fn enrich_local_result(
     local
 }
 
-const LOCAL_SUMMARY_MAX_BYTES: usize = 48_000;
+/// A local summary is a digest, not a transcript, so its budget is small.
+/// See `local_summary` for why this is two kilobytes rather than forty-eight.
+const LOCAL_SUMMARY_MAX_BYTES: usize = 2_000;
+/// How many distinct tools the digest names before it stops listing them.
+const LOCAL_SUMMARY_MAX_TOOLS: usize = 6;
+/// How many extracted facts the digest carries. The rest remain searchable as
+/// their own `kind=fact` memories; this list is a pointer, not the record.
+const LOCAL_SUMMARY_MAX_FACTS: usize = 8;
 const LOCAL_RELATION_MAX_PART_BYTES: usize = 512;
 
 /// Parse only explicit machine-readable relationship markers. Local mode never
@@ -208,14 +215,9 @@ fn local_explicit_relations(observations: &[db::Observation]) -> Vec<MemoryRelat
 /// searchable locally, while the complete byte-exact transcript is attached
 /// through CCR and observation chunks immediately after persistence.
 fn local_compression_result(observations: &[db::Observation]) -> CompressionResult {
-    let transcript = build_transcript(observations);
     let extraction = crate::local_extractor::extract(observations);
     CompressionResult {
-        summary: format!(
-            "Local session archive ({} observations)\n{}",
-            observations.len(),
-            crate::strutil::safe_truncate(&transcript, LOCAL_SUMMARY_MAX_BYTES)
-        ),
+        summary: local_summary(observations, &extraction),
         tags: "local-compression session-archive".to_string(),
         importance: 5,
         kind: "session".to_string(),
@@ -224,6 +226,86 @@ fn local_compression_result(observations: &[db::Observation]) -> CompressionResu
         relations: local_explicit_relations(observations),
         ..CompressionResult::default()
     }
+}
+
+/// A short, deterministic digest of a session, used when no provider summary
+/// is available.
+///
+/// This is deliberately not the transcript. The verbatim transcript is already
+/// preserved twice over the moment the memory persists: once as a CCR blob
+/// (`store_session_transcript`) and once as byte-ranged skim chunks, both
+/// retrievable on demand. A third copy here would be redundant, and it would
+/// be the expensive copy: `summary` is the field `ironmem inject` writes into
+/// IRONMEM.md, which assistants import at the start of every session in the
+/// project. Pasting a session's raw tool output there charges every future
+/// session for bytes nobody asked to read, to say what `retrieve_original`
+/// says on request.
+///
+/// What survives here is what a reader needs in order to decide whether to ask
+/// for the rest: how much happened, which tools did it, and the facts the
+/// deterministic extractor was confident enough to name.
+fn local_summary(
+    observations: &[db::Observation],
+    extraction: &crate::local_extractor::LocalExtraction,
+) -> String {
+    let mut lines = vec![format!(
+        "Local session archive ({} observation{}, no provider summary).",
+        observations.len(),
+        if observations.len() == 1 { "" } else { "s" }
+    )];
+
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for observation in observations {
+        match counts
+            .iter_mut()
+            .find(|(tool, _)| tool == &observation.tool)
+        {
+            Some((_, count)) => *count += 1,
+            None => counts.push((observation.tool.clone(), 1)),
+        }
+    }
+    // Busiest tool first; ties by name so two runs over the same session
+    // produce byte-identical summaries.
+    counts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    if !counts.is_empty() {
+        let listed = counts
+            .iter()
+            .take(LOCAL_SUMMARY_MAX_TOOLS)
+            .map(|(tool, count)| format!("{tool} x{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remainder = counts.len().saturating_sub(LOCAL_SUMMARY_MAX_TOOLS);
+        lines.push(if remainder == 0 {
+            format!("Tools: {listed}.")
+        } else {
+            format!("Tools: {listed}, and {remainder} more.")
+        });
+    }
+
+    if !extraction.facts.is_empty() {
+        lines.push(String::new());
+        for fact in extraction.facts.iter().take(LOCAL_SUMMARY_MAX_FACTS) {
+            lines.push(format!("- {fact}"));
+        }
+        let remainder = extraction
+            .facts
+            .len()
+            .saturating_sub(LOCAL_SUMMARY_MAX_FACTS);
+        if remainder > 0 {
+            lines.push(format!(
+                "- ...and {remainder} further extracted fact{}, searchable on their own.",
+                if remainder == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "Verbatim transcript retained; retrieve it with `retrieve_original` on this memory."
+            .to_string(),
+    );
+
+    crate::strutil::safe_truncate(&lines.join("\n"), LOCAL_SUMMARY_MAX_BYTES)
 }
 
 #[derive(Debug, Clone)]
@@ -1431,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn local_compression_requires_no_provider_and_preserves_session_text() {
+    fn local_compression_requires_no_provider_and_digests_the_session() {
         let observations = vec![db::Observation {
             id: 1,
             session_id: "session-1".to_string(),
@@ -1451,8 +1533,15 @@ mod tests {
 
         assert_eq!(result.kind, "session");
         assert!(result.tags.contains("local-compression"));
+        // The digest names what happened and points at the retained transcript.
+        // It does not carry the transcript: `test result: ok` is raw tool
+        // output, and lives in the CCR blob rather than in every future
+        // session's context window.
+        assert!(result.summary.contains("1 observation,"));
+        assert!(result.summary.contains("shell x1"));
         assert!(result.summary.contains("cargo test"));
-        assert!(result.summary.contains("test result: ok"));
+        assert!(result.summary.contains("retrieve_original"));
+        assert!(!result.summary.contains("test result: ok"));
         assert_eq!(
             result.facts,
             vec!["Command `cargo test` completed successfully."]
@@ -1462,6 +1551,66 @@ mod tests {
         assert_eq!(result.relations[0].relation, "completed_for");
         assert_eq!(result.relations[0].target, "Project:operator-os");
         assert_eq!(result.relations[0].confidence, 1.0);
+    }
+
+    #[test]
+    fn local_summary_stays_small_for_a_large_session() {
+        // The regression this guards: the local summary used to be the whole
+        // transcript truncated at 48 KB, and `ironmem inject` writes summaries
+        // into IRONMEM.md, so a handful of offline sessions put hundreds of
+        // kilobytes of raw tool output into every later session's context.
+        let observations = (0..500)
+            .map(|i| db::Observation {
+                id: i,
+                session_id: "session-1".to_string(),
+                project: "/tmp/project".to_string(),
+                tool: if i % 2 == 0 { "Bash" } else { "Edit" }.to_string(),
+                input: Some(format!("command number {i}")),
+                output: Some("x".repeat(4_000)),
+                created_at: i,
+            })
+            .collect::<Vec<_>>();
+
+        let result = local_compression_result(&observations);
+
+        assert!(
+            result.summary.len() <= LOCAL_SUMMARY_MAX_BYTES,
+            "summary was {} bytes",
+            result.summary.len()
+        );
+        assert!(result.summary.contains("500 observations,"));
+        assert!(!result.summary.contains(&"x".repeat(100)));
+    }
+
+    #[test]
+    fn local_summary_is_stable_across_runs() {
+        let observations = vec![
+            db::Observation {
+                id: 1,
+                session_id: "s".to_string(),
+                project: "/tmp/p".to_string(),
+                tool: "Edit".to_string(),
+                input: Some("{\"file_path\": \"src/lib.rs\"}".to_string()),
+                output: Some("ok".to_string()),
+                created_at: 1,
+            },
+            db::Observation {
+                id: 2,
+                session_id: "s".to_string(),
+                project: "/tmp/p".to_string(),
+                tool: "Bash".to_string(),
+                input: Some("cargo test".to_string()),
+                output: Some("test result: ok".to_string()),
+                created_at: 2,
+            },
+        ];
+
+        // Two tools appear once each, so only a deterministic tie-break keeps
+        // the digest byte-identical between runs.
+        let first = local_compression_result(&observations).summary;
+        let second = local_compression_result(&observations).summary;
+        assert_eq!(first, second);
+        assert!(first.contains("Bash x1, Edit x1"));
     }
 
     #[test]

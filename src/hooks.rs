@@ -4,6 +4,20 @@ use std::path::Path;
 
 use crate::db::Memory;
 
+/// Ceiling on the whole generated file.
+///
+/// IRONMEM.md is imported by CLAUDE.md, so an assistant reads all of it at the
+/// start of every session in this project. That makes its size a recurring
+/// charge rather than a one-off: bytes here are paid again on every session,
+/// whether or not anything in them turns out to be relevant. Nothing is lost
+/// by trimming, because every memory remains in the store and reachable
+/// through `search_memories` and `get_context`.
+const IRONMEM_FILE_MAX_BYTES: usize = 24_000;
+/// Ceiling on any single memory's summary within the file. A provider can
+/// return a summary of any length, and one verbose session should not crowd
+/// out four useful ones.
+const IRONMEM_ENTRY_MAX_BYTES: usize = 4_000;
+
 /// Write memories to IRONMEM.md in the project root.
 /// This file is provider-agnostic — readable by any AI coding assistant.
 pub fn write_ironmem_file(project_root: &str, memories: &[Memory]) -> Result<()> {
@@ -29,6 +43,9 @@ pub fn write_ironmem_file(project_root: &str, memories: &[Memory]) -> Result<()>
         String::new(),
     ];
 
+    let mut used: usize = lines.iter().map(|line| line.len() + 1).sum();
+    let mut written = 0usize;
+
     for (i, memory) in memories.iter().enumerate() {
         let date = Utc
             .timestamp_opt(memory.created_at, 0)
@@ -36,14 +53,37 @@ pub fn write_ironmem_file(project_root: &str, memories: &[Memory]) -> Result<()>
             .map(|dt| dt.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        lines.push(format!("### Session {} ({})", i + 1, date));
-        lines.push(memory.summary.clone());
+        let mut entry = vec![
+            format!("### Session {} ({})", i + 1, date),
+            crate::strutil::safe_truncate(&memory.summary, IRONMEM_ENTRY_MAX_BYTES),
+        ];
 
         if let Some(tags) = &memory.tags {
             if !tags.is_empty() {
-                lines.push(format!("**Keywords:** `{}`", tags.replace(' ', "` `")));
+                entry.push(format!("**Keywords:** `{}`", tags.replace(' ', "` `")));
             }
         }
+        entry.push(String::new());
+
+        let cost: usize = entry.iter().map(|line| line.len() + 1).sum();
+        // Always write the first memory, however long, so the file is never
+        // empty of content; stop before any later one that would overrun.
+        if written > 0 && used + cost > IRONMEM_FILE_MAX_BYTES {
+            break;
+        }
+        used += cost;
+        written += 1;
+        lines.extend(entry);
+    }
+
+    let omitted = memories.len() - written;
+    if omitted > 0 {
+        lines.push(format!(
+            "_{} older session memor{} omitted to keep this file small. \
+             They remain searchable with `search_memories`._",
+            omitted,
+            if omitted == 1 { "y" } else { "ies" }
+        ));
         lines.push(String::new());
     }
 
@@ -98,4 +138,78 @@ pub fn remove_claude_md_import(project_root: &str) -> Result<()> {
 
     std::fs::write(&claude_md_path, format!("{}\n", updated.trim_end()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memory(id: i64, summary: &str) -> Memory {
+        Memory {
+            id,
+            project: "/tmp/project".to_string(),
+            session_id: format!("session-{id}"),
+            summary: summary.to_string(),
+            tags: Some("local-compression".to_string()),
+            created_at: 1_700_000_000,
+        }
+    }
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("ironmem-hooks-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn generated_file_stays_within_its_budget() {
+        let root = temp_root("budget");
+        let memories: Vec<Memory> = (0..12)
+            .map(|i| memory(i, &"summary text ".repeat(400)))
+            .collect();
+
+        write_ironmem_file(root.to_str().unwrap(), &memories).unwrap();
+
+        let written = std::fs::read_to_string(root.join("IRONMEM.md")).unwrap();
+        assert!(
+            written.len() <= IRONMEM_FILE_MAX_BYTES,
+            "{} bytes",
+            written.len()
+        );
+        assert!(written.contains("omitted to keep this file small"));
+        assert!(written.contains("search_memories"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn one_overlong_memory_is_truncated_but_still_written() {
+        let root = temp_root("single");
+        let memories = vec![memory(1, &"x".repeat(IRONMEM_ENTRY_MAX_BYTES * 3))];
+
+        write_ironmem_file(root.to_str().unwrap(), &memories).unwrap();
+
+        let written = std::fs::read_to_string(root.join("IRONMEM.md")).unwrap();
+        assert!(written.contains("### Session 1"));
+        assert!(written.contains("[truncated]"));
+        assert!(!written.contains("omitted to keep this file small"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn every_memory_is_written_when_all_of_them_fit() {
+        let root = temp_root("fits");
+        let memories = vec![memory(1, "first session"), memory(2, "second session")];
+
+        write_ironmem_file(root.to_str().unwrap(), &memories).unwrap();
+
+        let written = std::fs::read_to_string(root.join("IRONMEM.md")).unwrap();
+        assert!(written.contains("first session"));
+        assert!(written.contains("second session"));
+        assert!(!written.contains("omitted to keep this file small"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
