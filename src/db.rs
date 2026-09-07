@@ -1724,6 +1724,8 @@ impl Database {
         .await?;
 
         sqlx::query("CREATE TABLE IF NOT EXISTS checkpoint_audit_evidence(project TEXT NOT NULL,evidence_hash TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(project,evidence_hash))").execute(&self.pool).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS checkpoint_objects(hash TEXT PRIMARY KEY REFERENCES blobs(hash) ON DELETE CASCADE)").execute(&self.pool).await?;
+        sqlx::query("INSERT INTO checkpoint_objects(hash) SELECT blob_hash FROM brain_snapshots WHERE EXISTS(SELECT 1 FROM blobs WHERE hash=brain_snapshots.blob_hash) ON CONFLICT(hash) DO NOTHING").execute(&self.pool).await?;
         sqlx::query("CREATE TABLE IF NOT EXISTS checkpoint_heads(project TEXT PRIMARY KEY,blob_hash TEXT NOT NULL REFERENCES blobs(hash))").execute(&self.pool).await?;
         sqlx::query("CREATE TABLE IF NOT EXISTS checkpoint_dependencies(child_hash TEXT NOT NULL REFERENCES blobs(hash) ON DELETE CASCADE,parent_hash TEXT NOT NULL REFERENCES blobs(hash),PRIMARY KEY(child_hash,parent_hash))").execute(&self.pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_checkpoint_parent ON checkpoint_dependencies(parent_hash)").execute(&self.pool).await?;
@@ -6848,6 +6850,7 @@ pub async fn insert_brain_snapshot(
     edge_count: i64,
     blob_hash: &str,
 ) -> Result<()> {
+    let mut tx = begin_write(db).await?;
     let now = Utc::now().timestamp();
     sqlx::query(
         "INSERT INTO brain_snapshots(id, label, project, memory_count, edge_count, blob_hash, created_at)
@@ -6860,8 +6863,13 @@ pub async fn insert_brain_snapshot(
     .bind(edge_count)
     .bind(blob_hash)
     .bind(now)
-    .execute(&db.pool)
+    .execute(&mut *tx)
     .await?;
+    sqlx::query("INSERT INTO checkpoint_objects(hash) VALUES($1) ON CONFLICT(hash) DO NOTHING")
+        .bind(blob_hash)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 

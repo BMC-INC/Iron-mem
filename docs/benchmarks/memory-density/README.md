@@ -65,6 +65,8 @@ ironmem snapshot delete SNAPSHOT
 ironmem gc
 ```
 
+Checkpoint blobs are marked separately from ordinary sources; generic source expansion rejects them even when paired with an authorized memory ID. Explicit snapshot export is the operator recovery path.
+
 Exports flatten the dependency chain into an independently recoverable full checkpoint and use atomic, non-overwriting output. Restores can repair missing or damaged live source blobs using verified exported originals. Legacy v4 payloads are readable and report their omissions in a dry run; destructive v4 restore is blocked because missing provenance/source state cannot be recreated honestly.
 
 Measure checkpoint payload sizes and full/delta restore wall time independently with `python3 scripts/benchmark_checkpoints.py --out OUTPUT`. Its deterministic fixture lives in a temporary database selected through `DATABASE_URL`; its timings include CLI startup and migration.

@@ -540,6 +540,10 @@ pub async fn create(
         }
     }
     let hash = persist_blob(&mut tx, &serde_json::to_vec(&envelope)?).await?;
+    sqlx::query("INSERT INTO checkpoint_objects(hash) VALUES($1) ON CONFLICT(hash) DO NOTHING")
+        .bind(&hash)
+        .execute(&mut *tx)
+        .await?;
     if let Some(parent) = &envelope.parent {
         sqlx::query("INSERT INTO checkpoint_dependencies(child_hash,parent_hash) VALUES($1,$2) ON CONFLICT DO NOTHING").bind(&hash).bind(parent).execute(&mut *tx).await?;
     }
@@ -1036,6 +1040,39 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn backup_blobs_cannot_escape_through_generic_expansion() -> Result<()> {
+        let (_dir, db, project, id) = fixture().await?;
+        let snap = create(&db, None, &project, false).await?;
+        for memory_id in [None, Some(id)] {
+            let error = crate::expansion::retrieve_original(
+                &db,
+                None,
+                memory_id,
+                Some(&snap.blob_hash),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("explicit snapshot export"));
+        }
+        let legacy = crate::snapshot::create(&db, None, None).await?;
+        assert!(ensure_source_object(&db, &legacy.blob_hash).await.is_err());
+        delete(&db, &snap.id).await?;
+        assert!(
+            crate::expansion::retrieve_original(&db, None, None, Some(&snap.blob_hash), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            crate::expansion::retrieve_original(&db, None, Some(id), None, None)
+                .await
+                .is_ok()
+        );
+        db.pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn restore_never_reuses_removed_memory_handles() -> Result<()> {
         let (_dir, db, project, _) = fixture().await?;
         let snap = create(&db, None, &project, false).await?;
@@ -1161,5 +1198,20 @@ pub async fn delete(db: &Database, snapshot_id: &str) -> Result<()> {
 /// External index coordination requires an offline rebuild; do not serve stale mirrors.
 pub fn ensure_native_restore(cfg: &crate::config::Config, dry_run: bool) -> Result<()> {
     ensure!(dry_run || (cfg.storage.vector_backend=="native" && cfg.storage.graph_backend=="native"),"restore with external indexes requires an isolated native database and an external index rebuild before serving it");
+    Ok(())
+}
+
+/// Checkpoints can contain many memories across namespaces; they must not be
+/// released by authorizing a single memory handle or an otherwise-unbound hash.
+pub async fn ensure_source_object(db: &Database, hash: &str) -> Result<()> {
+    let count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM checkpoint_objects WHERE hash=$1")
+        .bind(hash)
+        .fetch_one(&db.pool)
+        .await?
+        .get("n");
+    ensure!(
+        count == 0,
+        "checkpoint content requires explicit snapshot export"
+    );
     Ok(())
 }
