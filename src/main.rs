@@ -2367,17 +2367,18 @@ async fn run_inject(
     .await?;
     let memories = gate.authorized;
 
-    db::record_injection_events(&database, &project, None, Some("session-start"), &memories)
-        .await
-        .ok();
-    hooks::write_ironmem_file(&project, &memories)?;
-    hooks::ensure_claude_md_import(&project)?;
-
+    let report = hooks::inject_memories(&database, &project, &memories).await?;
     println!(
-        "Injected {} memories into IRONMEM.md for {}",
-        memories.len(),
-        project
+        "Injected {} memories into IRONMEM.md for {} ({} bytes; {} omitted)",
+        report.written_ids.len(),
+        project,
+        report.bytes,
+        report.omitted
     );
+    if !report.telemetry_recorded {
+        eprintln!("Context was written, but injection telemetry was not recorded.");
+    }
+
     Ok(())
 }
 

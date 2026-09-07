@@ -18,9 +18,38 @@ pub fn safe_truncate(s: &str, max_bytes: usize) -> String {
     format!("{}… [truncated]", &s[..end])
 }
 
+/// Enforce an inclusive byte budget, including the truncation marker.
+pub fn truncate_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_owned();
+    }
+    let marker = if max_bytes >= "… [truncated]".len() {
+        "… [truncated]"
+    } else {
+        ""
+    };
+    let mut end = max_bytes - marker.len();
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{marker}", &s[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inclusive_budget_at_every_unicode_boundary() {
+        let input = "héllo ✓☃".repeat(20);
+        for budget in 0..=input.len() + 1 {
+            let out = truncate_bytes(&input, budget);
+            assert!(out.len() <= budget);
+            if budget >= input.len() {
+                assert_eq!(out, input);
+            }
+        }
+    }
 
     #[test]
     fn short_input_is_returned_unchanged() {

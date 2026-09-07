@@ -1702,6 +1702,7 @@ dependencies = [
  "sha2",
  "sqlite-vec",
  "sqlx",
+ "tempfile",
  "tokio",
  "tower",
  "tracing",

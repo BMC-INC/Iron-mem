@@ -299,13 +299,13 @@ fn local_summary(
         }
     }
 
-    lines.push(String::new());
-    lines.push(
-        "Verbatim transcript retained; retrieve it with `retrieve_original` on this memory."
-            .to_string(),
-    );
-
-    crate::strutil::safe_truncate(&lines.join("\n"), LOCAL_SUMMARY_MAX_BYTES)
+    const POINTER: &str =
+        "\n\nVerbatim transcript retained; retrieve it with `retrieve_original` on this memory.";
+    format!(
+        "{}{}",
+        crate::strutil::truncate_bytes(&lines.join("\n"), LOCAL_SUMMARY_MAX_BYTES - POINTER.len()),
+        POINTER
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1551,6 +1551,17 @@ mod tests {
         assert_eq!(result.relations[0].relation, "completed_for");
         assert_eq!(result.relations[0].target, "Project:operator-os");
         assert_eq!(result.relations[0].confidence, 1.0);
+    }
+
+    #[test]
+    fn local_summary_reserves_expansion_pointer() {
+        let extraction = crate::local_extractor::LocalExtraction {
+            facts: vec!["✓".repeat(10_000); 8],
+            procedures: vec![],
+        };
+        let summary = local_summary(&[], &extraction);
+        assert!(summary.len() <= LOCAL_SUMMARY_MAX_BYTES);
+        assert!(summary.ends_with("retrieve it with `retrieve_original` on this memory."));
     }
 
     #[test]

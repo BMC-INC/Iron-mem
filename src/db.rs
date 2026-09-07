@@ -6494,6 +6494,7 @@ pub async fn record_injection_events(
     query: Option<&str>,
     memories: &[Memory],
 ) -> Result<()> {
+    let mut tx = db.pool.begin().await?;
     let now = Utc::now().timestamp();
     for (idx, memory) in memories.iter().enumerate() {
         sqlx::query(
@@ -6506,9 +6507,10 @@ pub async fn record_injection_events(
         .bind(idx as i64 + 1)
         .bind(query)
         .bind(now)
-        .execute(&db.pool)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 

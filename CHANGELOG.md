@@ -75,3 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Requires Rust/Cargo for installation (pre-built binaries coming soon)
 - Compression uses the Claude API, which requires an `ANTHROPIC_API_KEY`
 - Memory rotation/aging is basic — oldest memories are dropped when the inject limit is reached
+
+### Bounded injection follow-up
+
+- Render actionable memory IDs, reserve expansion pointers, and enforce inclusive UTF-8 byte limits for summaries, tags and the entire generated context.
+- Replace generated files atomically and report actual written IDs, bytes and omissions consistently across CLI/MCP. Record injection events transactionally after successful output; report telemetry failures separately.
