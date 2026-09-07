@@ -49,6 +49,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # CCR: content-addressed reversible blob store
 zstd = "0.13"
+fastcdc = "=4.0.1"
 sha2 = "0.10"
 hmac = "0.12"
 base64 = "0.22"
@@ -68,6 +69,9 @@ default = []
 local-onnx = ["dep:fastembed"]
 # Wave 4 cross-encoder on GPU: local-onnx + ort's CUDA execution provider.
 gpu = ["local-onnx", "dep:ort"]
+
+[build-dependencies]
+sha2 = "0.10"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -1,6 +1,7 @@
 mod auto_dream;
 mod bench;
 mod ccr;
+mod checkpoint;
 mod code_anchor;
 mod compliance;
 mod compress;
@@ -9,6 +10,7 @@ mod context;
 mod contradiction;
 mod corrections;
 mod db;
+mod density;
 #[cfg(test)]
 mod e2e;
 mod egress;
@@ -118,6 +120,21 @@ enum SnapshotCommands {
         /// Project root path (defaults to current directory)
         #[arg(short, long)]
         project: Option<String>,
+        /// Store a verified delta when smaller than a full checkpoint
+        #[arg(long)]
+        incremental: bool,
+    },
+    Delete {
+        snapshot_id: String,
+    },
+    Export {
+        snapshot_id: String,
+        path: String,
+    },
+    Import {
+        path: String,
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List brain snapshots
     List {
@@ -640,6 +657,20 @@ enum Commands {
         out: String,
     },
 
+    /// Inventory or convert legacy CCR objects (backup before --apply)
+    CcrConvert {
+        #[arg(long, default_value_t = 262_144)]
+        threshold_bytes: usize,
+        #[arg(long)]
+        apply: bool,
+    },
+
+    /// Measure local context/storage density on a deterministic isolated corpus
+    Density {
+        #[arg(long, default_value = "target/density")]
+        out: String,
+    },
+
     /// Run long-term memory benchmarks against the live pipeline
     Bench {
         /// Benchmark suite (currently only: longmemeval)
@@ -675,6 +706,9 @@ enum Commands {
         /// Character budget for --full-context prompts
         #[arg(long, default_value = "400000")]
         context_chars: usize,
+        /// Experimental serialized injection budget; production remains 24,000 bytes
+        #[arg(long)]
+        injection_budget_bytes: Option<usize>,
         /// Ingest and retrieve but skip LLM answer/judge calls (pipeline
         /// smoke test; needs no API key and scores nothing)
         #[arg(long)]
@@ -1074,6 +1108,20 @@ async fn async_main() -> Result<()> {
             force,
         } => run_embed(&cfg, project.as_deref(), all, force).await?,
         Commands::Eval { out } => run_eval(&cfg, &out).await?,
+        Commands::CcrConvert {
+            threshold_bytes,
+            apply,
+        } => {
+            let database = db::Database::new(&cfg.effective_database_url()).await?;
+            database.migrate().await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &ccr::chunked::convert(&database, threshold_bytes, apply).await?
+                )?
+            );
+        }
+        Commands::Density { out } => density::run(std::path::Path::new(&out)).await?,
         Commands::Bench {
             suite,
             data,
@@ -1086,12 +1134,14 @@ async fn async_main() -> Result<()> {
             judge_model,
             full_context,
             context_chars,
+            injection_budget_bytes,
             dry_run,
         } => {
             run_bench(
                 &cfg,
                 &suite,
                 bench::BenchOptions {
+                    suite: suite.clone(),
                     data: std::path::PathBuf::from(data),
                     out_dir: std::path::PathBuf::from(out),
                     limit,
@@ -1102,6 +1152,7 @@ async fn async_main() -> Result<()> {
                     judge_model,
                     full_context,
                     context_chars,
+                    injection_budget_bytes,
                     dry_run,
                 },
             )
@@ -1266,12 +1317,19 @@ async fn run_eval(cfg: &config::Config, out: &str) -> Result<()> {
 }
 
 async fn run_bench(cfg: &config::Config, suite: &str, opts: bench::BenchOptions) -> Result<()> {
-    if suite != "longmemeval" {
-        anyhow::bail!("unknown bench suite '{suite}' (supported: longmemeval)");
+    if suite != "longmemeval" && suite != "locomo" {
+        anyhow::bail!("unknown bench suite '{suite}' (supported: longmemeval, locomo)");
     }
     let report = bench::run(cfg, &opts).await?;
+    if opts.dry_run {
+        println!(
+            "IronMem {suite}: {} unscored pipeline questions; no accuracy measurements",
+            report.total
+        );
+        return Ok(());
+    }
     println!(
-        "IronMem LongMemEval: {}/{} = {:.1}% ({})",
+        "IronMem {suite}: {}/{} = {:.1}% ({})",
         report.correct,
         report.total,
         report.accuracy() * 100.0,
@@ -1951,15 +2009,44 @@ async fn run_snapshot(cfg: &config::Config, action: SnapshotCommands) -> Result<
     let database = db::Database::new(&cfg.effective_database_url()).await?;
     database.migrate().await?;
     match action {
-        SnapshotCommands::Create { label, project } => {
+        SnapshotCommands::Create {
+            label,
+            project,
+            incremental,
+        } => {
             let project = match project {
                 Some(p) => Some(resolve_project(Some(&p))?),
                 None => Some(resolve_project(None)?),
             };
-            let snap = snapshot::create(&database, label.as_deref(), project.as_deref()).await?;
+            let snap = if incremental {
+                checkpoint::create(
+                    &database,
+                    label.as_deref(),
+                    project
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("project required"))?,
+                    true,
+                )
+                .await?
+            } else {
+                snapshot::create(&database, label.as_deref(), project.as_deref()).await?
+            };
             println!(
                 "Created snapshot {} (memories={}, edges={}, blob={})",
                 snap.id, snap.memory_count, snap.edge_count, snap.blob_hash
+            );
+        }
+        SnapshotCommands::Delete { snapshot_id } => {
+            checkpoint::delete(&database, &snapshot_id).await?
+        }
+        SnapshotCommands::Export { snapshot_id, path } => {
+            checkpoint::export(&database, &snapshot_id, std::path::Path::new(&path)).await?
+        }
+        SnapshotCommands::Import { path, dry_run } => {
+            checkpoint::ensure_native_restore(cfg, dry_run)?;
+            println!(
+                "{}",
+                checkpoint::import(&database, std::path::Path::new(&path), dry_run).await?
             );
         }
         SnapshotCommands::List { limit } => {
@@ -1976,6 +2063,7 @@ async fn run_snapshot(cfg: &config::Config, action: SnapshotCommands) -> Result<
             snapshot_id,
             dry_run,
         } => {
+            checkpoint::ensure_native_restore(cfg, dry_run)?;
             let report = snapshot::restore(&database, &snapshot_id, dry_run).await?;
             println!(
                 "Snapshot restore{} {}: memories_in_snapshot={}, edges_in_snapshot={}, restored_memories={}, restored_edges={}",

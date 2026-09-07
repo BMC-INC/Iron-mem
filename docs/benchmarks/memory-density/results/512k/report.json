@@ -1,0 +1,123 @@
+{
+  "manifest": {
+    "version": 2,
+    "code_sha": "01dac52e353466bcf1fa6d176bbb64bd60ec7664",
+    "source_sha256": "ed57185b7a798668d1e3b24a453236ac58665e24ab132e52def85f2c8b6e168d",
+    "dataset_sha256": "bad58ac20a9e21bee32ab50ae67ba7d2573fed933a5beb4809c1389b9132c79d",
+    "seed": 1230131022,
+    "budgets": [
+      2000,
+      4000,
+      8000,
+      16000,
+      24000,
+      48000,
+      96000
+    ],
+    "storage_mode": "fastcdc_threshold=Some(524288); zstd=19",
+    "hardware": "macos-x86_64",
+    "cache_condition": "fresh database; first read then warm repeated reads; OS cache uncontrolled",
+    "tokenizer": null,
+    "answer_model": null,
+    "judge_model": null
+  },
+  "logical_original_bytes": 5067551,
+  "unique_original_bytes": 3058085,
+  "unique_payload_bytes": 1147397,
+  "dictionary_bytes": 0,
+  "chunk_payload_bytes": 1142935,
+  "manifest_bytes": 4428,
+  "database_bytes": 1687552,
+  "database_overhead_bytes": 540155,
+  "store_wall_ms": 20084,
+  "load_p50_us": 303188,
+  "load_p95_us": 331393,
+  "cpu_ms": null,
+  "peak_memory_bytes": null,
+  "measurements": [
+    {
+      "budget_bytes": 2000,
+      "injected_bytes": 318,
+      "injected_memories": 0,
+      "retrieval_payload_bytes": 17800,
+      "expansion_bytes": 4964393,
+      "total_exposure_bytes": 4982511,
+      "injected_tokens": null,
+      "accuracy": null,
+      "storage_read_bytes": null,
+      "exact_recovery": true
+    },
+    {
+      "budget_bytes": 4000,
+      "injected_bytes": 318,
+      "injected_memories": 0,
+      "retrieval_payload_bytes": 17800,
+      "expansion_bytes": 4964393,
+      "total_exposure_bytes": 4982511,
+      "injected_tokens": null,
+      "accuracy": null,
+      "storage_read_bytes": null,
+      "exact_recovery": true
+    },
+    {
+      "budget_bytes": 8000,
+      "injected_bytes": 4539,
+      "injected_memories": 1,
+      "retrieval_payload_bytes": 17800,
+      "expansion_bytes": 4964393,
+      "total_exposure_bytes": 4986732,
+      "injected_tokens": null,
+      "accuracy": null,
+      "storage_read_bytes": null,
+      "exact_recovery": true
+    },
+    {
+      "budget_bytes": 16000,
+      "injected_bytes": 12981,
+      "injected_memories": 3,
+      "retrieval_payload_bytes": 17800,
+      "expansion_bytes": 4964393,
+      "total_exposure_bytes": 4995174,
+      "injected_tokens": null,
+      "accuracy": null,
+      "storage_read_bytes": null,
+      "exact_recovery": true
+    },
+    {
+      "budget_bytes": 24000,
+      "injected_bytes": 21423,
+      "injected_memories": 5,
+      "retrieval_payload_bytes": 17800,
+      "expansion_bytes": 4964393,
+      "total_exposure_bytes": 5003616,
+      "injected_tokens": null,
+      "accuracy": null,
+      "storage_read_bytes": null,
+      "exact_recovery": true
+    },
+    {
+      "budget_bytes": 48000,
+      "injected_bytes": 25551,
+      "injected_memories": 6,
+      "retrieval_payload_bytes": 17800,
+      "expansion_bytes": 4964393,
+      "total_exposure_bytes": 5007744,
+      "injected_tokens": null,
+      "accuracy": null,
+      "storage_read_bytes": null,
+      "exact_recovery": true
+    },
+    {
+      "budget_bytes": 96000,
+      "injected_bytes": 25551,
+      "injected_memories": 6,
+      "retrieval_payload_bytes": 17800,
+      "expansion_bytes": 4964393,
+      "total_exposure_bytes": 5007744,
+      "injected_tokens": null,
+      "accuracy": null,
+      "storage_read_bytes": null,
+      "exact_recovery": true
+    }
+  ]
+}

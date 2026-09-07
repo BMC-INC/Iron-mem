@@ -1,0 +1,1 @@
+{"question_id":"locomo-0-0","ability":"locomo-single-hop","question":"Which compiler version is used?","gold":"Rust 1.90","hypothesis":"[dry-run: no LLM call]","correct":null,"judge_verdict":"","retrieved":1,"answer_ms":123,"context_bytes":526}

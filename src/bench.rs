@@ -59,6 +59,10 @@ impl LmeQuestion {
             return "abstention";
         }
         match self.question_type.as_str() {
+            "locomo-multi-hop" => "locomo-multi-hop",
+            "locomo-temporal" => "locomo-temporal",
+            "locomo-open-domain" => "locomo-open-domain",
+            "locomo-single-hop" => "locomo-single-hop",
             "temporal-reasoning" => "temporal-reasoning",
             "knowledge-update" => "knowledge-update",
             "multi-session" => "multi-session",
@@ -78,6 +82,7 @@ impl LmeQuestion {
 #[derive(Debug, Clone)]
 pub struct BenchOptions {
     pub data: PathBuf,
+    pub suite: String,
     pub out_dir: PathBuf,
     pub limit: Option<usize>,
     /// Select up to N questions from every ability instead of taking a prefix.
@@ -91,6 +96,7 @@ pub struct BenchOptions {
     pub judge_model: Option<String>,
     pub full_context: bool,
     pub context_chars: usize,
+    pub injection_budget_bytes: Option<usize>,
     /// Ingest + retrieve but skip the answer/judge LLM calls. Scores nothing;
     /// verifies the pipeline and reports retrieval counts (usable in CI
     /// without API keys).
@@ -104,18 +110,21 @@ pub struct QuestionResult {
     pub question: String,
     pub gold: String,
     pub hypothesis: String,
-    pub correct: bool,
+    pub correct: Option<bool>,
     /// Raw judge response. Empty for dry runs and harness failures.
     #[serde(default)]
     pub judge_verdict: String,
     pub retrieved: usize,
     pub answer_ms: u128,
+    #[serde(default)]
+    pub context_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CheckpointIdentity {
     schema: u32,
     dataset_sha256: String,
+    suite: String,
     commit: String,
     answer_model: String,
     judge_model: String,
@@ -126,6 +135,10 @@ struct CheckpointIdentity {
     min_accuracy_millionths: Option<u32>,
     full_context: bool,
     context_chars: usize,
+    injection_budget_bytes: Option<usize>,
+    source_sha256: String,
+    configuration_sha256: String,
+    chunk_threshold: Option<usize>,
     dry_run: bool,
 }
 
@@ -261,7 +274,7 @@ impl BenchReport {
 
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
-        out.push_str("# IronMem LongMemEval Report\n\n");
+        out.push_str(&format!("# IronMem {} Report\n\n", self.suite));
         out.push_str(&format!("- generated_at: `{}`\n", self.generated_at));
         out.push_str(&format!("- commit: `{}`\n", self.commit));
         out.push_str(&format!("- dataset: `{}`\n", self.dataset));
@@ -270,6 +283,10 @@ impl BenchReport {
         out.push_str(&format!("- judge_model: `{}`\n", self.judge_model));
         out.push_str(&format!("- embedder: `{}`\n", self.embedder));
         out.push_str(&format!("- retrieve_k: `{}`\n", self.retrieve_k));
+        if self.mode.contains("[dry-run: unscored]") {
+            out.push_str("\nUnscored pipeline run. No accuracy measurements.\n");
+            return out;
+        }
         out.push_str(&format!(
             "- overall: `{}/{} = {:.1}%`\n\n",
             self.correct,
@@ -319,13 +336,25 @@ fn select_stratified(questions: &[LmeQuestion], per_ability: usize) -> Vec<LmeQu
         .collect()
 }
 
+fn ensure_scoring_options(dry_run: bool, minimum: Option<f64>) -> Result<()> {
+    if dry_run && minimum.is_some() {
+        bail!("an unscored dry run cannot enforce an accuracy threshold");
+    }
+    Ok(())
+}
+
 pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
+    ensure_scoring_options(opts.dry_run, opts.min_accuracy)?;
     if let Some(minimum) = opts.min_accuracy {
         if !(0.0..=1.0).contains(&minimum) {
             bail!("--min-accuracy must be between 0.0 and 1.0");
         }
     }
-    let questions = load_dataset(&opts.data)?;
+    let questions = if opts.suite == "locomo" {
+        crate::density::load_locomo(&opts.data)?
+    } else {
+        load_dataset(&opts.data)?
+    };
     let questions = if let Some(per_ability) = opts.stratified_per_ability {
         if per_ability == 0 {
             bail!("--stratified-per-ability must be greater than zero");
@@ -350,7 +379,11 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
     let database = Database::new(&temp_db.to_string_lossy()).await?;
     database.migrate().await?;
 
-    let embedder = crate::embedder::resolve_embedder(cfg).await;
+    let embedder = if opts.dry_run {
+        None
+    } else {
+        crate::embedder::resolve_embedder(cfg).await
+    };
     let store: std::sync::Arc<dyn VectorStore> = match &embedder {
         Some(e) => crate::vectorstore::make_vector_store(&database, e.dim()).await,
         None => std::sync::Arc::new(BruteForceStore),
@@ -371,8 +404,9 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
 
     let checkpoint_dir = opts.out_dir.join("longmemeval-checkpoint");
     let checkpoint_identity = CheckpointIdentity {
-        schema: 2,
+        schema: 3,
         dataset_sha256: sha256_file(&opts.data)?,
+        suite: opts.suite.clone(),
         commit: git_commit(),
         answer_model: answer_model.clone(),
         judge_model: judge_model.clone(),
@@ -385,6 +419,10 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
             .map(|value| (value * 1_000_000.0).round() as u32),
         full_context: opts.full_context,
         context_chars: opts.context_chars,
+        injection_budget_bytes: opts.injection_budget_bytes,
+        source_sha256: env!("IRONMEM_SOURCE_SHA").into(),
+        configuration_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(cfg)?)),
+        chunk_threshold: crate::config::ccr_chunk_threshold()?,
         dry_run: opts.dry_run,
     };
     prepare_checkpoint_dir(&checkpoint_dir, &checkpoint_identity)?;
@@ -442,10 +480,11 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
                     question: question.question.clone(),
                     gold: question.gold_answer(),
                     hypothesis: format!("[harness error: {e:#}]"),
-                    correct: false,
+                    correct: if opts.dry_run { None } else { Some(false) },
                     judge_verdict: String::new(),
                     retrieved: 0,
                     answer_ms: 0,
+                    context_bytes: 0,
                 }
             }
         };
@@ -456,10 +495,10 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
             questions.len(),
             result.question_id,
             result.ability,
-            if result.correct {
-                "correct"
-            } else {
-                "incorrect"
+            match result.correct {
+                Some(true) => "correct",
+                Some(false) => "incorrect",
+                None => "unscored",
             }
         );
         results.push(result);
@@ -474,14 +513,14 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
                 correct: 0,
             });
         entry.total += 1;
-        if r.correct {
+        if r.correct == Some(true) {
             entry.correct += 1;
         }
     }
-    let correct = results.iter().filter(|r| r.correct).count();
+    let correct = results.iter().filter(|r| r.correct == Some(true)).count();
 
     let report = BenchReport {
-        suite: "longmemeval".to_string(),
+        suite: opts.suite.clone(),
         generated_at: Utc::now().to_rfc3339(),
         commit: git_commit(),
         dataset: opts.data.display().to_string(),
@@ -564,16 +603,36 @@ async fn run_question(
             context.push_str(&memory.summary);
             context.push_str("\n\n");
         }
-        (context, retrieved)
+        if let Some(budget) = opts.injection_budget_bytes {
+            let gate = crate::egress::gate_memories(
+                db,
+                chronological,
+                "local",
+                &project,
+                None,
+                crate::egress::PurposeChannel::LocalOperator("ironmem:bench".into()),
+                crate::egress::ConsumerCapabilities {
+                    reasoning_only_channel: false,
+                    exact_source_expansion: false,
+                    denial_diagnostics: false,
+                },
+                &cfg.influence,
+            )
+            .await?;
+            let (bounded, report) = crate::hooks::render_memories(&gate.authorized, budget);
+            (bounded, report.written_ids.len())
+        } else {
+            (context, retrieved)
+        }
     };
 
     let (hypothesis, correct, judge_verdict) = if opts.dry_run {
-        ("[dry-run: no LLM call]".to_string(), false, String::new())
+        ("[dry-run: no LLM call]".to_string(), None, String::new())
     } else {
         let hypothesis = answer_question(cfg, question, &context, answer_model).await?;
         let (correct, judge_verdict) =
             judge_answer(cfg, question, &hypothesis, judge_model).await?;
-        (hypothesis, correct, judge_verdict)
+        (hypothesis, Some(correct), judge_verdict)
     };
     let answer_ms = started.elapsed().as_millis();
 
@@ -587,6 +646,7 @@ async fn run_question(
         judge_verdict,
         retrieved,
         answer_ms,
+        context_bytes: context.len(),
     })
 }
 
@@ -617,6 +677,8 @@ async fn ingest_sessions(
         let session_id = db::create_session(db, project).await?;
         let text = session_memory_text(session, &date);
         let memory_id = db::insert_memory(db, project, &session_id, &text, None).await?;
+        let source = crate::ccr::store_blob(db, text.as_bytes(), Some("text")).await?;
+        db::set_memory_session_blob(db, memory_id, &source.hash).await?;
         if let Some(event_date) = date.split_whitespace().next() {
             if !event_date.is_empty() {
                 let _ = db::set_memory_event_time(db, memory_id, event_date).await;
@@ -718,10 +780,7 @@ fn full_context(question: &LmeQuestion, max_chars: usize) -> String {
             break;
         }
     }
-    if out.len() > max_chars {
-        out.truncate(max_chars);
-    }
-    out
+    crate::strutil::truncate_bytes(&out, max_chars)
 }
 
 async fn answer_question(
@@ -964,10 +1023,11 @@ mod tests {
             question: "What instrument?".to_string(),
             gold: "cello".to_string(),
             hypothesis: "cello".to_string(),
-            correct: true,
+            correct: Some(true),
             judge_verdict: "yes".to_string(),
             retrieved: 3,
             answer_ms: 42,
+            context_bytes: 100,
         };
 
         persist_checkpoint_result(&root, &result).unwrap();
@@ -975,7 +1035,7 @@ mod tests {
 
         assert_eq!(resumed.len(), 1);
         assert_eq!(resumed[0].question_id, "q1");
-        assert!(resumed[0].correct);
+        assert_eq!(resumed[0].correct, Some(true));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -989,10 +1049,11 @@ mod tests {
             question: "Unknown?".to_string(),
             gold: "unanswerable".to_string(),
             hypothesis: "I don't know".to_string(),
-            correct: true,
+            correct: Some(true),
             judge_verdict: "yes".to_string(),
             retrieved: 0,
             answer_ms: 7,
+            context_bytes: 0,
         };
 
         persist_checkpoint_result(&root, &result).unwrap();
@@ -1008,8 +1069,13 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("ironmem-checkpoint-test-{}", uuid::Uuid::new_v4()));
         let first = CheckpointIdentity {
-            schema: 2,
+            schema: 3,
             dataset_sha256: "dataset-a".to_string(),
+            suite: "longmemeval".into(),
+            injection_budget_bytes: None,
+            source_sha256: "source-a".into(),
+            configuration_sha256: "config-a".into(),
+            chunk_threshold: None,
             commit: "abc1234".to_string(),
             answer_model: "answerer".to_string(),
             judge_model: "judge".to_string(),

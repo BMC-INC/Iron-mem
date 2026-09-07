@@ -1,0 +1,8 @@
+budget_bytes,n,mean_context_bytes,accuracy,gate
+2000,2,547.5,,unscored
+4000,2,547.5,,unscored
+8000,2,547.5,,unscored
+16000,2,547.5,,unscored
+24000,2,547.5,,unscored
+48000,2,547.5,,unscored
+96000,2,547.5,,unscored

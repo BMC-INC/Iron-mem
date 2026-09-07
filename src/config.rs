@@ -1076,3 +1076,19 @@ mod tests {
         assert!(cfg.influence.fail_closed_on_policy_error);
     }
 }
+
+/// Opt-in physical format. Disabling writes never disables the chunked reader.
+pub fn ccr_chunk_threshold() -> Result<Option<usize>> {
+    let Some(value) = std::env::var_os("IRONMEM_CCR_CHUNK_THRESHOLD_BYTES") else {
+        return Ok(None);
+    };
+    let threshold: usize = value
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid CCR threshold encoding"))?
+        .parse()?;
+    anyhow::ensure!(
+        (128 * 1024..=512 * 1024 * 1024).contains(&threshold),
+        "CCR threshold must be between 128 KiB and 512 MiB"
+    );
+    Ok(Some(threshold))
+}

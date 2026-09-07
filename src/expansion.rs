@@ -39,6 +39,7 @@ pub async fn retrieve_original(
         anyhow::bail!("provide 'observation_id', 'memory_id', 'hash', or 'chunk_id'");
     };
 
+    crate::checkpoint::ensure_source_object(db, &resolved_hash).await?;
     let bytes = crate::ccr::load_blob(db, &resolved_hash).await?;
     Ok(ExpandedOriginal {
         hash: Some(resolved_hash),
@@ -57,6 +58,7 @@ async fn retrieve_chunk(db: &Database, chunk_id: &str) -> Result<ExpandedOrigina
         .ok_or_else(|| anyhow::anyhow!("memory chunk not found: {chunk_id}"))?;
 
     if let Some(hash) = chunk.source_hash.as_deref() {
+        crate::checkpoint::ensure_source_object(db, hash).await?;
         let bytes = crate::ccr::load_blob(db, hash).await?;
         if let (Some(start), Some(end)) = (chunk.source_start, chunk.source_end) {
             let start = start.max(0) as usize;

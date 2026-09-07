@@ -7,6 +7,7 @@
 //! is the runtime half of the reversibility contract — a corrupted or tampered
 //! row can never silently return wrong bytes.
 
+pub mod chunked;
 pub mod codec;
 pub mod detect;
 pub mod dict;
@@ -57,6 +58,11 @@ pub async fn store_blob(
     bytes: &[u8],
     path_hint: Option<&str>,
 ) -> anyhow::Result<BlobRef> {
+    if let Some(threshold) = crate::config::ccr_chunk_threshold()? {
+        if bytes.len() >= threshold {
+            return chunked::store(db, bytes, path_hint).await;
+        }
+    }
     let hash = sha256_hex(bytes);
     let content_type = detect::detect(bytes, path_hint);
 
@@ -110,7 +116,9 @@ pub async fn load_blob(db: &Database, hash: &str) -> anyhow::Result<Vec<u8>> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("CCR blob not found: {hash}"))?;
 
-    let original = if row.codec == "dict+zstd" {
+    let original = if row.codec == chunked::FORMAT {
+        chunked::load(db, &row).await?
+    } else if row.codec == "dict+zstd" {
         let dict_hash = row
             .dict_hash
             .as_deref()

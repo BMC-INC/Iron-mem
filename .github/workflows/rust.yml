@@ -51,5 +51,42 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo run --quiet -- eval --out target/eval-reports
 
+      - name: Seven-budget benchmark smoke tests (no model calls)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          python3 scripts/run_memory_density.py --suite longmemeval --data tests/fixtures/density/longmemeval.json --out "${{ runner.temp }}/density-lme"
+          python3 scripts/run_memory_density.py --suite locomo --data tests/fixtures/density/locomo.json --out "${{ runner.temp }}/density-locomo"
+
       - name: Clippy
         run: cargo clippy -- -D warnings
+
+  postgres-foundations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: ironmem_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: postgres-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: PostgreSQL storage and checkpoint integration
+        env:
+          IRONMEM_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/ironmem_test
+        run: cargo test --bin ironmem postgres_foundations -- --ignored

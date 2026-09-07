@@ -1,0 +1,1 @@
+{"question_id":"density-1","ability":"information-extraction","question":"Which compiler does the project use?","gold":"Rust 1.90","hypothesis":"[dry-run: no LLM call]","correct":null,"judge_verdict":"","retrieved":1,"answer_ms":92,"context_bytes":540}

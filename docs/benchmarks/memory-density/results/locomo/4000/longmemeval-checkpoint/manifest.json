@@ -1,0 +1,20 @@
+{
+  "schema": 3,
+  "dataset_sha256": "f4612dccbefc4c30e606ef637a360276d7287d8cba1fe04e7ac998c05409e037",
+  "suite": "locomo",
+  "commit": "01dac52",
+  "answer_model": "gemini-2.5-flash",
+  "judge_model": "gemini-2.5-flash",
+  "embedder": "none (FTS + graph only)",
+  "retrieve_k": 10,
+  "limit": null,
+  "stratified_per_ability": 1,
+  "min_accuracy_millionths": null,
+  "full_context": false,
+  "context_chars": 400000,
+  "injection_budget_bytes": 4000,
+  "source_sha256": "ed57185b7a798668d1e3b24a453236ac58665e24ab132e52def85f2c8b6e168d",
+  "configuration_sha256": "08eaf8897f0f5471c70d178f55c601943f08e69e584b240d0c6afed6446cd169",
+  "chunk_threshold": null,
+  "dry_run": true
+}

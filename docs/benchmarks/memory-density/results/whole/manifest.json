@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "code_sha": "01dac52e353466bcf1fa6d176bbb64bd60ec7664",
+  "source_sha256": "ed57185b7a798668d1e3b24a453236ac58665e24ab132e52def85f2c8b6e168d",
+  "dataset_sha256": "bad58ac20a9e21bee32ab50ae67ba7d2573fed933a5beb4809c1389b9132c79d",
+  "seed": 1230131022,
+  "budgets": [
+    2000,
+    4000,
+    8000,
+    16000,
+    24000,
+    48000,
+    96000
+  ],
+  "storage_mode": "fastcdc_threshold=None; zstd=19",
+  "hardware": "macos-x86_64",
+  "cache_condition": "fresh database; first read then warm repeated reads; OS cache uncontrolled",
+  "tokenizer": null,
+  "answer_model": null,
+  "judge_model": null
+}
