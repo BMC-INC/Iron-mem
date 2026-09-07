@@ -1048,13 +1048,13 @@ impl IronMemServer {
             .await?;
         let memories = gate.authorized;
 
-        hooks::write_ironmem_file(project, &memories)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        hooks::ensure_claude_md_import(project)
+        let report = hooks::inject_memories(&self.db, project, &memories)
+            .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let json = serde_json::json!({
-            "injected": memories.len(),
+            "injected": report.written_ids.len(),
+            "injection_report": report,
             "project": project,
             "denied_memory_ids": gate.denied_memory_ids,
             "influence_decisions": gate.decisions,
