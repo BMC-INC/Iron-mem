@@ -14,9 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full/incremental snapshots and independent exports preserve assertion history, validate event chains and reject divergent histories. Legacy v5 checkpoints remain compatible; older restores cannot erase newer immutable claims.
 - Deterministic temporal, governance, concurrency, recovery and public-surface fixtures; PostgreSQL CI now covers foundations, telemetry and assertions. README documents all memory-density upgrades and their rollout gates.
 
-### Fixed — Restore cleanup
+### Fixed — Recovery and portability
 
 - Snapshot restoration uses registered generated-file hashes before removing context, preserving user-edited and unrelated `IRONMEM.md` files.
+- Configured SQLite paths reuse the existing Windows/Unix URL normalizer, keeping CLI database access consistent with direct database opens.
 
 ### Added — Delivery telemetry and optional working sets
 

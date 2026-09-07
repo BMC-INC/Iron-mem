@@ -895,7 +895,7 @@ impl Config {
         std::env::var("DATABASE_URL")
             .ok()
             .or_else(|| self.database_url.clone())
-            .unwrap_or_else(|| format!("sqlite://{}?mode=rwc", self.db_path))
+            .unwrap_or_else(|| crate::db::sqlite_file_url(std::path::Path::new(&self.db_path)))
     }
 
     pub fn effective_mcp_transport(&self) -> String {
@@ -1001,6 +1001,32 @@ mod tests {
         "max_observation_bytes": 2048,
         "db_path": "/tmp/mem.db"
     }"#;
+
+    #[test]
+    fn configured_database_paths_use_portable_sqlite_urls() {
+        assert!(
+            std::env::var_os("DATABASE_URL").is_none(),
+            "isolated configuration test requires DATABASE_URL unset"
+        );
+        let mut cfg = Config {
+            db_path: r"C:\Users\runner\memory.db".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.effective_database_url(),
+            "sqlite:///C:/Users/runner/memory.db?mode=rwc"
+        );
+        cfg.db_path = "/tmp/memory.db".into();
+        assert_eq!(
+            cfg.effective_database_url(),
+            "sqlite:///tmp/memory.db?mode=rwc"
+        );
+        cfg.database_url = Some("postgres://example.invalid/memory".into());
+        assert_eq!(
+            cfg.effective_database_url(),
+            "postgres://example.invalid/memory"
+        );
+    }
 
     #[test]
     fn missing_embedding_key_yields_defaults() {

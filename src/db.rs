@@ -1849,7 +1849,7 @@ fn register_sqlite_vec() {
     });
 }
 
-fn sqlite_file_url(path: &std::path::Path) -> String {
+pub(crate) fn sqlite_file_url(path: &std::path::Path) -> String {
     let normalized = path.to_string_lossy().replace('\\', "/");
 
     if normalized.len() >= 2 && normalized.as_bytes()[1] == b':' {
