@@ -342,6 +342,8 @@ impl PolicyPrincipal {
             namespaces: Vec::new(),
             capabilities: vec![
                 POLICY_READ_CAPABILITY.to_string(),
+                "assertions:read".to_string(),
+                "assertions:write".to_string(),
                 POLICY_WRITE_CAPABILITY.to_string(),
             ],
         }

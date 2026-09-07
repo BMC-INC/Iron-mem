@@ -160,6 +160,42 @@ pub async fn stats(db: &Database, ids: &[i64]) -> Result<BTreeMap<i64, Stats>> {
     Ok(result)
 }
 
+/// Resolve the reference actually expanded (selector precedence matters), then
+/// intersect with the authorized owners. Never credit unrelated supplied IDs.
+pub async fn delivered_expansion(
+    db: &Database,
+    expanded: &crate::expansion::ExpandedOriginal,
+    gate: &crate::egress::GateResult,
+) {
+    if expanded.hash.is_none() {
+        return;
+    }
+    let mut allowed = gate_ids(gate).into_iter().collect::<BTreeSet<_>>();
+    allowed.extend(gate.source_required.iter().map(|m| m.id));
+    let resolved = if let Some(chunk) = expanded.chunk_id.as_deref() {
+        crate::db::memory_ids_for_original_reference(db, None, None, None, Some(chunk)).await
+    } else {
+        crate::db::memory_ids_for_original_reference(db, None, None, expanded.hash.as_deref(), None)
+            .await
+    };
+    match resolved {
+        Ok(ids) => {
+            delivered(
+                db,
+                Delivery::Expansion,
+                &ids.into_iter()
+                    .filter(|id| allowed.contains(id))
+                    .collect::<Vec<_>>(),
+                None,
+            )
+            .await
+        }
+        Err(error) => {
+            tracing::warn!(%error,"Delivered source but could not resolve telemetry ownership")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,41 +346,5 @@ mod tests {
         assert_eq!(stats(&db, &[id]).await?[&id].recall_count, 4);
         db.pool.close().await;
         Ok(())
-    }
-}
-
-/// Resolve the reference actually expanded (selector precedence matters), then
-/// intersect with the authorized owners. Never credit unrelated supplied IDs.
-pub async fn delivered_expansion(
-    db: &Database,
-    expanded: &crate::expansion::ExpandedOriginal,
-    gate: &crate::egress::GateResult,
-) {
-    if expanded.hash.is_none() {
-        return;
-    }
-    let mut allowed = gate_ids(gate).into_iter().collect::<BTreeSet<_>>();
-    allowed.extend(gate.source_required.iter().map(|m| m.id));
-    let resolved = if let Some(chunk) = expanded.chunk_id.as_deref() {
-        crate::db::memory_ids_for_original_reference(db, None, None, None, Some(chunk)).await
-    } else {
-        crate::db::memory_ids_for_original_reference(db, None, None, expanded.hash.as_deref(), None)
-            .await
-    };
-    match resolved {
-        Ok(ids) => {
-            delivered(
-                db,
-                Delivery::Expansion,
-                &ids.into_iter()
-                    .filter(|id| allowed.contains(id))
-                    .collect::<Vec<_>>(),
-                None,
-            )
-            .await
-        }
-        Err(error) => {
-            tracing::warn!(%error,"Delivered source but could not resolve telemetry ownership")
-        }
     }
 }

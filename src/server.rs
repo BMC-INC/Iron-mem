@@ -131,6 +131,7 @@ pub fn router(state: AppState) -> Router {
         .route("/status", get(get_status))
         .route("/retrieve_original", post(retrieve_original))
         .route("/remember", post(remember))
+        .route("/assertions", post(assertion_request))
         .route("/profile", get(get_profile))
         .route("/refresh_profile", post(refresh_profile))
         .route("/corrections", get(list_corrections))
@@ -1011,6 +1012,32 @@ fn rest_policy_principal(
         ),
         None => crate::influence::PolicyPrincipal::local_operator("ironmem:rest-local"),
     }
+}
+
+async fn assertion_request(
+    State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
+    Json(request): Json<crate::assertions::Request>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    crate::assertions::handle(
+        &state.db,
+        &state.config,
+        &rest_policy_principal(agent),
+        request,
+    )
+    .await
+    .map(Json)
+    .map_err(|error| {
+        let message = error.to_string();
+        let status = if crate::influence::policy_error(&error).is_some() {
+            StatusCode::FORBIDDEN
+        } else if message.contains("version conflict") {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        (status, message)
+    })
 }
 
 fn influence_http_error(error: anyhow::Error) -> InfluenceHttpError {
@@ -2375,6 +2402,53 @@ mod workbench_tests {
     use axum::body::{to_bytes, Body};
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn assertions_rest_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::Database::new(dir.path().join("rest.db").to_str().unwrap())
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        let session = db::create_session(&db, "synthetic").await.unwrap();
+        let id = db::insert_memory(&db, "synthetic", &session, "Rust 1.80", None)
+            .await
+            .unwrap();
+        let mut config = Config::default();
+        config.assertions.enabled = true;
+        let state = Arc::new(AppState {
+            db,
+            config,
+            embedder: None,
+            store: Arc::new(crate::vectorstore::BruteForceStore),
+        });
+        let scope = serde_json::json!({"namespace":"local","project":"synthetic","subject":"rust","predicate":"version"});
+        let write = serde_json::json!({"op":"write","scope":scope,"expected_version":0,"memory_id":id,"value":"1.80","valid_from":0});
+        let _ = assertion_request(
+            State(state.clone()),
+            None,
+            Json(serde_json::from_value(write.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        let conflict = assertion_request(
+            State(state.clone()),
+            None,
+            Json(serde_json::from_value(write).unwrap()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
+        let result = assertion_request(
+            State(state.clone()),
+            None,
+            Json(serde_json::from_value(serde_json::json!({"op":"query","scope":scope})).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.0["status"], "current");
+        state.db.pool.close().await;
+    }
 
     #[tokio::test]
     async fn access_rest_delivery_and_failure_counts() {

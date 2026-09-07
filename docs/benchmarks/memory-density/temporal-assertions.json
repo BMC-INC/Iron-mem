@@ -1,0 +1,18 @@
+{
+  "assertion_delivery_p50_us": 10918,
+  "assertion_delivery_p95_us": 13687,
+  "cache": "warm process; OS cache uncontrolled",
+  "comparison": "assertion delivery includes history verification, governance and access writes; independent read is a lower-level baseline without temporal resolution or delivery writes",
+  "database_bytes_with_assertions": 532480,
+  "default_enabled": false,
+  "fixture": "two synthetic evidence memories, ten scoped value events, 102 independently expected valid-time points",
+  "independent_database_bytes": 524288,
+  "independent_memory_read_p50_us": 2289,
+  "independent_memory_read_p95_us": 3290,
+  "profile": "debug without debug symbols",
+  "samples": 20,
+  "schema_version": 1,
+  "scored_accuracy": null,
+  "source_sha256": "3a23a3e496f2b56daefe003803a35a1691bf0a70017c008527f4a8505dbbfd78",
+  "temporal_points_passed": 102
+}

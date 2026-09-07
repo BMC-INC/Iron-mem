@@ -1,5 +1,6 @@
 mod access;
 mod access_mutations;
+mod assertions;
 mod auto_dream;
 mod bench;
 mod ccr;
@@ -742,6 +743,12 @@ enum Commands {
         actor: String,
     },
 
+    /// Append or query opt-in structured assertions using a JSON request
+    Assertion {
+        /// JSON request (op=write or query); see docs/architecture/temporal-assertions.md
+        request: String,
+    },
+
     /// Inspect local delivery counters and temperature without recording a recall
     AccessStats {
         memory_id: i64,
@@ -1177,6 +1184,10 @@ async fn async_main() -> Result<()> {
             apply,
             actor,
         } => run_ledger_migrate(&cfg, &namespace, &out, apply, &actor).await?,
+        Commands::Assertion { request } => {
+            let response = run_assertion(&cfg, &request).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
         Commands::AccessStats {
             memory_id,
             namespace,
@@ -2057,6 +2068,18 @@ async fn run_code_relink(
         relinked
     );
     Ok(())
+}
+
+async fn run_assertion(cfg: &config::Config, request: &str) -> Result<serde_json::Value> {
+    let database = db::Database::new(&cfg.effective_database_url()).await?;
+    database.migrate().await?;
+    assertions::handle(
+        &database,
+        cfg,
+        &influence::PolicyPrincipal::local_operator("ironmem:cli"),
+        serde_json::from_str(request)?,
+    )
+    .await
 }
 
 async fn run_snapshot(cfg: &config::Config, action: SnapshotCommands) -> Result<()> {
@@ -3216,6 +3239,39 @@ mod tests {
 #[cfg(test)]
 mod access_cli_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn assertions_cli_contract() -> Result<()> {
+        anyhow::ensure!(
+            std::env::var_os("DATABASE_URL").is_none(),
+            "isolated CLI test requires DATABASE_URL unset"
+        );
+        let dir = tempfile::tempdir()?;
+        let mut cfg = config::Config {
+            db_path: dir.path().join("cli.db").to_str().unwrap().into(),
+            ..Default::default()
+        };
+        cfg.assertions.enabled = true;
+        let db = db::Database::new(&cfg.db_path).await?;
+        db.migrate().await?;
+        let session = db::create_session(&db, "synthetic").await?;
+        let id = db::insert_memory(&db, "synthetic", &session, "Rust 1.80", None).await?;
+        let scope = serde_json::json!({"namespace":"local","project":"synthetic","subject":"rust","predicate":"version"});
+        let write=serde_json::json!({"op":"write","scope":scope,"expected_version":0,"memory_id":id,"value":"1.80","valid_from":0}).to_string();
+        assert!(matches!(
+            Cli::try_parse_from(["ironmem", "assertion", &write])?.command,
+            Commands::Assertion { .. }
+        ));
+        let receipt = run_assertion(&cfg, &write).await?;
+        let result = run_assertion(
+            &cfg,
+            &serde_json::json!({"op":"query","scope":scope}).to_string(),
+        )
+        .await?;
+        assert_eq!(result["current_id"], receipt["id"]);
+        db.pool.close().await;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn access_cli_delivery_parity() -> Result<()> {

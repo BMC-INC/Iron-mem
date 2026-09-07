@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Structured temporal assertions
+
+- Opt-in structured claims with scoped identities, immutable hash-linked events, expected-version writes, valid/recorded time, explicit supersession and retraction. Current/as-of queries abstain on conflicts and enforce today's evidence restrictions.
+- Shared CLI `assertion`, MCP `memory_assertion`, and REST `/assertions` contracts with explicit remote read/write capabilities. Appends include atomic governance receipts; successful delivery uses existing access telemetry.
+- Full/incremental snapshots and independent exports preserve assertion history, validate event chains and reject divergent histories. Legacy v5 checkpoints remain compatible; older restores cannot erase newer immutable claims.
+- Deterministic temporal, governance, concurrency, recovery and public-surface fixtures; PostgreSQL CI now covers foundations, telemetry and assertions. README documents all memory-density upgrades and their rollout gates.
+
+### Fixed — Restore cleanup
+
+- Snapshot restoration uses registered generated-file hashes before removing context, preserving user-edited and unrelated `IRONMEM.md` files.
+
 ### Added — Delivery telemetry and optional working sets
 
 - Compact recall/expansion counters, bounded retry receipts, transactional metadata-row mutation counts, and local `access-stats` diagnostics. Injection totals reuse existing history.

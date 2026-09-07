@@ -132,8 +132,25 @@ impl IronMemServer {
         .map_err(|error| ErrorData::invalid_params(error.to_string(), None))
     }
 
+    async fn handle_assertion(&self, args: &JsonObject) -> Result<CallToolResult, ErrorData> {
+        let request = serde_json::from_value(
+            args.get("request")
+                .cloned()
+                .ok_or_else(|| ErrorData::invalid_params("request required", None))?,
+        )
+        .map_err(|e| ErrorData::invalid_params(format!("invalid assertion request: {e}"), None))?;
+        let result =
+            crate::assertions::handle(&self.db, &self.config, &self.policy_principal, request)
+                .await
+                .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&result).unwrap(),
+        )]))
+    }
+
     fn build_tool_list() -> Vec<Tool> {
         vec![
+            Tool::new("memory_assertion", "Append or query opt-in structured temporal claims. Requires assertions:read/write capability. Conflicts abstain; original evidence remains governed.", schema(serde_json::json!({"type":"object","properties":{"request":crate::assertions::request_schema()},"required":["request"],"additionalProperties":false}))),
             Tool::new(
                 "session_start",
                 "Start a new session for a project. Returns a session_id.",
@@ -1800,6 +1817,7 @@ impl ServerHandler for IronMemServer {
     ) -> Result<CallToolResult, ErrorData> {
         let args = request.arguments.unwrap_or_default();
         match request.name.as_ref() {
+            "memory_assertion" => self.handle_assertion(&args).await,
             "session_start" => self.handle_session_start(&args).await,
             "session_end" => self.handle_session_end(&args).await,
             "record_event" => self.handle_record_event(&args).await,
@@ -2064,6 +2082,37 @@ mod tests {
             .as_str()
             .expect("text content")
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn assertions_mcp_contract() {
+        let (mut server, path) = test_server().await;
+        Arc::make_mut(&mut server.config).assertions.enabled = true;
+        let session = db::create_session(&server.db, "synthetic").await.unwrap();
+        let id = db::insert_memory(&server.db, "synthetic", &session, "Rust 1.80", None)
+            .await
+            .unwrap();
+        let scope = serde_json::json!({"namespace":"local","project":"synthetic","subject":"rust","predicate":"version"});
+        let args = serde_json::json!({"request":{"op":"write","scope":scope,"expected_version":0,"memory_id":id,"value":"1.80","valid_from":0}});
+        server
+            .handle_assertion(args.as_object().unwrap())
+            .await
+            .unwrap();
+        let args = serde_json::json!({"request":{"op":"query","scope":scope}});
+        let result = server
+            .handle_assertion(args.as_object().unwrap())
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(result["status"], "current");
+        server.policy_principal =
+            crate::influence::PolicyPrincipal::configured("shared", "shared_token", vec![], vec![]);
+        assert!(server
+            .handle_assertion(args.as_object().unwrap())
+            .await
+            .is_err());
+        server.db.pool.close().await;
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

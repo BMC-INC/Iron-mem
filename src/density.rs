@@ -258,35 +258,6 @@ pub async fn run(out: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn local_frontier_accounts_for_all_exposure_and_rejects_resume_drift() -> Result<()> {
-        let out = tempfile::tempdir()?;
-        run(out.path()).await?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(out.path().join("report.json"))?)?;
-        assert_eq!(value["measurements"].as_array().unwrap().len(), 7);
-        for m in value["measurements"].as_array().unwrap() {
-            assert!(m["accuracy"].is_null());
-            assert!(m["injected_bytes"].as_u64() <= m["budget_bytes"].as_u64());
-            assert_eq!(
-                m["total_exposure_bytes"].as_u64().unwrap(),
-                m["injected_bytes"].as_u64().unwrap()
-                    + m["retrieval_payload_bytes"].as_u64().unwrap()
-                    + m["expansion_bytes"].as_u64().unwrap()
-            );
-        }
-        let path = out.path().join("manifest.json");
-        let mut manifest: Manifest = serde_json::from_slice(&std::fs::read(&path)?)?;
-        manifest.seed += 1;
-        std::fs::write(path, serde_json::to_vec(&manifest)?)?;
-        assert!(run(out.path()).await.is_err());
-        Ok(())
-    }
-}
-
 /// LoCoMo categories 1-4 remain separate; adversarial category 5 is excluded
 /// from the headline denominator, matching the existing external harness.
 pub fn load_locomo(path: &Path) -> Result<Vec<crate::bench::LmeQuestion>> {
@@ -377,4 +348,33 @@ pub fn load_locomo(path: &Path) -> Result<Vec<crate::bench::LmeQuestion>> {
     }
     ensure!(!questions.is_empty(), "no scored LoCoMo questions");
     Ok(questions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn local_frontier_accounts_for_all_exposure_and_rejects_resume_drift() -> Result<()> {
+        let out = tempfile::tempdir()?;
+        run(out.path()).await?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.path().join("report.json"))?)?;
+        assert_eq!(value["measurements"].as_array().unwrap().len(), 7);
+        for m in value["measurements"].as_array().unwrap() {
+            assert!(m["accuracy"].is_null());
+            assert!(m["injected_bytes"].as_u64() <= m["budget_bytes"].as_u64());
+            assert_eq!(
+                m["total_exposure_bytes"].as_u64().unwrap(),
+                m["injected_bytes"].as_u64().unwrap()
+                    + m["retrieval_payload_bytes"].as_u64().unwrap()
+                    + m["expansion_bytes"].as_u64().unwrap()
+            );
+        }
+        let path = out.path().join("manifest.json");
+        let mut manifest: Manifest = serde_json::from_slice(&std::fs::read(&path)?)?;
+        manifest.seed += 1;
+        std::fs::write(path, serde_json::to_vec(&manifest)?)?;
+        assert!(run(out.path()).await.is_err());
+        Ok(())
+    }
 }

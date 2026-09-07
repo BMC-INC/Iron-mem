@@ -1,6 +1,6 @@
 # Delivery telemetry and working sets
 
-This batch implements phases E and F of the upgrade plan. The production injection ceiling remains 24,000 decimal bytes. Dynamic selection is disabled by default; no scored accuracy improvement is claimed. The full regression/evaluation run is deferred until the remaining upgrade phases are complete, as requested.
+This batch implements phases E and F of the upgrade plan. The production injection ceiling remains 24,000 decimal bytes. Dynamic selection is disabled by default; no scored accuracy improvement is claimed. The E/F checkpoint used focused verification; the final integration pass is recorded in [FINAL-VALIDATION.md](FINAL-VALIDATION.md).
 
 ## Delivery contract
 

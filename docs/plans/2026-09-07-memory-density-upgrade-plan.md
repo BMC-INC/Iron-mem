@@ -1,6 +1,6 @@
 # IronMem memory density and storage upgrade plan
 
-Status: Phase A merged in PR #45. Phases B–D implemented in the storage-foundations batch, with final validation recorded in `docs/benchmarks/memory-density/`. Task 11 uses complete transactional row-set differences rather than an incomplete mutation journal; see the implementation methodology. Phase E is implemented with opt-in working sets and focused verification; operational telemetry resets on project restore. Phase F profiling is complete, with no production interning migration justified by representative evidence. Phase G remains pending. The user has deferred the comprehensive test run until completion through the seventh phase (G).
+Status: A merged in PR #45; B–D merged in PR #46. E implements delivery telemetry and opt-in working sets. F profiling completed without a justified production interning migration. G implements opt-in immutable assertion events, governed temporal queries, and snapshot integration. Final integrated validation and explicit plan adjustments are recorded in `docs/benchmarks/memory-density/FINAL-VALIDATION.md`. Scored model evaluation and representative-data rollout gates remain separate; no production defaults or installed runtime were changed.
 Prepared: 2026-09-07.
 
 ## Verified starting point
@@ -280,4 +280,4 @@ Before the first production schema migration, obtain a consistent recoverable ba
 - Which metadata families merit interning.
 - Whether semantic deltas outperform independent assertions enough to enable publicly.
 
-These do not block Phase A or local benchmark tooling. Next implementation checkpoint: Phase G assertion identity and temporal semantics, followed by its opt-in persistence/retrieval integration. Full integration verification follows that batch. E/F implementation details and profiling gates are in `docs/benchmarks/memory-density/ACCESS-WORKING-SETS.md`.
+These do not block Phase A or local benchmark tooling. The implementation sequence is complete with experimental features disabled by default and the interning migration gate intentionally untriggered. E/F methodology is in `docs/benchmarks/memory-density/ACCESS-WORKING-SETS.md`; G semantics are in `docs/architecture/temporal-assertions.md`. The final validation report distinguishes completed deterministic checks from unrun paid/scored and representative-workload evaluations.

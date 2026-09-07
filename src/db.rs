@@ -1783,6 +1783,7 @@ impl Database {
         .await?;
 
         crate::access::migrate(self).await?;
+        crate::assertions::migrate(self).await?;
 
         Ok(())
     }
@@ -4670,7 +4671,7 @@ async fn append_memory_ledger_with_expected_head(
     }
 }
 
-async fn append_memory_ledger_on_connection(
+pub(crate) async fn append_memory_ledger_on_connection(
     conn: &mut sqlx::AnyConnection,
     namespace: &str,
     memory_id: Option<i64>,

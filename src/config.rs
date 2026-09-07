@@ -25,6 +25,8 @@ pub struct Config {
     pub inject_limit: usize,
     #[serde(default)]
     pub working_set: crate::working_set::Config,
+    #[serde(default)]
+    pub assertions: crate::assertions::Config,
     pub max_observation_bytes: usize,
     pub db_path: String,
     #[serde(default)]
@@ -812,6 +814,7 @@ impl Default for Config {
             vertex_location: default_vertex_location(),
             inject_limit: 5,
             working_set: crate::working_set::Config::default(),
+            assertions: crate::assertions::Config::default(),
             max_observation_bytes: 2048,
             db_path: ironmem_dir().join("mem.db").to_string_lossy().to_string(),
             database_url: None,
@@ -971,6 +974,22 @@ pub fn save(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Opt-in physical format. Disabling writes never disables the chunked reader.
+pub fn ccr_chunk_threshold() -> Result<Option<usize>> {
+    let Some(value) = std::env::var_os("IRONMEM_CCR_CHUNK_THRESHOLD_BYTES") else {
+        return Ok(None);
+    };
+    let threshold: usize = value
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid CCR threshold encoding"))?
+        .parse()?;
+    anyhow::ensure!(
+        (128 * 1024..=512 * 1024 * 1024).contains(&threshold),
+        "CCR threshold must be between 128 KiB and 512 MiB"
+    );
+    Ok(Some(threshold))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,20 +1098,4 @@ mod tests {
         assert!(cfg.influence.require_trusted_attestation);
         assert!(cfg.influence.fail_closed_on_policy_error);
     }
-}
-
-/// Opt-in physical format. Disabling writes never disables the chunked reader.
-pub fn ccr_chunk_threshold() -> Result<Option<usize>> {
-    let Some(value) = std::env::var_os("IRONMEM_CCR_CHUNK_THRESHOLD_BYTES") else {
-        return Ok(None);
-    };
-    let threshold: usize = value
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("invalid CCR threshold encoding"))?
-        .parse()?;
-    anyhow::ensure!(
-        (128 * 1024..=512 * 1024 * 1024).contains(&threshold),
-        "CCR threshold must be between 128 KiB and 512 MiB"
-    );
-    Ok(Some(threshold))
 }

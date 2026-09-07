@@ -264,6 +264,65 @@ pub fn remove_claude_md_import(project_root: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove only registered, unchanged generated files after a committed mutation.
+/// User edits and unrelated IRONMEM.md files are never deleted. Dirty entries
+/// survive failures so a later operation can retry; imported model context cannot
+/// be revoked retroactively.
+pub async fn invalidate_generated_files(db: &crate::db::Database) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use sqlx::Row;
+    let dirty: i64 = sqlx::query("SELECT COUNT(*) AS n FROM generated_context_files WHERE dirty>0")
+        .fetch_one(&db.pool)
+        .await?
+        .get("n");
+    if dirty == 0 {
+        return Ok(());
+    }
+    let mut tx = crate::db::begin_write(db).await?;
+    let rows =
+        sqlx::query("SELECT project,content_hash,dirty FROM generated_context_files WHERE dirty>0")
+            .fetch_all(&mut *tx)
+            .await?;
+    for row in rows {
+        let project: String = row.get("project");
+        let hash: String = row.get("content_hash");
+        let generation: i64 = row.get("dirty");
+        let path = Path::new(&project).join("IRONMEM.md");
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                if format!("{:x}", Sha256::digest(&bytes)) == hash {
+                    std::fs::remove_file(&path)?;
+                } else {
+                    tracing::warn!(%project,"Generated context was edited; preserved user file after invalidation");
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        sqlx::query(
+            "DELETE FROM generated_context_files WHERE project=$1 AND content_hash=$2 AND dirty=$3",
+        )
+        .bind(&project)
+        .bind(&hash)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Capture before ranking/gating; publication verifies under the write lock.
+pub async fn context_revision(db: &crate::db::Database) -> Result<i64> {
+    use sqlx::Row;
+    Ok(
+        sqlx::query("SELECT revision FROM context_revision WHERE singleton=1")
+            .fetch_one(&db.pool)
+            .await?
+            .get("revision"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,63 +478,4 @@ mod tests {
 
         std::fs::remove_dir_all(&root).unwrap();
     }
-}
-
-/// Remove only registered, unchanged generated files after a committed mutation.
-/// User edits and unrelated IRONMEM.md files are never deleted. Dirty entries
-/// survive failures so a later operation can retry; imported model context cannot
-/// be revoked retroactively.
-pub async fn invalidate_generated_files(db: &crate::db::Database) -> Result<()> {
-    use sha2::{Digest, Sha256};
-    use sqlx::Row;
-    let dirty: i64 = sqlx::query("SELECT COUNT(*) AS n FROM generated_context_files WHERE dirty>0")
-        .fetch_one(&db.pool)
-        .await?
-        .get("n");
-    if dirty == 0 {
-        return Ok(());
-    }
-    let mut tx = crate::db::begin_write(db).await?;
-    let rows =
-        sqlx::query("SELECT project,content_hash,dirty FROM generated_context_files WHERE dirty>0")
-            .fetch_all(&mut *tx)
-            .await?;
-    for row in rows {
-        let project: String = row.get("project");
-        let hash: String = row.get("content_hash");
-        let generation: i64 = row.get("dirty");
-        let path = Path::new(&project).join("IRONMEM.md");
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                if format!("{:x}", Sha256::digest(&bytes)) == hash {
-                    std::fs::remove_file(&path)?;
-                } else {
-                    tracing::warn!(%project,"Generated context was edited; preserved user file after invalidation");
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        sqlx::query(
-            "DELETE FROM generated_context_files WHERE project=$1 AND content_hash=$2 AND dirty=$3",
-        )
-        .bind(&project)
-        .bind(&hash)
-        .bind(generation)
-        .execute(&mut *tx)
-        .await?;
-    }
-    tx.commit().await?;
-    Ok(())
-}
-
-/// Capture before ranking/gating; publication verifies under the write lock.
-pub async fn context_revision(db: &crate::db::Database) -> Result<i64> {
-    use sqlx::Row;
-    Ok(
-        sqlx::query("SELECT revision FROM context_revision WHERE singleton=1")
-            .fetch_one(&db.pool)
-            .await?
-            .get("revision"),
-    )
 }
