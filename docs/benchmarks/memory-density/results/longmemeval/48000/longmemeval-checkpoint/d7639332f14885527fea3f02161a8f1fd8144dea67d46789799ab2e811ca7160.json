@@ -1,0 +1,1 @@
+{"question_id":"density-2","ability":"temporal-reasoning","question":"When did the project switch compilers?","gold":"January 2, 2026","hypothesis":"[dry-run: no LLM call]","correct":null,"judge_verdict":"","retrieved":1,"answer_ms":44,"context_bytes":555}

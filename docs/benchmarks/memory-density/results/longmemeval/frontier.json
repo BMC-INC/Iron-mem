@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "suite": "longmemeval",
+  "scored": false,
+  "criterion": "paired overall accuracy delta lower 95% bound >= -0.01; category regressions require review",
+  "interval": "distribution-free Hoeffding paired bound; conservative and often inconclusive",
+  "quality_scope": "renderer context only; fixed expansion probe reported by ironmem density separately",
+  "budgets": [
+    {
+      "budget_bytes": 2000,
+      "n": 2,
+      "mean_context_bytes": 547.5,
+      "accuracy": null,
+      "accuracy_delta": null,
+      "confidence_interval": null,
+      "gate": "unscored",
+      "categories": {}
+    },
+    {
+      "budget_bytes": 4000,
+      "n": 2,
+      "mean_context_bytes": 547.5,
+      "accuracy": null,
+      "accuracy_delta": null,
+      "confidence_interval": null,
+      "gate": "unscored",
+      "categories": {}
+    },
+    {
+      "budget_bytes": 8000,
+      "n": 2,
+      "mean_context_bytes": 547.5,
+      "accuracy": null,
+      "accuracy_delta": null,
+      "confidence_interval": null,
+      "gate": "unscored",
+      "categories": {}
+    },
+    {
+      "budget_bytes": 16000,
+      "n": 2,
+      "mean_context_bytes": 547.5,
+      "accuracy": null,
+      "accuracy_delta": null,
+      "confidence_interval": null,
+      "gate": "unscored",
+      "categories": {}
+    },
+    {
+      "budget_bytes": 24000,
+      "n": 2,
+      "mean_context_bytes": 547.5,
+      "accuracy": null,
+      "accuracy_delta": null,
+      "confidence_interval": null,
+      "gate": "unscored",
+      "categories": {}
+    },
+    {
+      "budget_bytes": 48000,
+      "n": 2,
+      "mean_context_bytes": 547.5,
+      "accuracy": null,
+      "accuracy_delta": null,
+      "confidence_interval": null,
+      "gate": "unscored",
+      "categories": {}
+    },
+    {
+      "budget_bytes": 96000,
+      "n": 2,
+      "mean_context_bytes": 547.5,
+      "accuracy": null,
+      "accuracy_delta": null,
+      "confidence_interval": null,
+      "gate": "unscored",
+      "categories": {}
+    }
+  ]
+}

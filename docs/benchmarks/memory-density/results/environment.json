@@ -1,0 +1,9 @@
+{
+  "cpu": "Intel(R) Core(TM) i9-9980HK CPU @ 2.40GHz",
+  "memory_bytes": 17179869184,
+  "logical_cpus": 16,
+  "profile": "debug",
+  "concurrent_task_build_or_tests": false,
+  "os_cache": "uncontrolled",
+  "accuracy": "unscored"
+}
