@@ -1322,6 +1322,13 @@ async fn run_bench(cfg: &config::Config, suite: &str, opts: bench::BenchOptions)
         anyhow::bail!("unknown bench suite '{suite}' (supported: longmemeval, locomo)");
     }
     let report = bench::run(cfg, &opts).await?;
+    if opts.dry_run {
+        println!(
+            "IronMem {suite}: {} unscored pipeline questions; no accuracy measurements",
+            report.total
+        );
+        return Ok(());
+    }
     println!(
         "IronMem {suite}: {}/{} = {:.1}% ({})",
         report.correct,

@@ -18,12 +18,13 @@ fig, ax = plt.subplots(figsize=(8, 5), layout='constrained')
 for path, report in zip(args.storage, reports):
     x = report['load_p95_us']/1000
     y = report['unique_payload_bytes']/1024**2
-    ax.scatter([x], [y])
-    ax.annotate(path.parent.name, (x, y), xytext=(5, 5), textcoords='offset points')
+    ax.scatter([x], [y], label=path.parent.name)
 ax.set(xlabel='Warm-inclusive p95 full-load wall time (ms)', ylabel='Unique compressed payload + manifests (MiB)',
        title='Storage / latency tradeoff — deterministic synthetic corpus')
 ax.grid(alpha=.25)
+ax.legend()
 fig.savefig(args.out/'storage-latency.svg')
+fig.savefig(args.out/'storage-latency.png', dpi=160)
 plt.close(fig)
 fig, ax = plt.subplots(figsize=(8, 5), layout='constrained')
 for path, report in zip(args.storage, reports):

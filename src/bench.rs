@@ -110,7 +110,7 @@ pub struct QuestionResult {
     pub question: String,
     pub gold: String,
     pub hypothesis: String,
-    pub correct: bool,
+    pub correct: Option<bool>,
     /// Raw judge response. Empty for dry runs and harness failures.
     #[serde(default)]
     pub judge_verdict: String,
@@ -283,6 +283,10 @@ impl BenchReport {
         out.push_str(&format!("- judge_model: `{}`\n", self.judge_model));
         out.push_str(&format!("- embedder: `{}`\n", self.embedder));
         out.push_str(&format!("- retrieve_k: `{}`\n", self.retrieve_k));
+        if self.mode.contains("[dry-run: unscored]") {
+            out.push_str("\nUnscored pipeline run. No accuracy measurements.\n");
+            return out;
+        }
         out.push_str(&format!(
             "- overall: `{}/{} = {:.1}%`\n\n",
             self.correct,
@@ -332,7 +336,15 @@ fn select_stratified(questions: &[LmeQuestion], per_ability: usize) -> Vec<LmeQu
         .collect()
 }
 
+fn ensure_scoring_options(dry_run: bool, minimum: Option<f64>) -> Result<()> {
+    if dry_run && minimum.is_some() {
+        bail!("an unscored dry run cannot enforce an accuracy threshold");
+    }
+    Ok(())
+}
+
 pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
+    ensure_scoring_options(opts.dry_run, opts.min_accuracy)?;
     if let Some(minimum) = opts.min_accuracy {
         if !(0.0..=1.0).contains(&minimum) {
             bail!("--min-accuracy must be between 0.0 and 1.0");
@@ -468,7 +480,7 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
                     question: question.question.clone(),
                     gold: question.gold_answer(),
                     hypothesis: format!("[harness error: {e:#}]"),
-                    correct: false,
+                    correct: if opts.dry_run { None } else { Some(false) },
                     judge_verdict: String::new(),
                     retrieved: 0,
                     answer_ms: 0,
@@ -483,10 +495,10 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
             questions.len(),
             result.question_id,
             result.ability,
-            if result.correct {
-                "correct"
-            } else {
-                "incorrect"
+            match result.correct {
+                Some(true) => "correct",
+                Some(false) => "incorrect",
+                None => "unscored",
             }
         );
         results.push(result);
@@ -501,11 +513,11 @@ pub async fn run(cfg: &Config, opts: &BenchOptions) -> Result<BenchReport> {
                 correct: 0,
             });
         entry.total += 1;
-        if r.correct {
+        if r.correct == Some(true) {
             entry.correct += 1;
         }
     }
-    let correct = results.iter().filter(|r| r.correct).count();
+    let correct = results.iter().filter(|r| r.correct == Some(true)).count();
 
     let report = BenchReport {
         suite: opts.suite.clone(),
@@ -615,12 +627,12 @@ async fn run_question(
     };
 
     let (hypothesis, correct, judge_verdict) = if opts.dry_run {
-        ("[dry-run: no LLM call]".to_string(), false, String::new())
+        ("[dry-run: no LLM call]".to_string(), None, String::new())
     } else {
         let hypothesis = answer_question(cfg, question, &context, answer_model).await?;
         let (correct, judge_verdict) =
             judge_answer(cfg, question, &hypothesis, judge_model).await?;
-        (hypothesis, correct, judge_verdict)
+        (hypothesis, Some(correct), judge_verdict)
     };
     let answer_ms = started.elapsed().as_millis();
 
@@ -1011,7 +1023,7 @@ mod tests {
             question: "What instrument?".to_string(),
             gold: "cello".to_string(),
             hypothesis: "cello".to_string(),
-            correct: true,
+            correct: Some(true),
             judge_verdict: "yes".to_string(),
             retrieved: 3,
             answer_ms: 42,
@@ -1023,7 +1035,7 @@ mod tests {
 
         assert_eq!(resumed.len(), 1);
         assert_eq!(resumed[0].question_id, "q1");
-        assert!(resumed[0].correct);
+        assert_eq!(resumed[0].correct, Some(true));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1037,7 +1049,7 @@ mod tests {
             question: "Unknown?".to_string(),
             gold: "unanswerable".to_string(),
             hypothesis: "I don't know".to_string(),
-            correct: true,
+            correct: Some(true),
             judge_verdict: "yes".to_string(),
             retrieved: 0,
             answer_ms: 7,
