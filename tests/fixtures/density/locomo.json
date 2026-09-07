@@ -1,0 +1,1 @@
+[{"sample_id":"fixture","conversation":{"speaker_a":"Ada","speaker_b":"Ben","session_1_date_time":"2026-01-01","session_1":[{"speaker":"Ada","text":"The project uses Rust 1.90."}]},"qa":[{"category":4,"question":"Which compiler version is used?","answer":"Rust 1.90"},{"category":5,"question":"Who stole the compiler?","adversarial_answer":"There is no evidence of theft."}]}]

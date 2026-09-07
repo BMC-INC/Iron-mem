@@ -80,3 +80,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Render actionable memory IDs, reserve expansion pointers, and enforce inclusive UTF-8 byte limits for summaries, tags and the entire generated context.
 - Replace generated files atomically and report actual written IDs, bytes and omissions consistently across CLI/MCP. Record injection events transactionally after successful output; report telemetry failures separately.
+
+### Memory density and storage foundations
+
+- Escape generated memory data and add reproducible seven-budget LongMemEval/LoCoMo experiments plus local byte/storage measurements. Unscored accuracy remains unavailable.
+- Add opt-in versioned FastCDC storage, verified reconstruction, transactional ownership, protected-root GC and resumable conversion.
+- Replace project snapshots with complete atomic checkpoints, portable source-inclusive exports, verified row-set deltas, safe pruning and conservative preservation of live restrictions. Keep stable IDs and rebuild native indexes; block destructive incomplete legacy restores.

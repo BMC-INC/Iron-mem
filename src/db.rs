@@ -28,6 +28,22 @@ pub struct Database {
     pub backend: Backend,
 }
 
+/// Reserve a SQLite writer before reads and refresh its pooled schema cache.
+/// PostgreSQL uses its normal transaction isolation unless the caller strengthens it.
+pub async fn begin_write(db: &Database) -> Result<sqlx::Transaction<'_, sqlx::Any>> {
+    let mut tx = if matches!(db.backend, Backend::Sqlite) {
+        db.pool.begin_with("BEGIN IMMEDIATE").await?
+    } else {
+        db.pool.begin().await?
+    };
+    if matches!(db.backend, Backend::Sqlite) {
+        sqlx::query("SELECT name FROM sqlite_master LIMIT 1")
+            .fetch_optional(&mut *tx)
+            .await?;
+    }
+    Ok(tx)
+}
+
 // SQLite's busy handler blocks the calling worker while another connection owns
 // the write reservation. Gate ledger writers asynchronously inside this process
 // before taking BEGIN IMMEDIATE; the database reservation still protects against
@@ -1050,6 +1066,9 @@ impl Database {
             }
         }
 
+        sqlx::query("CREATE TABLE IF NOT EXISTS memory_identity_highwater(singleton BIGINT PRIMARY KEY,maximum BIGINT NOT NULL)").execute(&self.pool).await?;
+        sqlx::query("INSERT INTO memory_identity_highwater(singleton,maximum) VALUES(1,0) ON CONFLICT(singleton) DO NOTHING").execute(&self.pool).await?;
+
         // Memories table (branched for FTS5 vs tsvector)
         match self.backend {
             Backend::Sqlite => {
@@ -1165,6 +1184,16 @@ impl Database {
                 created_at   BIGINT NOT NULL
             )"
         ))
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(&format!("CREATE TABLE IF NOT EXISTS ccr_chunks(hash TEXT PRIMARY KEY, data {blob_type} NOT NULL)"))
+            .execute(&self.pool).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS ccr_object_chunks(object_hash TEXT NOT NULL REFERENCES blobs(hash) ON DELETE CASCADE, chunk_hash TEXT NOT NULL REFERENCES ccr_chunks(hash), PRIMARY KEY(object_hash,chunk_hash))")
+            .execute(&self.pool).await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_ccr_chunk_owners ON ccr_object_chunks(chunk_hash)",
+        )
         .execute(&self.pool)
         .await?;
 
@@ -1694,6 +1723,12 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        sqlx::query("CREATE TABLE IF NOT EXISTS checkpoint_audit_evidence(project TEXT NOT NULL,evidence_hash TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(project,evidence_hash))").execute(&self.pool).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS checkpoint_heads(project TEXT PRIMARY KEY,blob_hash TEXT NOT NULL REFERENCES blobs(hash))").execute(&self.pool).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS checkpoint_dependencies(child_hash TEXT NOT NULL REFERENCES blobs(hash) ON DELETE CASCADE,parent_hash TEXT NOT NULL REFERENCES blobs(hash),PRIMARY KEY(child_hash,parent_hash))").execute(&self.pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_checkpoint_parent ON checkpoint_dependencies(parent_hash)").execute(&self.pool).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS checkpoint_restore_events(id TEXT PRIMARY KEY,snapshot_id TEXT NOT NULL,project TEXT NOT NULL,state_hash TEXT NOT NULL,created_at BIGINT NOT NULL)").execute(&self.pool).await?;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS sync_events (
                 event_id   TEXT PRIMARY KEY,
@@ -2184,34 +2219,14 @@ pub async fn insert_memory(
 
     let memory_id = match db.backend {
         Backend::Sqlite => {
-            // `memories` is an FTS5 virtual table (no RETURNING support), and
-            // `last_insert_rowid()` is per-connection — so the INSERT and the
-            // rowid read MUST run on the same pooled connection or a 5-way pool
-            // can hand back a wrong/zero id.
-            let mut conn = db.pool.acquire().await?;
-            sqlx::query(
-                "INSERT INTO memories (rowid, project, session_id, summary, tags, created_at)
-                 VALUES (
-                    (SELECT COALESCE(MAX(id), 0) + 1 FROM (
-                        SELECT rowid AS id FROM memories
-                        UNION ALL
-                        SELECT memory_id AS id FROM memory_meta
-                    )),
-                    $1, $2, $3, $4, $5
-                 )",
-            )
-            .bind(project)
-            .bind(session_id)
-            .bind(summary)
-            .bind(tags)
-            .bind(now)
-            .execute(&mut *conn)
-            .await?;
-
-            let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() as id")
-                .fetch_one(&mut *conn)
-                .await?;
-            row.get("id")
+            let mut tx = begin_write(db).await?;
+            let row = sqlx::query("UPDATE memory_identity_highwater SET maximum=MAX(maximum,COALESCE((SELECT MAX(rowid) FROM memories),0),COALESCE((SELECT MAX(memory_id) FROM memory_meta),0))+1 WHERE singleton=1 RETURNING maximum")
+                .fetch_one(&mut *tx).await?;
+            let id: i64 = row.get("maximum");
+            sqlx::query("INSERT INTO memories(rowid,project,session_id,summary,tags,created_at) VALUES($1,$2,$3,$4,$5,$6)")
+                .bind(id).bind(project).bind(session_id).bind(summary).bind(tags).bind(now).execute(&mut *tx).await?;
+            tx.commit().await?;
+            id
         }
         Backend::Postgres => {
             let row: sqlx::any::AnyRow = sqlx::query(
@@ -3161,78 +3176,6 @@ pub async fn add_supporting_evidence_from_memories(
     Ok(inserted)
 }
 
-/// Restore previously captured evidence metadata after a snapshot has remapped
-/// memory ids. New snapshots supply the complete root set; legacy snapshots do
-/// not call this and retain the safe root created by insert_memory.
-pub async fn restore_memory_evidence(
-    db: &Database,
-    memory_id: i64,
-    parent_memory_id: Option<i64>,
-    evidence_root: &str,
-    derivation_depth: u32,
-    roots: &[MemoryEvidenceRoot],
-) -> Result<()> {
-    if evidence_root.trim().is_empty() {
-        anyhow::bail!("snapshot evidence root may not be empty");
-    }
-    sqlx::query(
-        "UPDATE memory_meta
-         SET parent_memory_id = $1, evidence_root_id = $2, derivation_depth = $3
-         WHERE memory_id = $4",
-    )
-    .bind(parent_memory_id)
-    .bind(evidence_root)
-    .bind(derivation_depth as i64)
-    .bind(memory_id)
-    .execute(&db.pool)
-    .await?;
-    sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id = $1")
-        .bind(memory_id)
-        .execute(&db.pool)
-        .await?;
-
-    let mut has_primary = false;
-    for root in roots {
-        let role = match root.role.as_str() {
-            "primary" => {
-                if root.evidence_root_id != evidence_root {
-                    anyhow::bail!(
-                        "snapshot primary root '{}' does not match metadata root '{}'",
-                        root.evidence_root_id,
-                        evidence_root
-                    );
-                }
-                has_primary = true;
-                "primary"
-            }
-            "contradicting" => "contradicting",
-            _ => "supporting",
-        };
-        sqlx::query(
-            "INSERT INTO memory_evidence_roots(memory_id, evidence_root_id, role, created_at)
-             VALUES($1, $2, $3, $4)
-             ON CONFLICT(memory_id, evidence_root_id) DO UPDATE SET role = excluded.role",
-        )
-        .bind(memory_id)
-        .bind(&root.evidence_root_id)
-        .bind(role)
-        .bind(root.created_at)
-        .execute(&db.pool)
-        .await?;
-    }
-    if !has_primary {
-        persist_primary_evidence_root(
-            db,
-            memory_id,
-            evidence_root,
-            derivation_depth as i64,
-            Utc::now().timestamp(),
-        )
-        .await?;
-    }
-    Ok(())
-}
-
 /// Re-run the deterministic evidence repair over rows whose roots are missing.
 /// This is intentionally separate from startup migration state so operators can
 /// fix malformed parents and validate the result before restarting.
@@ -4042,59 +3985,6 @@ pub async fn update_memory_influence_policy(
     }
 }
 
-pub async fn restore_memory_influence_policy(
-    db: &Database,
-    memory_id: i64,
-    policy: &MemoryInfluencePolicy,
-    updated_by: Option<&str>,
-    updated_at: Option<i64>,
-) -> Result<()> {
-    anyhow::ensure!(policy.version >= 1, "cannot restore policy version zero");
-    let allowed_task_types = serde_json::to_string(&policy.allowed_task_types)?;
-    let denied_task_types = serde_json::to_string(&policy.denied_task_types)?;
-    sqlx::query(
-        "INSERT INTO memory_influence_policy(
-            memory_id, version, state, allowed_task_types, denied_task_types,
-            maximum_action_risk, requires_original_source,
-            requires_human_confirmation, maximum_derivation_depth,
-            updated_by, updated_at
-         ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-         ON CONFLICT(memory_id) DO UPDATE SET
-            version = excluded.version,
-            state = excluded.state,
-            allowed_task_types = excluded.allowed_task_types,
-            denied_task_types = excluded.denied_task_types,
-            maximum_action_risk = excluded.maximum_action_risk,
-            requires_original_source = excluded.requires_original_source,
-            requires_human_confirmation = excluded.requires_human_confirmation,
-            maximum_derivation_depth = excluded.maximum_derivation_depth,
-            updated_by = excluded.updated_by,
-            updated_at = excluded.updated_at",
-    )
-    .bind(memory_id)
-    .bind(i64::try_from(policy.version)?)
-    .bind(policy.state.to_string())
-    .bind(allowed_task_types)
-    .bind(denied_task_types)
-    .bind(policy.maximum_action_risk.to_string())
-    .bind(if policy.requires_original_source {
-        1_i64
-    } else {
-        0_i64
-    })
-    .bind(if policy.requires_human_confirmation {
-        1_i64
-    } else {
-        0_i64
-    })
-    .bind(policy.maximum_derivation_depth.map(i64::from))
-    .bind(updated_by)
-    .bind(updated_at.unwrap_or_else(|| Utc::now().timestamp()))
-    .execute(&db.pool)
-    .await?;
-    Ok(())
-}
-
 async fn validate_contradiction_members(
     db: &Database,
     request: &crate::contradiction::CreateContradictionRequest,
@@ -4363,77 +4253,6 @@ pub async fn contradiction_status(db: &Database) -> Result<serde_json::Value> {
         "unresolved": statuses.get("unresolved").copied().unwrap_or(0),
         "statuses": statuses,
     }))
-}
-
-pub async fn delete_project_contradiction_sets(db: &Database, project: &str) -> Result<()> {
-    sqlx::query("DELETE FROM contradiction_sets WHERE realm='project' AND project=$1")
-        .bind(project)
-        .execute(&db.pool)
-        .await?;
-    Ok(())
-}
-
-pub async fn restore_contradiction_set(
-    db: &Database,
-    set: &crate::contradiction::ContradictionSet,
-    id_map: &std::collections::HashMap<i64, i64>,
-) -> Result<bool> {
-    let members = set
-        .members
-        .iter()
-        .filter_map(|member| {
-            id_map
-                .get(&member.memory_id)
-                .copied()
-                .map(|memory_id| (memory_id, member.stance))
-        })
-        .collect::<Vec<_>>();
-    if members.len() < 2 {
-        return Ok(false);
-    }
-    let preferred = set
-        .preferred_memory_id
-        .and_then(|memory_id| id_map.get(&memory_id).copied());
-    sqlx::query(
-        "INSERT INTO contradiction_sets(
-            id, namespace, realm, project, claim_key, claim_schema_version,
-            cardinality, preferred_memory_id, status, resolution_basis,
-            resolved_by, version, created_at, updated_at
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-         ON CONFLICT(id) DO UPDATE SET preferred_memory_id=excluded.preferred_memory_id,
-            status=excluded.status, resolution_basis=excluded.resolution_basis,
-            resolved_by=excluded.resolved_by, version=excluded.version,
-            updated_at=excluded.updated_at",
-    )
-    .bind(&set.id)
-    .bind(&set.namespace)
-    .bind(&set.realm)
-    .bind(&set.project)
-    .bind(&set.claim_key)
-    .bind(i64::from(set.claim_schema_version))
-    .bind(set.cardinality.to_string())
-    .bind(preferred)
-    .bind(set.status.to_string())
-    .bind(&set.resolution_basis)
-    .bind(&set.resolved_by)
-    .bind(i64::try_from(set.version)?)
-    .bind(set.created_at)
-    .bind(set.updated_at)
-    .execute(&db.pool)
-    .await?;
-    for (memory_id, stance) in members {
-        sqlx::query(
-            "INSERT INTO contradiction_members(contradiction_set_id,memory_id,stance,created_at)
-             VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING",
-        )
-        .bind(&set.id)
-        .bind(memory_id)
-        .bind(stance.to_string())
-        .bind(set.created_at)
-        .execute(&db.pool)
-        .await?;
-    }
-    Ok(true)
 }
 
 async fn update_contradiction_set_on_connection(
@@ -7685,16 +7504,26 @@ pub async fn decref_memory_session_blob(db: &Database, memory_id: i64) -> Result
 /// Delete every blob with no remaining references. Returns
 /// `(blobs_removed, compressed_bytes_freed)`.
 pub async fn gc_blobs(db: &Database) -> Result<(i64, i64)> {
-    let r: sqlx::any::AnyRow = sqlx::query(
-        "SELECT COUNT(*) AS cnt, COALESCE(SUM(comp_len), 0) AS bytes FROM blobs WHERE refcount <= 0",
+    let mut tx = begin_write(db).await?;
+    // Reference counters are hints; durable source and snapshot roots always win.
+    let removed = sqlx::query(
+        "DELETE FROM blobs WHERE refcount <= 0
+        AND NOT EXISTS (SELECT 1 FROM memory_meta m WHERE m.session_blob=blobs.hash)
+        AND NOT EXISTS (SELECT 1 FROM observations o WHERE o.output_blob=blobs.hash)
+        AND NOT EXISTS (SELECT 1 FROM memory_chunks c WHERE c.source_hash=blobs.hash)
+        AND NOT EXISTS (SELECT 1 FROM brain_snapshots s WHERE s.blob_hash=blobs.hash)
+        AND NOT EXISTS (SELECT 1 FROM checkpoint_dependencies d WHERE d.parent_hash=blobs.hash)
+        AND NOT EXISTS (SELECT 1 FROM checkpoint_heads h WHERE h.blob_hash=blobs.hash)
+        RETURNING comp_len",
     )
-    .fetch_one(&db.pool)
+    .fetch_all(&mut *tx)
     .await?;
-    let count: i64 = r.get("cnt");
-    let bytes: i64 = r.get("bytes");
-    sqlx::query("DELETE FROM blobs WHERE refcount <= 0")
-        .execute(&db.pool)
-        .await?;
+    let count = removed.len() as i64;
+    let mut bytes: i64 = removed.iter().map(|r| r.get::<i64, _>("comp_len")).sum();
+    let chunks = sqlx::query("DELETE FROM ccr_chunks WHERE NOT EXISTS (SELECT 1 FROM ccr_object_chunks o WHERE o.chunk_hash=ccr_chunks.hash) RETURNING length(data) AS n")
+        .fetch_all(&mut *tx).await?;
+    bytes += chunks.iter().map(|r| r.get::<i64, _>("n")).sum::<i64>();
+    tx.commit().await?;
     Ok((count, bytes))
 }
 
@@ -7935,9 +7764,9 @@ pub async fn get_stats(db: &Database) -> Result<DbStats> {
 
     let r: sqlx::any::AnyRow = sqlx::query(
         "SELECT COUNT(*) AS cnt,
-                COALESCE(SUM(orig_len), 0) AS orig,
-                COALESCE(SUM(comp_len), 0) AS comp,
-                COALESCE(SUM(orig_len * refcount), 0) AS logical
+                CAST(COALESCE(SUM(orig_len), 0) AS BIGINT) AS orig,
+                CAST(COALESCE(SUM(comp_len), 0) + (SELECT COALESCE(SUM(length(data)),0) FROM ccr_chunks) AS BIGINT) AS comp,
+                CAST(COALESCE(SUM(orig_len * refcount), 0) AS BIGINT) AS logical
          FROM blobs",
     )
     .fetch_one(&db.pool)
@@ -8276,7 +8105,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_memory_releases_its_session_blob() -> Result<()> {
+    async fn live_source_root_outweighs_decremented_refcount() -> Result<()> {
         let (db, path) = test_db().await?;
         let s = create_session(&db, "/tmp/p").await?;
         let mid = insert_memory(&db, "/tmp/p", &s, "sum", None).await?;
@@ -8289,6 +8118,8 @@ mod tests {
         );
 
         decref_memory_session_blob(&db, mid).await?;
+        assert_eq!(gc_blobs(&db).await?.0, 0); // source still linked
+        delete_memory_meta(&db, mid).await?;
         assert_eq!(gc_blobs(&db).await?.0, 1);
         assert!(get_blob(&db, "tx").await?.is_none());
 

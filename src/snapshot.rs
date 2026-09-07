@@ -18,6 +18,8 @@ pub struct SnapshotPayload {
     pub influence_policies: Vec<SnapshotMemoryInfluencePolicy>,
     #[serde(default)]
     pub contradiction_sets: Vec<crate::contradiction::ContradictionSet>,
+    #[serde(default)]
+    pub complete: Option<crate::checkpoint::State>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,6 +51,7 @@ pub struct RestoreReport {
     pub restored_edges: usize,
     pub restored_influence_policies: usize,
     pub restored_contradiction_sets: usize,
+    pub warnings: Vec<String>,
 }
 
 pub async fn create(
@@ -56,6 +59,9 @@ pub async fn create(
     label: Option<&str>,
     project: Option<&str>,
 ) -> Result<BrainSnapshot> {
+    if let Some(project) = project {
+        return crate::checkpoint::create(db, label, project, false).await;
+    }
     let memories = match project {
         Some(p) => db::get_recent_memories(db, p, i64::MAX).await?,
         None => db::get_all_memories(db, i64::MAX).await?,
@@ -91,6 +97,7 @@ pub async fn create(
     }
     let payload = SnapshotPayload {
         version: 4,
+        complete: None,
         project: project.map(ToOwned::to_owned),
         memories: memories.clone(),
         edges: edges.clone(),
@@ -127,13 +134,37 @@ pub async fn load_payload(db: &Database, snapshot_id: &str) -> Result<SnapshotPa
         .await?
         .ok_or_else(|| anyhow::anyhow!("snapshot not found: {snapshot_id}"))?;
     let bytes = crate::ccr::load_blob(db, &snap.blob_hash).await?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if value.get("version").and_then(|v| v.as_u64()) == Some(5) {
+        let state = crate::checkpoint::load(db, &snap.blob_hash).await?;
+        let memories = state.tables["memories"]
+            .rows
+            .iter()
+            .map(|r| serde_json::from_value(serde_json::to_value(r)?))
+            .collect::<std::result::Result<Vec<Memory>, serde_json::Error>>()?;
+        let edges = state.tables["memory_edges"]
+            .rows
+            .iter()
+            .map(|r| serde_json::from_value(serde_json::to_value(r)?))
+            .collect::<std::result::Result<Vec<MemoryEdge>, serde_json::Error>>()?;
+        return Ok(SnapshotPayload {
+            version: 5,
+            project: Some(state.project.clone()),
+            memories,
+            edges,
+            evidence: vec![],
+            influence_policies: vec![],
+            contradiction_sets: vec![],
+            complete: Some(state),
+        });
+    }
     Ok(serde_json::from_slice(&bytes)?)
 }
 
 pub async fn restore(db: &Database, snapshot_id: &str, dry_run: bool) -> Result<RestoreReport> {
     let payload = load_payload(db, snapshot_id).await?;
     let mut report = RestoreReport {
-        snapshot_id: snapshot_id.to_string(),
+        snapshot_id: snapshot_id.into(),
         memories_in_snapshot: payload.memories.len(),
         edges_in_snapshot: payload.edges.len(),
         influence_policies_in_snapshot: payload.influence_policies.len(),
@@ -143,92 +174,23 @@ pub async fn restore(db: &Database, snapshot_id: &str, dry_run: bool) -> Result<
         restored_edges: 0,
         restored_influence_policies: 0,
         restored_contradiction_sets: 0,
+        warnings: vec![],
     };
-    if dry_run {
-        return Ok(report);
-    }
-
-    let project = payload.project.as_deref();
-    if let Some(p) = project {
-        db::delete_project_contradiction_sets(db, p).await?;
-        let existing = db::memory_ids_for_project(db, p).await?;
-        for id in existing {
-            let _ = db::decref_memory_session_blob(db, id).await;
-            let _ = db::delete_memory(db, id).await;
-            let _ = db::delete_memory_edges(db, id).await;
-            let _ = db::delete_memory_chunks(db, id).await;
-            let _ = db::delete_embedding(db, "memory", id).await;
-            let _ = db::delete_memory_meta(db, id).await;
-        }
+    anyhow::ensure!(
+        payload.project.is_some(),
+        "global restore is intentionally blocked; restore a project snapshot"
+    );
+    if let Some(state) = payload.complete {
+        report.influence_policies_in_snapshot = state.tables["memory_influence_policy"].rows.len();
+        report.contradiction_sets_in_snapshot = state.tables["contradiction_sets"].rows.len();
+        let counts = crate::checkpoint::restore(db, &state, snapshot_id, dry_run).await?;
+        report.restored_memories = counts.memories;
+        report.restored_edges = counts.edges;
+        report.restored_influence_policies = counts.policies;
+        report.restored_contradiction_sets = counts.contradictions;
     } else {
-        anyhow::bail!("global restore is intentionally blocked; restore a project snapshot");
-    }
-
-    let mut id_map = std::collections::HashMap::new();
-    for memory in &payload.memories {
-        let new_id = db::insert_memory(
-            db,
-            &memory.project,
-            &memory.session_id,
-            &memory.summary,
-            memory.tags.as_deref(),
-        )
-        .await?;
-        id_map.insert(memory.id, new_id);
-        report.restored_memories += 1;
-    }
-    for evidence in &payload.evidence {
-        let Some(new_id) = id_map.get(&evidence.memory_id).copied() else {
-            continue;
-        };
-        let mapped_parent = evidence
-            .parent_memory_id
-            .and_then(|parent| id_map.get(&parent).copied());
-        db::restore_memory_evidence(
-            db,
-            new_id,
-            mapped_parent,
-            &evidence.evidence_root_id,
-            evidence.derivation_depth,
-            &evidence.roots,
-        )
-        .await?;
-    }
-    for stored_policy in &payload.influence_policies {
-        let Some(new_id) = id_map.get(&stored_policy.memory_id).copied() else {
-            continue;
-        };
-        db::restore_memory_influence_policy(
-            db,
-            new_id,
-            &stored_policy.policy,
-            stored_policy.updated_by.as_deref(),
-            stored_policy.updated_at,
-        )
-        .await?;
-        report.restored_influence_policies += 1;
-    }
-    for set in &payload.contradiction_sets {
-        if db::restore_contradiction_set(db, set, &id_map).await? {
-            report.restored_contradiction_sets += 1;
-        }
-    }
-    for edge in &payload.edges {
-        let new_edge = db::NewMemoryEdge {
-            project: edge.project.clone(),
-            memory_id: id_map
-                .get(&edge.memory_id)
-                .copied()
-                .unwrap_or(edge.memory_id),
-            source: edge.source.clone(),
-            relation: edge.relation.clone(),
-            target: edge.target.clone(),
-            valid_from: edge.valid_from.clone(),
-            valid_until: edge.valid_until.clone(),
-            confidence: edge.confidence,
-        };
-        let _ = db::insert_memory_edge(db, &new_edge).await;
-        report.restored_edges += 1;
+        report.warnings.push("Legacy snapshot lacks full metadata, source closure and authoritative timestamps. Destructive restore is blocked; export its readable payload for recovery into a separate database.".into());
+        anyhow::ensure!(dry_run, "{}", report.warnings[0]);
     }
     Ok(report)
 }
@@ -317,10 +279,25 @@ mod tests {
 
         let snapshot = create(&db, Some("evidence"), Some(project)).await?;
         let payload = load_payload(&db, &snapshot.id).await?;
-        assert_eq!(payload.version, 4);
-        assert_eq!(payload.evidence.len(), 2);
-        assert_eq!(payload.influence_policies.len(), 1);
-        assert_eq!(payload.contradiction_sets.len(), 1);
+        assert_eq!(payload.version, 5);
+        assert_eq!(
+            payload.complete.as_ref().unwrap().tables["memory_meta"]
+                .rows
+                .len(),
+            2
+        );
+        assert_eq!(
+            payload.complete.as_ref().unwrap().tables["memory_influence_policy"]
+                .rows
+                .len(),
+            1
+        );
+        assert_eq!(
+            payload.complete.as_ref().unwrap().tables["contradiction_sets"]
+                .rows
+                .len(),
+            1
+        );
         let report = restore(&db, &snapshot.id, false).await?;
         assert_eq!(report.restored_contradiction_sets, 1);
 

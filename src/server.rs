@@ -1203,6 +1203,8 @@ async fn restore_snapshot(
     Path(id): Path<String>,
     Json(body): Json<RestoreSnapshotRequest>,
 ) -> Result<Json<crate::snapshot::RestoreReport>, (StatusCode, String)> {
+    crate::checkpoint::ensure_native_restore(&state.config, body.dry_run.unwrap_or(true))
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let report = crate::snapshot::restore(&state.db, &id, body.dry_run.unwrap_or(true))
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
