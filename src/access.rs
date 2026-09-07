@@ -91,7 +91,7 @@ static FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 pub fn status() -> serde_json::Value {
     use std::sync::atomic::Ordering::Relaxed;
     let calls = CALLS.load(Relaxed);
-    serde_json::json!({"handler_delivery_calls":calls,"failures":FAILURES.load(Relaxed),"mean_write_us":if calls==0 {None} else {Some(NANOS.load(Relaxed)/calls/1000)},"history_complete":false,"retry_window_days":7,"semantics":"authorized response prepared; transport acknowledgement unavailable"})
+    serde_json::json!({"handler_delivery_calls":calls,"failures":FAILURES.load(Relaxed),"mean_write_us":NANOS.load(Relaxed).checked_div(calls).map(|mean| mean / 1000),"history_complete":false,"retry_window_days":7,"semantics":"authorized response prepared; transport acknowledgement unavailable"})
 }
 pub fn ids(memories: &[Memory], advisory: &[Memory]) -> Vec<i64> {
     memories.iter().chain(advisory).map(|m| m.id).collect()

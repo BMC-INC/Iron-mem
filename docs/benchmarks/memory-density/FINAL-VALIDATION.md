@@ -1,6 +1,6 @@
 # Integrated upgrade validation
 
-Local validation completed on 2026-09-07. The final Rust source fingerprint is `3a23a3e496f2b56daefe003803a35a1691bf0a70017c008527f4a8505dbbfd78` (the build.rs hash of Cargo manifests/build script and sorted Rust sources). Reports were produced from the working tree based on commit `0c66eac`; their recorded parent commit is not the identity of the uncommitted implementation. The source fingerprint and checkpoint binary hash identify the tested implementation. Remote CI checks the subsequent PR commit separately.
+Local validation completed on 2026-09-07. The comprehensive local run used Rust source fingerprint `3a23a3e496f2b56daefe003803a35a1691bf0a70017c008527f4a8505dbbfd78` (the build.rs hash of Cargo manifests/build script and sorted Rust sources). Reports were produced from the working tree based on commit `0c66eac`; their recorded parent commit is not the identity of the uncommitted implementation. The source fingerprint and checkpoint binary hash identify that tested implementation. CI on Rust 1.98 subsequently requested idiomatic `checked_div` for the telemetry mean (local Rust was 1.94); this behavior-preserving guard replacement received focused local checks and a new full platform CI run. The retained measurements keep their original source hashes rather than being relabeled as reruns.
 
 ## Results
 
