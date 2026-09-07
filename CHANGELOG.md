@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Delivery telemetry and optional working sets
+
+- Compact recall/expansion counters, bounded retry receipts, transactional metadata-row mutation counts, and local `access-stats` diagnostics. Injection totals reuse existing history.
+- Opt-in coding/planning/debug/generic context selection with decaying temperature, exact byte budgets, live policy revision checks, and invalidation of registered generated files after memory changes.
+- Reproducible synthetic metadata-interning profiling. Production schema normalization remains deferred until representative net savings justify it. Access counters are operational state and start a new observation window on project restore.
+
 ### Added — Semantic Foundation
 
 - **Hybrid retrieval** — keyword (FTS) and semantic (vector) search are fused with Reciprocal Rank Fusion. `search`, `search-global`, and `get_context` now return semantically relevant memories that pure keyword search would miss. Pass `semantic: false` to force keyword-only.

@@ -486,6 +486,7 @@ async fn retrieve_original(
     .await
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
+    crate::access::delivered_expansion(&state.db, &expanded, &gate).await;
     Ok(Json(RetrieveOriginalResponse {
         hash: expanded.hash,
         bytes: expanded.bytes,
@@ -1535,6 +1536,7 @@ async fn get_context(
     )
     .await
     .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+    let delivered_ids = crate::access::gate_ids(&gate);
     let memories = gate.authorized;
 
     let memory_ids: Vec<i64> = memories.iter().map(|m| m.id).collect();
@@ -1558,6 +1560,13 @@ async fn get_context(
         })
         .collect();
 
+    crate::access::delivered(
+        &state.db,
+        crate::access::Delivery::Recall,
+        &delivered_ids,
+        None,
+    )
+    .await;
     Ok(Json(ContextResponse {
         memories,
         advisory_memories: gate.advisory,
@@ -1679,6 +1688,28 @@ async fn evaluate_context(
             .await
             .unwrap_or_default(),
     };
+    let mut recalled_ids = crate::access::ids(&context.memories, &context.advisory_memories);
+    recalled_ids.extend(source_backed_memories.iter().map(|m| m.memory.id));
+    let expanded_ids = source_backed_memories
+        .iter()
+        .filter(|m| m.source.hash.is_some())
+        .map(|m| m.memory.id)
+        .collect::<Vec<_>>();
+    let operation = format!("rest:evaluate:{}:{}", namespace, body.purpose.request_id);
+    crate::access::delivered(
+        &state.db,
+        crate::access::Delivery::Recall,
+        &recalled_ids,
+        Some(&operation),
+    )
+    .await;
+    crate::access::delivered(
+        &state.db,
+        crate::access::Delivery::Expansion,
+        &expanded_ids,
+        Some(&operation),
+    )
+    .await;
     Ok(Json(EvaluateContextResponse {
         context,
         source_backed_memories,
@@ -1762,6 +1793,18 @@ async fn get_skim(
         .iter()
         .map(|memory| memory.id)
         .collect::<std::collections::HashSet<_>>();
+    let delivered_ids = chunks
+        .iter()
+        .filter(|c| allowed.contains(&c.memory_id) || advisory.contains(&c.memory_id))
+        .map(|c| c.memory_id)
+        .collect::<Vec<_>>();
+    crate::access::delivered(
+        &state.db,
+        crate::access::Delivery::Recall,
+        &delivered_ids,
+        None,
+    )
+    .await;
     Ok(Json(SkimResponse {
         chunks: chunks
             .iter()
@@ -1790,6 +1833,7 @@ pub struct StatusResponse {
     pub ccr: serde_json::Value,
     /// Per-governance-operation cost (paper RQ5): count / avg_us / max_us.
     pub governance_cost: serde_json::Value,
+    pub access_telemetry: serde_json::Value,
     /// Rerank backend and cross-encoder readiness (Wave 4).
     pub rerank: serde_json::Value,
     /// Session graduation mode. `local` requires no provider credentials.
@@ -1819,6 +1863,7 @@ async fn get_status(
         db_path: state.config.db_path.clone(),
         ccr: stats.ccr_json(),
         governance_cost: crate::metrics::snapshot(),
+        access_telemetry: crate::access::status(),
         rerank: serde_json::json!({
             "backend": state.config.rerank.backend,
             "cross_encoder_ready": crate::reranker::is_ready(),
@@ -2330,6 +2375,76 @@ mod workbench_tests {
     use axum::body::{to_bytes, Body};
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn access_rest_delivery_and_failure_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::Database::new(dir.path().join("rest.db").to_str().unwrap())
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        let session = db::create_session(&db, "/synthetic/rest").await.unwrap();
+        let id = db::insert_memory(&db, "/synthetic/rest", &session, "rest synthetic", None)
+            .await
+            .unwrap();
+        let blob = crate::ccr::store_blob(&db, b"synthetic original", None)
+            .await
+            .unwrap();
+        db::set_memory_session_blob(&db, id, &blob.hash)
+            .await
+            .unwrap();
+        let state = Arc::new(AppState {
+            db,
+            config: Config::default(),
+            embedder: None,
+            store: Arc::new(crate::vectorstore::BruteForceStore),
+        });
+        let args = ContextQuery {
+            project: "/synthetic/rest".into(),
+            query: None,
+            limit: Some(10),
+            namespace: None,
+            rerank: None,
+            pool: None,
+        };
+        let response = get_context(State(state.clone()), None, Query(args))
+            .await
+            .unwrap();
+        assert_eq!(response.0.memories.len(), 1);
+        let expanded = retrieve_original(
+            State(state.clone()),
+            None,
+            Json(RetrieveOriginalRequest {
+                observation_id: None,
+                memory_id: Some(id),
+                hash: None,
+                chunk_id: None,
+                namespace: None,
+                purpose: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(expanded.0.original, "synthetic original");
+        assert!(retrieve_original(
+            State(state.clone()),
+            None,
+            Json(RetrieveOriginalRequest {
+                observation_id: None,
+                memory_id: Some(-9),
+                hash: None,
+                chunk_id: None,
+                namespace: None,
+                purpose: None
+            })
+        )
+        .await
+        .is_err());
+        let stats = crate::access::stats(&state.db, &[id]).await.unwrap();
+        assert_eq!(stats[&id].recall_count, 1);
+        assert_eq!(stats[&id].expansion_count, 1);
+        state.db.pool.close().await;
+    }
 
     async fn response_json(response: Response) -> serde_json::Value {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();

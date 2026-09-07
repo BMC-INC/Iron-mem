@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "seed": 45,
+  "rows": 10000,
+  "python": "3.14.6",
+  "sqlite": "3.53.3",
+  "platform": "macOS-26.6.2-x86_64-i386-64bit-Mach-O",
+  "cache_condition": "warm process; OS cache uncontrolled",
+  "workload": "synthetic single-family projections with 1024-byte incompressible payload, not a full IronMem database",
+  "gates": {
+    "minimum_fixture_saving_fraction": 0.1,
+    "maximum_lookup_p95_overhead_fraction": 0.2,
+    "representative_workload_required": true
+  },
+  "results": [
+    {
+      "family": "classification",
+      "rows": 10000,
+      "unique_values_including_null": 6,
+      "repeated_utf8_bytes": 59954,
+      "inline": {
+        "database_bytes": 13844480,
+        "lookup_p50_us": 64.28,
+        "lookup_p95_us": 72.814
+      },
+      "interned": {
+        "database_bytes": 13799424,
+        "lookup_p50_us": 61.388000000000005,
+        "lookup_p95_us": 69.212
+      },
+      "fixture_storage_saving_fraction": 0.0032544378698224907,
+      "lookup_p95_overhead_fraction": -0.04946850880325193,
+      "synthetic_gate_passed": false,
+      "migration_enabled": false
+    },
+    {
+      "family": "source_type",
+      "rows": 10000,
+      "unique_values_including_null": 6,
+      "repeated_utf8_bytes": 36641,
+      "inline": {
+        "database_bytes": 13819904,
+        "lookup_p50_us": 81.94999999999999,
+        "lookup_p95_us": 164.792
+      },
+      "interned": {
+        "database_bytes": 13799424,
+        "lookup_p50_us": 76.85,
+        "lookup_p95_us": 158.425
+      },
+      "fixture_storage_saving_fraction": 0.0014819205690574933,
+      "lookup_p95_overhead_fraction": -0.038636584300208665,
+      "synthetic_gate_passed": false,
+      "migration_enabled": false
+    },
+    {
+      "family": "writer_identity",
+      "rows": 10000,
+      "unique_values_including_null": 5,
+      "repeated_utf8_bytes": 91954,
+      "inline": {
+        "database_bytes": 13873152,
+        "lookup_p50_us": 67.3985,
+        "lookup_p95_us": 122.587
+      },
+      "interned": {
+        "database_bytes": 13795328,
+        "lookup_p50_us": 64.1335,
+        "lookup_p95_us": 98.675
+      },
+      "fixture_storage_saving_fraction": 0.005609684086211986,
+      "lookup_p95_overhead_fraction": -0.19506146655028678,
+      "synthetic_gate_passed": false,
+      "migration_enabled": false
+    },
+    {
+      "family": "project_path",
+      "rows": 10000,
+      "unique_values_including_null": 32,
+      "repeated_utf8_bytes": 336384,
+      "inline": {
+        "database_bytes": 14127104,
+        "lookup_p50_us": 65.3015,
+        "lookup_p95_us": 73.102
+      },
+      "interned": {
+        "database_bytes": 13799424,
+        "lookup_p50_us": 61.706,
+        "lookup_p95_us": 71.316
+      },
+      "fixture_storage_saving_fraction": 0.023195129022905214,
+      "lookup_p95_overhead_fraction": -0.024431616098054776,
+      "synthetic_gate_passed": false,
+      "migration_enabled": false
+    },
+    {
+      "family": "long_project_path",
+      "rows": 10000,
+      "unique_values_including_null": 32,
+      "repeated_utf8_bytes": 1943552,
+      "inline": {
+        "database_bytes": 15843328,
+        "lookup_p50_us": 65.93799999999999,
+        "lookup_p95_us": 75.901
+      },
+      "interned": {
+        "database_bytes": 13815808,
+        "lookup_p50_us": 63.182,
+        "lookup_p95_us": 69.13
+      },
+      "fixture_storage_saving_fraction": 0.12797311271975176,
+      "lookup_p95_overhead_fraction": -0.08920831082594438,
+      "synthetic_gate_passed": true,
+      "migration_enabled": false
+    },
+    {
+      "family": "tags_high_cardinality",
+      "rows": 10000,
+      "unique_values_including_null": 10000,
+      "repeated_utf8_bytes": 0,
+      "inline": {
+        "database_bytes": 14032896,
+        "lookup_p50_us": 66.01650000000001,
+        "lookup_p95_us": 75.375
+      },
+      "interned": {
+        "database_bytes": 14475264,
+        "lookup_p50_us": 63.4725,
+        "lookup_p95_us": 71.025
+      },
+      "fixture_storage_saving_fraction": -0.031523642732049106,
+      "lookup_p95_overhead_fraction": -0.057711442786069544,
+      "synthetic_gate_passed": false,
+      "migration_enabled": false
+    }
+  ],
+  "code_sha": "5219e4c8b2ccbf1af8af64177ac9d4e573407bdf",
+  "script_sha256": "206a145a6cff21ea3aa5e745999972bf39347d425f963595bbb15bc12c8b2831"
+}

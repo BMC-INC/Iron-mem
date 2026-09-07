@@ -23,6 +23,8 @@ const IRONMEM_ENTRY_MAX_BYTES: usize = 4_000;
 pub struct InjectionReport {
     pub written_ids: Vec<i64>,
     pub omitted: usize,
+    /// Relevant, authorized candidates excluded before rendering by working-set selection.
+    pub selection_omitted: usize,
     pub bytes: usize,
     pub telemetry_recorded: bool,
 }
@@ -101,10 +103,23 @@ pub fn render_memories(memories: &[Memory], budget: usize) -> (String, Injection
 }
 
 /// Replace in the same directory so readers see either complete version.
+#[cfg(test)]
 pub fn write_ironmem_file(project_root: &str, memories: &[Memory]) -> Result<InjectionReport> {
+    write_ironmem_file_with_budget(project_root, memories, IRONMEM_FILE_MAX_BYTES)
+}
+
+fn write_ironmem_file_with_budget(
+    project_root: &str,
+    memories: &[Memory],
+    budget: usize,
+) -> Result<InjectionReport> {
+    anyhow::ensure!(
+        budget <= IRONMEM_FILE_MAX_BYTES,
+        "injection budget exceeds production ceiling"
+    );
     use std::io::Write;
     let path = Path::new(project_root).join("IRONMEM.md");
-    let (text, report) = render_memories(memories, IRONMEM_FILE_MAX_BYTES);
+    let (text, report) = render_memories(memories, budget);
     if text.is_empty() {
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -121,13 +136,71 @@ pub fn write_ironmem_file(project_root: &str, memories: &[Memory]) -> Result<Inj
 }
 
 /// Shared CLI/MCP delivery boundary: only successful inclusions earn events.
+#[cfg(test)]
 pub async fn inject_memories(
     db: &crate::db::Database,
     project: &str,
     memories: &[Memory],
 ) -> Result<InjectionReport> {
+    inject_with_budget(db, project, memories, IRONMEM_FILE_MAX_BYTES, None).await
+}
+
+pub async fn inject_with_budget(
+    db: &crate::db::Database,
+    project: &str,
+    memories: &[Memory],
+    budget: usize,
+    expected_revision: Option<i64>,
+) -> Result<InjectionReport> {
+    let mut tx = crate::db::begin_write(db).await?;
+    if let Some(expected) = expected_revision {
+        use sqlx::Row;
+        let current: i64 = sqlx::query("SELECT revision FROM context_revision WHERE singleton=1")
+            .fetch_one(&mut *tx)
+            .await?
+            .get("revision");
+        anyhow::ensure!(
+            expected == current,
+            "memory or policy changed during selection; retry injection"
+        );
+        for memory in memories {
+            let id_col = match db.backend {
+                crate::db::Backend::Sqlite => "rowid",
+                crate::db::Backend::Postgres => "id",
+            };
+            let eligible: i64 = sqlx::query(&format!("SELECT COUNT(*) AS n FROM memory_meta WHERE memory_id=$1 AND tombstoned_at IS NULL AND (expires_at IS NULL OR expires_at>$2) AND memory_id IN (SELECT {id_col} FROM memories WHERE {id_col}=$1)")).bind(memory.id).bind(chrono::Utc::now().timestamp()).fetch_one(&mut *tx).await?.get("n");
+            anyhow::ensure!(
+                eligible == 1,
+                "memory expired or disappeared during selection; retry injection"
+            );
+        }
+    }
     ensure_claude_md_import(project)?;
-    let mut report = write_ironmem_file(project, memories)?;
+    let mut report = write_ironmem_file_with_budget(project, memories, budget)?;
+    // Register only our rendered bytes, never a concurrently edited file.
+    use sha2::{Digest, Sha256};
+    let expected_hash = format!(
+        "{:x}",
+        Sha256::digest(render_memories(memories, budget).0.as_bytes())
+    );
+    let registration: Result<()> = async {
+        if report.bytes > 0 {
+            sqlx::query("INSERT INTO generated_context_files(project,content_hash,dirty) VALUES($1,$2,0) ON CONFLICT(project) DO UPDATE SET content_hash=excluded.content_hash,dirty=0").bind(project).bind(&expected_hash).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }.await;
+    if let Err(error) = registration {
+        let path = Path::new(project).join("IRONMEM.md");
+        if let Ok(bytes) = std::fs::read(&path) {
+            if format!("{:x}", Sha256::digest(&bytes)) == expected_hash {
+                if let Err(cleanup) = std::fs::remove_file(&path) {
+                    tracing::error!(%cleanup, "Failed to remove unregistered generated context");
+                }
+            }
+        }
+        return Err(error.context("context registration failed; injection was not recorded"));
+    }
     let included: Vec<Memory> = memories
         .iter()
         .filter(|m| report.written_ids.contains(&m.id))
@@ -346,4 +419,63 @@ mod tests {
 
         std::fs::remove_dir_all(&root).unwrap();
     }
+}
+
+/// Remove only registered, unchanged generated files after a committed mutation.
+/// User edits and unrelated IRONMEM.md files are never deleted. Dirty entries
+/// survive failures so a later operation can retry; imported model context cannot
+/// be revoked retroactively.
+pub async fn invalidate_generated_files(db: &crate::db::Database) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use sqlx::Row;
+    let dirty: i64 = sqlx::query("SELECT COUNT(*) AS n FROM generated_context_files WHERE dirty>0")
+        .fetch_one(&db.pool)
+        .await?
+        .get("n");
+    if dirty == 0 {
+        return Ok(());
+    }
+    let mut tx = crate::db::begin_write(db).await?;
+    let rows =
+        sqlx::query("SELECT project,content_hash,dirty FROM generated_context_files WHERE dirty>0")
+            .fetch_all(&mut *tx)
+            .await?;
+    for row in rows {
+        let project: String = row.get("project");
+        let hash: String = row.get("content_hash");
+        let generation: i64 = row.get("dirty");
+        let path = Path::new(&project).join("IRONMEM.md");
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                if format!("{:x}", Sha256::digest(&bytes)) == hash {
+                    std::fs::remove_file(&path)?;
+                } else {
+                    tracing::warn!(%project,"Generated context was edited; preserved user file after invalidation");
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        sqlx::query(
+            "DELETE FROM generated_context_files WHERE project=$1 AND content_hash=$2 AND dirty=$3",
+        )
+        .bind(&project)
+        .bind(&hash)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Capture before ranking/gating; publication verifies under the write lock.
+pub async fn context_revision(db: &crate::db::Database) -> Result<i64> {
+    use sqlx::Row;
+    Ok(
+        sqlx::query("SELECT revision FROM context_revision WHERE singleton=1")
+            .fetch_one(&db.pool)
+            .await?
+            .get("revision"),
+    )
 }

@@ -1782,6 +1782,8 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        crate::access::migrate(self).await?;
+
         Ok(())
     }
 
@@ -2217,6 +2219,7 @@ pub async fn insert_memory(
     summary: &str,
     tags: Option<&str>,
 ) -> Result<i64> {
+    let result = async {
     let now = Utc::now().timestamp();
 
     let memory_id = match db.backend {
@@ -2293,6 +2296,12 @@ pub async fn insert_memory(
         return Err(error);
     }
     Ok(memory_id)
+
+    }.await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 pub async fn get_recent_memories(db: &Database, project: &str, limit: i64) -> Result<Vec<Memory>> {
@@ -2558,11 +2567,30 @@ pub async fn list_projects(db: &Database, limit: i64) -> Result<Vec<ProjectSumma
 
 #[allow(dead_code)]
 pub async fn delete_memories_for_project(db: &Database, project: &str) -> Result<u64> {
-    let result = sqlx::query("DELETE FROM memories WHERE project = $1")
+    let mut tx = begin_write(db).await?;
+    let id = match db.backend {
+        Backend::Sqlite => "rowid",
+        Backend::Postgres => "id",
+    };
+    sqlx::query(&format!("UPDATE memory_mutations SET mutation_count=mutation_count+1 WHERE memory_id IN (SELECT {id} FROM memories WHERE project=$1)")).bind(project).execute(&mut *tx).await?;
+    let count = sqlx::query("DELETE FROM memories WHERE project=$1")
         .bind(project)
-        .execute(&db.pool)
-        .await?;
-    Ok(result.rows_affected())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if count > 0 {
+        sqlx::query("UPDATE context_revision SET revision=revision+1 WHERE singleton=1")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE generated_context_files SET dirty=dirty+1")
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error,"Memories deleted but generated context invalidation failed");
+    }
+    Ok(count)
 }
 
 /// Collect all memory ids for a project (rowid in sqlite / id in pg). Used to
@@ -2664,15 +2692,36 @@ pub async fn list_session_history(
 }
 
 pub async fn delete_memory(db: &Database, memory_id: i64) -> Result<bool> {
-    let query_str = match db.backend {
-        Backend::Sqlite => "DELETE FROM memories WHERE rowid = $1",
-        Backend::Postgres => "DELETE FROM memories WHERE id = $1",
+    let mut tx = begin_write(db).await?;
+    let query = match db.backend {
+        Backend::Sqlite => "DELETE FROM memories WHERE rowid=$1",
+        Backend::Postgres => "DELETE FROM memories WHERE id=$1",
     };
-    let result = sqlx::query(query_str)
+    let deleted = sqlx::query(query)
         .bind(memory_id)
-        .execute(&db.pool)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+        > 0;
+    if deleted {
+        sqlx::query(
+            "UPDATE memory_mutations SET mutation_count=mutation_count+1 WHERE memory_id=$1",
+        )
+        .bind(memory_id)
+        .execute(&mut *tx)
         .await?;
-    Ok(result.rows_affected() > 0)
+        sqlx::query("UPDATE context_revision SET revision=revision+1 WHERE singleton=1")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE generated_context_files SET dirty=dirty+1")
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error,"Memory deleted but generated context invalidation failed");
+    }
+    Ok(deleted)
 }
 
 pub async fn governed_delete_memory(
@@ -2681,53 +2730,60 @@ pub async fn governed_delete_memory(
     actor: Option<&str>,
     reason: Option<&str>,
 ) -> Result<bool> {
-    let Some(memory) = get_memory_by_id_any_namespace(db, memory_id).await? else {
-        return Ok(false);
-    };
-    let meta = get_memory_meta_full(db, memory_id).await?;
-    if meta.legal_hold {
-        anyhow::bail!("memory {memory_id} is under legal hold and cannot be forgotten");
-    }
-    let namespace = normalize_namespace(&meta.namespace);
-    let now = Utc::now().timestamp();
-    let _tw = crate::metrics::start();
-    sqlx::query(
-        "UPDATE memory_meta
+    let result = async {
+        let Some(memory) = get_memory_by_id_any_namespace(db, memory_id).await? else {
+            return Ok(false);
+        };
+        let meta = get_memory_meta_full(db, memory_id).await?;
+        if meta.legal_hold {
+            anyhow::bail!("memory {memory_id} is under legal hold and cannot be forgotten");
+        }
+        let namespace = normalize_namespace(&meta.namespace);
+        let now = Utc::now().timestamp();
+        let _tw = crate::metrics::start();
+        sqlx::query(
+            "UPDATE memory_meta
          SET tombstoned_at = $1, tombstone_reason = $2
          WHERE memory_id = $3",
-    )
-    .bind(now)
-    .bind(reason)
-    .bind(memory_id)
-    .execute(&db.pool)
-    .await?;
-    crate::metrics::record(crate::metrics::GovOp::TombstoneWrite, _tw.elapsed());
+        )
+        .bind(now)
+        .bind(reason)
+        .bind(memory_id)
+        .execute(&db.pool)
+        .await?;
+        crate::metrics::record(crate::metrics::GovOp::TombstoneWrite, _tw.elapsed());
 
-    let payload = serde_json::json!({
-        "classification": meta.classification,
-        "kind": meta.kind,
-        "namespace": namespace,
-        "project": memory.project,
-        "reason": reason,
-        "record_hash": meta.record_hash,
-        "scope": meta.scope,
-        "session_blob": get_memory_session_blob(db, memory_id).await?,
-        "source_type": meta.source_type,
-        "tombstoned_at": now,
-    });
-    append_memory_ledger(
-        db,
-        &namespace,
-        Some(memory_id),
-        "forget",
-        actor,
-        &payload.to_string(),
-    )
-    .await?;
+        let payload = serde_json::json!({
+            "classification": meta.classification,
+            "kind": meta.kind,
+            "namespace": namespace,
+            "project": memory.project,
+            "reason": reason,
+            "record_hash": meta.record_hash,
+            "scope": meta.scope,
+            "session_blob": get_memory_session_blob(db, memory_id).await?,
+            "source_type": meta.source_type,
+            "tombstoned_at": now,
+        });
+        append_memory_ledger(
+            db,
+            &namespace,
+            Some(memory_id),
+            "forget",
+            actor,
+            &payload.to_string(),
+        )
+        .await?;
 
-    decref_memory_session_blob(db, memory_id).await?;
-    let _ = gc_blobs(db).await?;
-    delete_memory(db, memory_id).await
+        decref_memory_session_blob(db, memory_id).await?;
+        let _ = gc_blobs(db).await?;
+        delete_memory(db, memory_id).await
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 pub async fn get_all_memories(db: &Database, limit: i64) -> Result<Vec<Memory>> {
@@ -2851,18 +2907,25 @@ pub async fn clear_embeddings_for_model(db: &Database, model: &str) -> Result<()
 }
 
 pub async fn upsert_memory_meta(db: &Database, memory_id: i64, importance: f64) -> Result<()> {
-    let now = Utc::now().timestamp();
-    sqlx::query(
-        "INSERT INTO memory_meta(memory_id, importance, created_at)
+    let result = async {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO memory_meta(memory_id, importance, created_at)
          VALUES($1, $2, $3)
          ON CONFLICT(memory_id) DO UPDATE SET importance = excluded.importance",
-    )
-    .bind(memory_id)
-    .bind(importance)
-    .bind(now)
-    .execute(&db.pool)
-    .await?;
-    Ok(())
+        )
+        .bind(memory_id)
+        .bind(importance)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 /// Insert a default importance row only if none exists. Never overwrites an
@@ -2872,18 +2935,25 @@ pub async fn ensure_memory_meta(
     memory_id: i64,
     default_importance: f64,
 ) -> Result<()> {
-    let now = Utc::now().timestamp();
-    sqlx::query(
-        "INSERT INTO memory_meta(memory_id, importance, created_at)
+    let result = async {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO memory_meta(memory_id, importance, created_at)
          VALUES($1, $2, $3)
          ON CONFLICT(memory_id) DO NOTHING",
-    )
-    .bind(memory_id)
-    .bind(default_importance)
-    .bind(now)
-    .execute(&db.pool)
-    .await?;
-    Ok(())
+        )
+        .bind(memory_id)
+        .bind(default_importance)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 /// Importance-only accessor. Production ranking reads importance + scope + kind
@@ -3130,52 +3200,59 @@ pub async fn add_supporting_evidence_from_memories(
     memory_id: i64,
     source_memory_ids: &[i64],
 ) -> Result<usize> {
-    let target = load_evidence_meta(db, memory_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("memory metadata not found: {memory_id}"))?;
-    let target_namespace = normalize_namespace(&target.namespace);
-    let primary = target
-        .evidence_root_id
-        .ok_or_else(|| anyhow::anyhow!("memory {memory_id} has no primary evidence root"))?;
-    let mut roots = BTreeSet::new();
-    for source_memory_id in source_memory_ids {
-        let source = load_evidence_meta(db, *source_memory_id)
+    let result = async {
+        let target = load_evidence_meta(db, memory_id)
             .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!("source memory metadata not found: {source_memory_id}")
+            .ok_or_else(|| anyhow::anyhow!("memory metadata not found: {memory_id}"))?;
+        let target_namespace = normalize_namespace(&target.namespace);
+        let primary = target
+            .evidence_root_id
+            .ok_or_else(|| anyhow::anyhow!("memory {memory_id} has no primary evidence root"))?;
+        let mut roots = BTreeSet::new();
+        for source_memory_id in source_memory_ids {
+            let source = load_evidence_meta(db, *source_memory_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("source memory metadata not found: {source_memory_id}")
+                })?;
+            if normalize_namespace(&source.namespace) != target_namespace {
+                anyhow::bail!(
+                    "source memory {} namespace '{}' does not match target namespace '{}'",
+                    source_memory_id,
+                    source.namespace,
+                    target_namespace
+                );
+            }
+            let root = source.evidence_root_id.ok_or_else(|| {
+                anyhow::anyhow!("source memory {source_memory_id} has no evidence root")
             })?;
-        if normalize_namespace(&source.namespace) != target_namespace {
-            anyhow::bail!(
-                "source memory {} namespace '{}' does not match target namespace '{}'",
-                source_memory_id,
-                source.namespace,
-                target_namespace
-            );
+            if root != primary {
+                roots.insert(root);
+            }
         }
-        let root = source.evidence_root_id.ok_or_else(|| {
-            anyhow::anyhow!("source memory {source_memory_id} has no evidence root")
-        })?;
-        if root != primary {
-            roots.insert(root);
-        }
-    }
 
-    let now = Utc::now().timestamp();
-    let mut inserted = 0;
-    for root in roots {
-        let result = sqlx::query(
-            "INSERT INTO memory_evidence_roots(memory_id, evidence_root_id, role, created_at)
+        let now = Utc::now().timestamp();
+        let mut inserted = 0;
+        for root in roots {
+            let result = sqlx::query(
+                "INSERT INTO memory_evidence_roots(memory_id, evidence_root_id, role, created_at)
              VALUES($1, $2, 'supporting', $3)
              ON CONFLICT(memory_id, evidence_root_id) DO NOTHING",
-        )
-        .bind(memory_id)
-        .bind(root)
-        .bind(now)
-        .execute(&db.pool)
-        .await?;
-        inserted += result.rows_affected() as usize;
+            )
+            .bind(memory_id)
+            .bind(root)
+            .bind(now)
+            .execute(&db.pool)
+            .await?;
+            inserted += result.rows_affected() as usize;
+        }
+        Ok(inserted)
     }
-    Ok(inserted)
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 /// Re-run the deterministic evidence repair over rows whose roots are missing.
@@ -3183,14 +3260,21 @@ pub async fn add_supporting_evidence_from_memories(
 /// fix malformed parents and validate the result before restarting.
 #[allow(dead_code)] // operator repair seam; exercised by deterministic tests
 pub async fn repair_evidence_roots(db: &Database) -> Result<EvidenceRootMigrationReport> {
-    let mut report = EvidenceRootMigrationReport {
-        version: EVIDENCE_ROOT_MIGRATION_VERSION,
-        ..Default::default()
-    };
-    evidence_backfill_from_cursor(db, 0, &mut report, false).await?;
-    report.broken_parent_memory_ids.sort_unstable();
-    report.broken_parent_memory_ids.dedup();
-    Ok(report)
+    let result = async {
+        let mut report = EvidenceRootMigrationReport {
+            version: EVIDENCE_ROOT_MIGRATION_VERSION,
+            ..Default::default()
+        };
+        evidence_backfill_from_cursor(db, 0, &mut report, false).await?;
+        report.broken_parent_memory_ids.sort_unstable();
+        report.broken_parent_memory_ids.dedup();
+        Ok(report)
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 pub async fn evidence_root_migration_report(
@@ -3217,19 +3301,26 @@ pub async fn set_memory_scope_kind(
     scope: &str,
     kind: &str,
 ) -> Result<()> {
-    let now = Utc::now().timestamp();
-    sqlx::query(
-        "INSERT INTO memory_meta(memory_id, importance, created_at, scope, kind)
+    let result = async {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO memory_meta(memory_id, importance, created_at, scope, kind)
          VALUES($1, 0.5, $2, $3, $4)
          ON CONFLICT(memory_id) DO UPDATE SET scope = excluded.scope, kind = excluded.kind",
-    )
-    .bind(memory_id)
-    .bind(now)
-    .bind(clamp_scope(scope))
-    .bind(clamp_kind(kind))
-    .execute(&db.pool)
-    .await?;
-    Ok(())
+        )
+        .bind(memory_id)
+        .bind(now)
+        .bind(clamp_scope(scope))
+        .bind(clamp_kind(kind))
+        .execute(&db.pool)
+        .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 /// Set a memory's `event_time` (a date/range stated in the session). Upserts the
@@ -3237,18 +3328,25 @@ pub async fn set_memory_scope_kind(
 /// ran first; a fresh row gets the default importance and never clobbers an
 /// existing one's importance/scope/kind.
 pub async fn set_memory_event_time(db: &Database, memory_id: i64, event_time: &str) -> Result<()> {
-    let now = Utc::now().timestamp();
-    sqlx::query(
-        "INSERT INTO memory_meta(memory_id, importance, created_at, event_time)
+    let result = async {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO memory_meta(memory_id, importance, created_at, event_time)
          VALUES($1, 0.5, $2, $3)
          ON CONFLICT(memory_id) DO UPDATE SET event_time = excluded.event_time",
-    )
-    .bind(memory_id)
-    .bind(now)
-    .bind(event_time)
-    .execute(&db.pool)
-    .await?;
-    Ok(())
+        )
+        .bind(memory_id)
+        .bind(now)
+        .bind(event_time)
+        .execute(&db.pool)
+        .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3261,6 +3359,7 @@ pub async fn apply_memory_governance(
     actor: Option<&str>,
     op_type: &str,
 ) -> Result<String> {
+    let result = async {
     governance.validate()?;
     let memory = get_memory_by_id_any_namespace(db, memory_id)
         .await?
@@ -3408,6 +3507,12 @@ pub async fn apply_memory_governance(
         &payload.to_string(),
     )
     .await
+
+    }.await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 fn influence_policy_record_from_row(
@@ -3939,52 +4044,59 @@ pub async fn update_memory_influence_policy(
     principal: &PolicyPrincipal,
     request: &PolicyMutationRequest,
 ) -> Result<MemoryInfluencePolicyRecord> {
-    request.validate().map_err(anyhow::Error::new)?;
-    let namespace = normalize_namespace(namespace);
-    match db.backend {
-        Backend::Sqlite => {
-            let _write_guard = sqlite_ledger_write_lock().lock().await;
-            let mut connection = db.pool.acquire().await?;
-            sqlx::query("BEGIN IMMEDIATE")
-                .execute(&mut *connection)
-                .await?;
-            match update_memory_influence_policy_on_connection(
-                &mut connection,
-                memory_id,
-                &namespace,
-                principal,
-                request,
-            )
-            .await
-            {
-                Ok(record) => {
-                    sqlx::query("COMMIT").execute(&mut *connection).await?;
-                    Ok(record)
-                }
-                Err(error) => {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-                    Err(error)
+    let result = async {
+        request.validate().map_err(anyhow::Error::new)?;
+        let namespace = normalize_namespace(namespace);
+        match db.backend {
+            Backend::Sqlite => {
+                let _write_guard = sqlite_ledger_write_lock().lock().await;
+                let mut connection = db.pool.acquire().await?;
+                sqlx::query("BEGIN IMMEDIATE")
+                    .execute(&mut *connection)
+                    .await?;
+                match update_memory_influence_policy_on_connection(
+                    &mut connection,
+                    memory_id,
+                    &namespace,
+                    principal,
+                    request,
+                )
+                .await
+                {
+                    Ok(record) => {
+                        sqlx::query("COMMIT").execute(&mut *connection).await?;
+                        Ok(record)
+                    }
+                    Err(error) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                        Err(error)
+                    }
                 }
             }
-        }
-        Backend::Postgres => {
-            let mut transaction = db.pool.begin().await?;
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(&namespace)
-                .execute(&mut *transaction)
+            Backend::Postgres => {
+                let mut transaction = db.pool.begin().await?;
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                    .bind(&namespace)
+                    .execute(&mut *transaction)
+                    .await?;
+                let record = update_memory_influence_policy_on_connection(
+                    &mut transaction,
+                    memory_id,
+                    &namespace,
+                    principal,
+                    request,
+                )
                 .await?;
-            let record = update_memory_influence_policy_on_connection(
-                &mut transaction,
-                memory_id,
-                &namespace,
-                principal,
-                request,
-            )
-            .await?;
-            transaction.commit().await?;
-            Ok(record)
+                transaction.commit().await?;
+                Ok(record)
+            }
         }
     }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 async fn validate_contradiction_members(
@@ -4158,47 +4270,54 @@ pub async fn create_contradiction_set(
     namespace: &str,
     claim_key: &str,
 ) -> Result<crate::contradiction::ContradictionSet> {
-    validate_contradiction_members(db, request, namespace).await?;
-    match db.backend {
-        Backend::Sqlite => {
-            let _guard = sqlite_ledger_write_lock().lock().await;
-            let mut connection = db.pool.acquire().await?;
-            sqlx::query("BEGIN IMMEDIATE")
-                .execute(&mut *connection)
-                .await?;
-            match create_contradiction_set_on_connection(
-                &mut connection,
-                principal,
-                request,
-                namespace,
-                claim_key,
-            )
-            .await
-            {
-                Ok(set) => {
-                    sqlx::query("COMMIT").execute(&mut *connection).await?;
-                    Ok(set)
-                }
-                Err(error) => {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-                    Err(error)
+    let result = async {
+        validate_contradiction_members(db, request, namespace).await?;
+        match db.backend {
+            Backend::Sqlite => {
+                let _guard = sqlite_ledger_write_lock().lock().await;
+                let mut connection = db.pool.acquire().await?;
+                sqlx::query("BEGIN IMMEDIATE")
+                    .execute(&mut *connection)
+                    .await?;
+                match create_contradiction_set_on_connection(
+                    &mut connection,
+                    principal,
+                    request,
+                    namespace,
+                    claim_key,
+                )
+                .await
+                {
+                    Ok(set) => {
+                        sqlx::query("COMMIT").execute(&mut *connection).await?;
+                        Ok(set)
+                    }
+                    Err(error) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                        Err(error)
+                    }
                 }
             }
-        }
-        Backend::Postgres => {
-            let mut tx = db.pool.begin().await?;
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(namespace)
-                .execute(&mut *tx)
+            Backend::Postgres => {
+                let mut tx = db.pool.begin().await?;
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                    .bind(namespace)
+                    .execute(&mut *tx)
+                    .await?;
+                let set = create_contradiction_set_on_connection(
+                    &mut tx, principal, request, namespace, claim_key,
+                )
                 .await?;
-            let set = create_contradiction_set_on_connection(
-                &mut tx, principal, request, namespace, claim_key,
-            )
-            .await?;
-            tx.commit().await?;
-            Ok(set)
+                tx.commit().await?;
+                Ok(set)
+            }
         }
     }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 pub async fn get_contradiction_set(
@@ -4344,45 +4463,53 @@ pub async fn update_contradiction_set(
     namespace: &str,
     request: &crate::contradiction::UpdateContradictionRequest,
 ) -> Result<crate::contradiction::ContradictionSet> {
-    match db.backend {
-        Backend::Sqlite => {
-            let _guard = sqlite_ledger_write_lock().lock().await;
-            let mut connection = db.pool.acquire().await?;
-            sqlx::query("BEGIN IMMEDIATE")
-                .execute(&mut *connection)
-                .await?;
-            match update_contradiction_set_on_connection(
-                &mut connection,
-                principal,
-                id,
-                namespace,
-                request,
-            )
-            .await
-            {
-                Ok(set) => {
-                    sqlx::query("COMMIT").execute(&mut *connection).await?;
-                    Ok(set)
-                }
-                Err(error) => {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-                    Err(error)
+    let result = async {
+        match db.backend {
+            Backend::Sqlite => {
+                let _guard = sqlite_ledger_write_lock().lock().await;
+                let mut connection = db.pool.acquire().await?;
+                sqlx::query("BEGIN IMMEDIATE")
+                    .execute(&mut *connection)
+                    .await?;
+                match update_contradiction_set_on_connection(
+                    &mut connection,
+                    principal,
+                    id,
+                    namespace,
+                    request,
+                )
+                .await
+                {
+                    Ok(set) => {
+                        sqlx::query("COMMIT").execute(&mut *connection).await?;
+                        Ok(set)
+                    }
+                    Err(error) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                        Err(error)
+                    }
                 }
             }
-        }
-        Backend::Postgres => {
-            let mut tx = db.pool.begin().await?;
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(namespace)
-                .execute(&mut *tx)
-                .await?;
-            let set =
-                update_contradiction_set_on_connection(&mut tx, principal, id, namespace, request)
+            Backend::Postgres => {
+                let mut tx = db.pool.begin().await?;
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                    .bind(namespace)
+                    .execute(&mut *tx)
                     .await?;
-            tx.commit().await?;
-            Ok(set)
+                let set = update_contradiction_set_on_connection(
+                    &mut tx, principal, id, namespace, request,
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(set)
+            }
         }
     }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 pub async fn ensure_graph_contradiction_set(
@@ -5085,19 +5212,26 @@ pub async fn dated_memories(
 /// query resolves any token of a multi-word entity ("York" of "New York").
 /// Duplicate tokens within one call are collapsed.
 pub async fn insert_memory_entity(db: &Database, memory_id: i64, entity: &str) -> Result<()> {
-    let mut seen = std::collections::HashSet::new();
-    for tok in entity.split(|c: char| !c.is_alphanumeric()) {
-        let t = tok.to_lowercase();
-        if t.chars().count() < 3 || !seen.insert(t.clone()) {
-            continue;
+    let result = async {
+        let mut seen = std::collections::HashSet::new();
+        for tok in entity.split(|c: char| !c.is_alphanumeric()) {
+            let t = tok.to_lowercase();
+            if t.chars().count() < 3 || !seen.insert(t.clone()) {
+                continue;
+            }
+            sqlx::query("INSERT INTO memory_entities(memory_id, entity) VALUES($1, $2)")
+                .bind(memory_id)
+                .bind(&t)
+                .execute(&db.pool)
+                .await?;
         }
-        sqlx::query("INSERT INTO memory_entities(memory_id, entity) VALUES($1, $2)")
-            .bind(memory_id)
-            .bind(&t)
-            .execute(&db.pool)
-            .await?;
+        Ok(())
     }
-    Ok(())
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 /// Memory ids indexed under `entity` (matched case-insensitively against a single
@@ -5203,85 +5337,92 @@ fn memory_edge_from_row(r: sqlx::any::AnyRow) -> MemoryEdge {
 ///   different target are marked `current_state_update` and closed with
 ///   `valid_until`.
 pub async fn insert_memory_edge(db: &Database, edge: &NewMemoryEdge) -> Result<i64> {
-    let source_norm = normalize_graph_text(&edge.source);
-    let relation_norm = normalize_relation(&edge.relation);
-    let target_norm = normalize_graph_text(&edge.target);
-    if source_norm.is_empty() || relation_norm.is_empty() || target_norm.is_empty() {
-        anyhow::bail!("memory edge source, relation, and target must not be empty");
-    }
+    let result = async {
+        let source_norm = normalize_graph_text(&edge.source);
+        let relation_norm = normalize_relation(&edge.relation);
+        let target_norm = normalize_graph_text(&edge.target);
+        if source_norm.is_empty() || relation_norm.is_empty() || target_norm.is_empty() {
+            anyhow::bail!("memory edge source, relation, and target must not be empty");
+        }
 
-    let now = Utc::now().timestamp();
-    let confidence = edge.confidence.clamp(0.0, 1.0);
-    let id = match db.backend {
-        Backend::Sqlite => {
-            let mut conn = db.pool.acquire().await?;
-            sqlx::query(
-                "INSERT INTO memory_edges
+        let now = Utc::now().timestamp();
+        let confidence = edge.confidence.clamp(0.0, 1.0);
+        let id = match db.backend {
+            Backend::Sqlite => {
+                let mut conn = db.pool.acquire().await?;
+                sqlx::query(
+                    "INSERT INTO memory_edges
                  (project, memory_id, source, source_norm, relation, relation_norm,
                   target, target_norm, valid_from, valid_until, observed_at,
                   confidence, created_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
-            )
-            .bind(&edge.project)
-            .bind(edge.memory_id)
-            .bind(edge.source.trim())
-            .bind(&source_norm)
-            .bind(edge.relation.trim())
-            .bind(&relation_norm)
-            .bind(edge.target.trim())
-            .bind(&target_norm)
-            .bind(edge.valid_from.as_deref())
-            .bind(edge.valid_until.as_deref())
-            .bind(now)
-            .bind(confidence)
-            .bind(now)
-            .execute(&mut *conn)
-            .await?;
-
-            let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() AS id")
-                .fetch_one(&mut *conn)
+                )
+                .bind(&edge.project)
+                .bind(edge.memory_id)
+                .bind(edge.source.trim())
+                .bind(&source_norm)
+                .bind(edge.relation.trim())
+                .bind(&relation_norm)
+                .bind(edge.target.trim())
+                .bind(&target_norm)
+                .bind(edge.valid_from.as_deref())
+                .bind(edge.valid_until.as_deref())
+                .bind(now)
+                .bind(confidence)
+                .bind(now)
+                .execute(&mut *conn)
                 .await?;
-            row.get("id")
-        }
-        Backend::Postgres => {
-            let row: sqlx::any::AnyRow = sqlx::query(
-                "INSERT INTO memory_edges
+
+                let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() AS id")
+                    .fetch_one(&mut *conn)
+                    .await?;
+                row.get("id")
+            }
+            Backend::Postgres => {
+                let row: sqlx::any::AnyRow = sqlx::query(
+                    "INSERT INTO memory_edges
                  (project, memory_id, source, source_norm, relation, relation_norm,
                   target, target_norm, valid_from, valid_until, observed_at,
                   confidence, created_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                  RETURNING id",
-            )
-            .bind(&edge.project)
-            .bind(edge.memory_id)
-            .bind(edge.source.trim())
-            .bind(&source_norm)
-            .bind(edge.relation.trim())
-            .bind(&relation_norm)
-            .bind(edge.target.trim())
-            .bind(&target_norm)
-            .bind(edge.valid_from.as_deref())
-            .bind(edge.valid_until.as_deref())
-            .bind(now)
-            .bind(confidence)
-            .bind(now)
-            .fetch_one(&db.pool)
-            .await?;
-            row.get("id")
-        }
-    };
+                )
+                .bind(&edge.project)
+                .bind(edge.memory_id)
+                .bind(edge.source.trim())
+                .bind(&source_norm)
+                .bind(edge.relation.trim())
+                .bind(&relation_norm)
+                .bind(edge.target.trim())
+                .bind(&target_norm)
+                .bind(edge.valid_from.as_deref())
+                .bind(edge.valid_until.as_deref())
+                .bind(now)
+                .bind(confidence)
+                .bind(now)
+                .fetch_one(&db.pool)
+                .await?;
+                row.get("id")
+            }
+        };
 
-    reconcile_inserted_memory_edge(
-        db,
-        id,
-        edge,
-        &source_norm,
-        &relation_norm,
-        &target_norm,
-        now,
-    )
-    .await?;
-    Ok(id)
+        reconcile_inserted_memory_edge(
+            db,
+            id,
+            edge,
+            &source_norm,
+            &relation_norm,
+            &target_norm,
+            now,
+        )
+        .await?;
+        Ok(id)
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 async fn reconcile_inserted_memory_edge(
@@ -5635,105 +5776,112 @@ pub async fn reconcile_memory_graph(
     project: Option<&str>,
     dry_run: bool,
 ) -> Result<ReconcileReport> {
-    let edges = all_memory_edges(db, project).await?;
-    let scanned = edges.len();
+    let result = async {
+        let edges = all_memory_edges(db, project).await?;
+        let scanned = edges.len();
 
-    let mut exact: HashMap<String, Vec<&MemoryEdge>> = HashMap::new();
-    for edge in edges.iter().filter(|e| e.superseded_by.is_none()) {
-        exact.entry(edge_exact_key(edge)).or_default().push(edge);
-    }
-
-    let mut duplicate_updates: Vec<(i64, i64)> = Vec::new();
-    for group in exact.values_mut() {
-        if group.len() <= 1 {
-            continue;
+        let mut exact: HashMap<String, Vec<&MemoryEdge>> = HashMap::new();
+        for edge in edges.iter().filter(|e| e.superseded_by.is_none()) {
+            exact.entry(edge_exact_key(edge)).or_default().push(edge);
         }
-        edge_sort_newest(group);
-        let winner = group[0].id;
-        for duplicate in group.iter().skip(1) {
-            duplicate_updates.push((duplicate.id, winner));
-        }
-    }
 
-    let mut active_after_duplicates: Vec<&MemoryEdge> = edges
-        .iter()
-        .filter(|e| e.superseded_by.is_none())
-        .filter(|e| !duplicate_updates.iter().any(|(id, _)| *id == e.id))
-        .collect();
-
-    let mut state_groups: HashMap<String, Vec<&MemoryEdge>> = HashMap::new();
-    for edge in active_after_duplicates.drain(..) {
-        let relation_norm = normalize_relation(&edge.relation);
-        if is_current_state_relation(&relation_norm) && edge.valid_until.is_none() {
-            state_groups
-                .entry(edge_state_key(edge))
-                .or_default()
-                .push(edge);
-        }
-    }
-
-    let mut state_updates: Vec<(i64, i64, String)> = Vec::new();
-    for group in state_groups.values_mut() {
-        if group.len() <= 1 {
-            continue;
-        }
-        edge_sort_newest(group);
-        let winner = group[0];
-        let winner_target = normalize_graph_text(&winner.target);
-        let closes_at = winner
-            .valid_from
-            .clone()
-            .unwrap_or_else(|| winner.observed_at.to_string());
-        for older in group.iter().skip(1) {
-            if normalize_graph_text(&older.target) != winner_target {
-                state_updates.push((older.id, winner.id, closes_at.clone()));
+        let mut duplicate_updates: Vec<(i64, i64)> = Vec::new();
+        for group in exact.values_mut() {
+            if group.len() <= 1 {
+                continue;
+            }
+            edge_sort_newest(group);
+            let winner = group[0].id;
+            for duplicate in group.iter().skip(1) {
+                duplicate_updates.push((duplicate.id, winner));
             }
         }
-    }
 
-    if !dry_run {
-        for (id, winner) in &duplicate_updates {
-            sqlx::query(
-                "UPDATE memory_edges
+        let mut active_after_duplicates: Vec<&MemoryEdge> = edges
+            .iter()
+            .filter(|e| e.superseded_by.is_none())
+            .filter(|e| !duplicate_updates.iter().any(|(id, _)| *id == e.id))
+            .collect();
+
+        let mut state_groups: HashMap<String, Vec<&MemoryEdge>> = HashMap::new();
+        for edge in active_after_duplicates.drain(..) {
+            let relation_norm = normalize_relation(&edge.relation);
+            if is_current_state_relation(&relation_norm) && edge.valid_until.is_none() {
+                state_groups
+                    .entry(edge_state_key(edge))
+                    .or_default()
+                    .push(edge);
+            }
+        }
+
+        let mut state_updates: Vec<(i64, i64, String)> = Vec::new();
+        for group in state_groups.values_mut() {
+            if group.len() <= 1 {
+                continue;
+            }
+            edge_sort_newest(group);
+            let winner = group[0];
+            let winner_target = normalize_graph_text(&winner.target);
+            let closes_at = winner
+                .valid_from
+                .clone()
+                .unwrap_or_else(|| winner.observed_at.to_string());
+            for older in group.iter().skip(1) {
+                if normalize_graph_text(&older.target) != winner_target {
+                    state_updates.push((older.id, winner.id, closes_at.clone()));
+                }
+            }
+        }
+
+        if !dry_run {
+            for (id, winner) in &duplicate_updates {
+                sqlx::query(
+                    "UPDATE memory_edges
                  SET superseded_by = $1, superseded_reason = 'duplicate'
                  WHERE id = $2 AND superseded_by IS NULL",
-            )
-            .bind(winner)
-            .bind(id)
-            .execute(&db.pool)
-            .await?;
-        }
-        for (id, winner, closes_at) in &state_updates {
-            sqlx::query(
-                "UPDATE memory_edges
+                )
+                .bind(winner)
+                .bind(id)
+                .execute(&db.pool)
+                .await?;
+            }
+            for (id, winner, closes_at) in &state_updates {
+                sqlx::query(
+                    "UPDATE memory_edges
                  SET superseded_by = $1,
                      superseded_reason = 'current_state_update',
                      valid_until = COALESCE(valid_until, $2)
                  WHERE id = $3 AND superseded_by IS NULL",
-            )
-            .bind(winner)
-            .bind(closes_at)
-            .bind(id)
-            .execute(&db.pool)
-            .await?;
+                )
+                .bind(winner)
+                .bind(closes_at)
+                .bind(id)
+                .execute(&db.pool)
+                .await?;
+            }
         }
+
+        let active_edges = if dry_run {
+            scanned
+                .saturating_sub(duplicate_updates.len())
+                .saturating_sub(state_updates.len())
+        } else {
+            count_active_memory_edges(db, project).await?
+        };
+
+        Ok(ReconcileReport {
+            scanned,
+            duplicates: duplicate_updates.len(),
+            current_state_updates: state_updates.len(),
+            active_edges,
+            dry_run,
+        })
     }
-
-    let active_edges = if dry_run {
-        scanned
-            .saturating_sub(duplicate_updates.len())
-            .saturating_sub(state_updates.len())
-    } else {
-        count_active_memory_edges(db, project).await?
-    };
-
-    Ok(ReconcileReport {
-        scanned,
-        duplicates: duplicate_updates.len(),
-        current_state_updates: state_updates.len(),
-        active_edges,
-        dry_run,
-    })
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 pub async fn count_active_memory_edges(db: &Database, project: Option<&str>) -> Result<usize> {
@@ -5849,11 +5997,18 @@ pub async fn memory_edges_for_memories(
 }
 
 pub async fn delete_memory_edges(db: &Database, memory_id: i64) -> Result<()> {
-    sqlx::query("DELETE FROM memory_edges WHERE memory_id = $1")
-        .bind(memory_id)
-        .execute(&db.pool)
-        .await?;
-    Ok(())
+    let result = async {
+        sqlx::query("DELETE FROM memory_edges WHERE memory_id = $1")
+            .bind(memory_id)
+            .execute(&db.pool)
+            .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 fn clamp_chunk_density(density: &str) -> &'static str {
@@ -5892,44 +6047,58 @@ pub async fn replace_memory_chunks(
     memory_id: i64,
     chunks: &[NewMemoryChunk],
 ) -> Result<()> {
-    sqlx::query("DELETE FROM memory_chunks WHERE memory_id = $1")
-        .bind(memory_id)
-        .execute(&db.pool)
-        .await?;
-    let now = Utc::now().timestamp();
-    for chunk in chunks {
-        sqlx::query(
-            "INSERT INTO memory_chunks
+    let result = async {
+        sqlx::query("DELETE FROM memory_chunks WHERE memory_id = $1")
+            .bind(memory_id)
+            .execute(&db.pool)
+            .await?;
+        let now = Utc::now().timestamp();
+        for chunk in chunks {
+            sqlx::query(
+                "INSERT INTO memory_chunks
              (chunk_id, project, memory_id, session_id, ordinal, density, kind, title, summary,
               source_hash, source_start, source_end, token_estimate, created_at)
              VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
-        )
-        .bind(&chunk.chunk_id)
-        .bind(&chunk.project)
-        .bind(chunk.memory_id)
-        .bind(&chunk.session_id)
-        .bind(chunk.ordinal)
-        .bind(clamp_chunk_density(&chunk.density))
-        .bind(clamp_kind(&chunk.kind))
-        .bind(&chunk.title)
-        .bind(&chunk.summary)
-        .bind(chunk.source_hash.as_deref())
-        .bind(chunk.source_start)
-        .bind(chunk.source_end)
-        .bind(chunk.token_estimate)
-        .bind(now)
-        .execute(&db.pool)
-        .await?;
+            )
+            .bind(&chunk.chunk_id)
+            .bind(&chunk.project)
+            .bind(chunk.memory_id)
+            .bind(&chunk.session_id)
+            .bind(chunk.ordinal)
+            .bind(clamp_chunk_density(&chunk.density))
+            .bind(clamp_kind(&chunk.kind))
+            .bind(&chunk.title)
+            .bind(&chunk.summary)
+            .bind(chunk.source_hash.as_deref())
+            .bind(chunk.source_start)
+            .bind(chunk.source_end)
+            .bind(chunk.token_estimate)
+            .bind(now)
+            .execute(&db.pool)
+            .await?;
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 pub async fn delete_memory_chunks(db: &Database, memory_id: i64) -> Result<()> {
-    sqlx::query("DELETE FROM memory_chunks WHERE memory_id = $1")
-        .bind(memory_id)
-        .execute(&db.pool)
-        .await?;
-    Ok(())
+    let result = async {
+        sqlx::query("DELETE FROM memory_chunks WHERE memory_id = $1")
+            .bind(memory_id)
+            .execute(&db.pool)
+            .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 pub async fn get_memory_chunk(db: &Database, chunk_id: &str) -> Result<Option<MemoryChunk>> {
@@ -6218,12 +6387,19 @@ pub fn maturity_multiplier(maturity: Option<&str>) -> f64 {
 }
 
 pub async fn set_memory_maturity(db: &Database, memory_id: i64, maturity: &str) -> Result<()> {
-    sqlx::query("UPDATE memory_meta SET maturity = $1 WHERE memory_id = $2")
-        .bind(clamp_maturity(maturity))
-        .bind(memory_id)
-        .execute(&db.pool)
-        .await?;
-    Ok(())
+    let result = async {
+        sqlx::query("UPDATE memory_meta SET maturity = $1 WHERE memory_id = $2")
+            .bind(clamp_maturity(maturity))
+            .bind(memory_id)
+            .execute(&db.pool)
+            .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 #[derive(Debug, Clone, Default)]
@@ -6279,31 +6455,38 @@ pub async fn activation_meta_for(
 /// stable → core once its net feedback reaches ≥ 2.0.
 /// Returns the number of promoted rows.
 pub async fn promote_memories_maturity(db: &Database) -> Result<usize> {
-    let stable = sqlx::query(
-        "UPDATE memory_meta SET maturity = 'stable'
+    let result = async {
+        let stable = sqlx::query(
+            "UPDATE memory_meta SET maturity = 'stable'
          WHERE (maturity IS NULL OR maturity = 'draft')
            AND tombstoned_at IS NULL
            AND memory_id IN (
                SELECT memory_id FROM injection_events
                GROUP BY memory_id HAVING COUNT(*) >= 3
            )",
-    )
-    .execute(&db.pool)
-    .await?
-    .rows_affected();
-    let core = sqlx::query(
-        "UPDATE memory_meta SET maturity = 'core'
+        )
+        .execute(&db.pool)
+        .await?
+        .rows_affected();
+        let core = sqlx::query(
+            "UPDATE memory_meta SET maturity = 'core'
          WHERE maturity = 'stable'
            AND tombstoned_at IS NULL
            AND memory_id IN (
                SELECT memory_id FROM memory_feedback
                GROUP BY memory_id HAVING SUM(weight) >= 2.0
            )",
-    )
-    .execute(&db.pool)
-    .await?
-    .rows_affected();
-    Ok((stable + core) as usize)
+        )
+        .execute(&db.pool)
+        .await?
+        .rows_affected();
+        Ok((stable + core) as usize)
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 // ── Feedback, decay, and usage reinforcement ────────────────────────────────
@@ -6343,12 +6526,13 @@ pub async fn record_memory_feedback(
     weight: f64,
     detail: Option<&str>,
 ) -> Result<i64> {
-    let now = Utc::now().timestamp();
-    let weight = weight.clamp(-2.0, 2.0);
-    let id: i64 = match db.backend {
-        Backend::Sqlite => {
-            let mut conn = db.pool.acquire().await?;
-            sqlx::query(
+    let result = async {
+        let now = Utc::now().timestamp();
+        let weight = weight.clamp(-2.0, 2.0);
+        let id: i64 = match db.backend {
+            Backend::Sqlite => {
+                let mut conn = db.pool.acquire().await?;
+                sqlx::query(
                 "INSERT INTO memory_feedback(memory_id, project, signal, weight, detail, created_at)
                  VALUES($1, $2, $3, $4, $5, $6)",
             )
@@ -6360,13 +6544,13 @@ pub async fn record_memory_feedback(
             .bind(now)
             .execute(&mut *conn)
             .await?;
-            let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() AS id")
-                .fetch_one(&mut *conn)
-                .await?;
-            row.get("id")
-        }
-        Backend::Postgres => {
-            let row: sqlx::any::AnyRow = sqlx::query(
+                let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() AS id")
+                    .fetch_one(&mut *conn)
+                    .await?;
+                row.get("id")
+            }
+            Backend::Postgres => {
+                let row: sqlx::any::AnyRow = sqlx::query(
                 "INSERT INTO memory_feedback(memory_id, project, signal, weight, detail, created_at)
                  VALUES($1, $2, $3, $4, $5, $6) RETURNING id",
             )
@@ -6378,26 +6562,32 @@ pub async fn record_memory_feedback(
             .bind(now)
             .fetch_one(&db.pool)
             .await?;
-            row.get("id")
-        }
-    };
+                row.get("id")
+            }
+        };
 
-    // Receipt-confirmed reference: positive feedback is evidence the memory was
-    // actually used and useful, so advance its trust trajectory (paper Finding 4:
-    // trust earned over time as a first-class, temporally-grounded signal).
-    if weight > 0.0 {
-        let _ = sqlx::query(
-            "UPDATE memory_meta
+        // Receipt-confirmed reference: positive feedback is evidence the memory was
+        // actually used and useful, so advance its trust trajectory (paper Finding 4:
+        // trust earned over time as a first-class, temporally-grounded signal).
+        if weight > 0.0 {
+            let _ = sqlx::query(
+                "UPDATE memory_meta
              SET trust_ref_count = trust_ref_count + 1, trust_last_validated_at = $1
              WHERE memory_id = $2",
-        )
-        .bind(now)
-        .bind(memory_id)
-        .execute(&db.pool)
-        .await;
-    }
+            )
+            .bind(now)
+            .bind(memory_id)
+            .execute(&db.pool)
+            .await;
+        }
 
-    Ok(id)
+        Ok(id)
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 #[allow(dead_code)]
@@ -6525,15 +6715,22 @@ pub async fn memory_edge_by_id(db: &Database, edge_id: i64) -> Result<Option<Mem
 }
 
 pub async fn curate_memory_edge_delete(db: &Database, edge_id: i64) -> Result<bool> {
-    let result = sqlx::query(
-        "UPDATE memory_edges
+    let result = async {
+        let result = sqlx::query(
+            "UPDATE memory_edges
          SET superseded_by = id, superseded_reason = 'user_deleted'
          WHERE id = $1 AND superseded_by IS NULL",
-    )
-    .bind(edge_id)
-    .execute(&db.pool)
-    .await?;
-    Ok(result.rows_affected() > 0)
+        )
+        .bind(edge_id)
+        .execute(&db.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6547,32 +6744,39 @@ pub async fn curate_memory_edge_update(
     valid_until: Option<&str>,
     confidence: f64,
 ) -> Result<bool> {
-    let source_norm = normalize_graph_text(source);
-    let relation_norm = normalize_relation(relation);
-    let target_norm = normalize_graph_text(target);
-    if source_norm.is_empty() || relation_norm.is_empty() || target_norm.is_empty() {
-        anyhow::bail!("source, relation, and target must not be empty");
-    }
-    let result = sqlx::query(
-        "UPDATE memory_edges
+    let result = async {
+        let source_norm = normalize_graph_text(source);
+        let relation_norm = normalize_relation(relation);
+        let target_norm = normalize_graph_text(target);
+        if source_norm.is_empty() || relation_norm.is_empty() || target_norm.is_empty() {
+            anyhow::bail!("source, relation, and target must not be empty");
+        }
+        let result = sqlx::query(
+            "UPDATE memory_edges
          SET source = $1, source_norm = $2, relation = $3, relation_norm = $4,
              target = $5, target_norm = $6, valid_from = $7, valid_until = $8,
              confidence = $9, superseded_by = NULL, superseded_reason = NULL
          WHERE id = $10",
-    )
-    .bind(source.trim())
-    .bind(source_norm)
-    .bind(relation.trim())
-    .bind(relation_norm)
-    .bind(target.trim())
-    .bind(target_norm)
-    .bind(valid_from)
-    .bind(valid_until)
-    .bind(confidence.clamp(0.0, 1.0))
-    .bind(edge_id)
-    .execute(&db.pool)
-    .await?;
-    Ok(result.rows_affected() > 0)
+        )
+        .bind(source.trim())
+        .bind(source_norm)
+        .bind(relation.trim())
+        .bind(relation_norm)
+        .bind(target.trim())
+        .bind(target_norm)
+        .bind(valid_from)
+        .bind(valid_until)
+        .bind(confidence.clamp(0.0, 1.0))
+        .bind(edge_id)
+        .execute(&db.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 // ── AST-bound code anchors ───────────────────────────────────────────────────
@@ -6591,71 +6795,78 @@ pub async fn upsert_code_anchor(
     start_byte: i64,
     end_byte: i64,
 ) -> Result<i64> {
-    let now = Utc::now().timestamp();
-    sqlx::query(
-        "DELETE FROM code_anchors
+    let result = async {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "DELETE FROM code_anchors
          WHERE project = $1 AND memory_id = $2 AND language = $3 AND symbol_name = $4",
-    )
-    .bind(project)
-    .bind(memory_id)
-    .bind(language)
-    .bind(symbol_name)
-    .execute(&db.pool)
-    .await?;
+        )
+        .bind(project)
+        .bind(memory_id)
+        .bind(language)
+        .bind(symbol_name)
+        .execute(&db.pool)
+        .await?;
 
-    match db.backend {
-        Backend::Sqlite => {
-            let mut conn = db.pool.acquire().await?;
-            sqlx::query(
-                "INSERT INTO code_anchors
+        match db.backend {
+            Backend::Sqlite => {
+                let mut conn = db.pool.acquire().await?;
+                sqlx::query(
+                    "INSERT INTO code_anchors
                  (project, memory_id, path, language, symbol_kind, symbol_name, ast_hash,
                   context_hash, start_byte, end_byte, created_at, updated_at)
                  VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-            )
-            .bind(project)
-            .bind(memory_id)
-            .bind(path)
-            .bind(language)
-            .bind(symbol_kind)
-            .bind(symbol_name)
-            .bind(ast_hash)
-            .bind(context_hash)
-            .bind(start_byte)
-            .bind(end_byte)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *conn)
-            .await?;
-            let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() AS id")
-                .fetch_one(&mut *conn)
+                )
+                .bind(project)
+                .bind(memory_id)
+                .bind(path)
+                .bind(language)
+                .bind(symbol_kind)
+                .bind(symbol_name)
+                .bind(ast_hash)
+                .bind(context_hash)
+                .bind(start_byte)
+                .bind(end_byte)
+                .bind(now)
+                .bind(now)
+                .execute(&mut *conn)
                 .await?;
-            Ok(row.get("id"))
-        }
-        Backend::Postgres => {
-            let row: sqlx::any::AnyRow = sqlx::query(
-                "INSERT INTO code_anchors
+                let row: sqlx::any::AnyRow = sqlx::query("SELECT last_insert_rowid() AS id")
+                    .fetch_one(&mut *conn)
+                    .await?;
+                Ok(row.get("id"))
+            }
+            Backend::Postgres => {
+                let row: sqlx::any::AnyRow = sqlx::query(
+                    "INSERT INTO code_anchors
                  (project, memory_id, path, language, symbol_kind, symbol_name, ast_hash,
                   context_hash, start_byte, end_byte, created_at, updated_at)
                  VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                  RETURNING id",
-            )
-            .bind(project)
-            .bind(memory_id)
-            .bind(path)
-            .bind(language)
-            .bind(symbol_kind)
-            .bind(symbol_name)
-            .bind(ast_hash)
-            .bind(context_hash)
-            .bind(start_byte)
-            .bind(end_byte)
-            .bind(now)
-            .bind(now)
-            .fetch_one(&db.pool)
-            .await?;
-            Ok(row.get("id"))
+                )
+                .bind(project)
+                .bind(memory_id)
+                .bind(path)
+                .bind(language)
+                .bind(symbol_kind)
+                .bind(symbol_name)
+                .bind(ast_hash)
+                .bind(context_hash)
+                .bind(start_byte)
+                .bind(end_byte)
+                .bind(now)
+                .bind(now)
+                .fetch_one(&db.pool)
+                .await?;
+                Ok(row.get("id"))
+            }
         }
     }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 fn code_anchor_from_row(r: sqlx::any::AnyRow) -> CodeAnchor {
@@ -6696,21 +6907,28 @@ pub async fn update_code_anchor_location(
     end_byte: i64,
     context_hash: &str,
 ) -> Result<bool> {
-    let now = Utc::now().timestamp();
-    let result = sqlx::query(
-        "UPDATE code_anchors
+    let result = async {
+        let now = Utc::now().timestamp();
+        let result = sqlx::query(
+            "UPDATE code_anchors
          SET path = $1, start_byte = $2, end_byte = $3, context_hash = $4, updated_at = $5
          WHERE id = $6",
-    )
-    .bind(path)
-    .bind(start_byte)
-    .bind(end_byte)
-    .bind(context_hash)
-    .bind(now)
-    .bind(anchor_id)
-    .execute(&db.pool)
-    .await?;
-    Ok(result.rows_affected() > 0)
+        )
+        .bind(path)
+        .bind(start_byte)
+        .bind(end_byte)
+        .bind(context_hash)
+        .bind(now)
+        .bind(anchor_id)
+        .execute(&db.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 // ── Reflection/consolidation proposals ──────────────────────────────────────
@@ -7307,41 +7525,62 @@ pub async fn get_memories_by_kind(
 }
 
 pub async fn delete_memory_meta(db: &Database, memory_id: i64) -> Result<()> {
-    // Explicit child-first cleanup keeps this correct even when a SQLite
-    // connection has foreign-key enforcement disabled.
-    sqlx::query("DELETE FROM memory_influence_policy WHERE memory_id = $1")
-        .bind(memory_id)
-        .execute(&db.pool)
-        .await?;
-    sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id = $1")
-        .bind(memory_id)
-        .execute(&db.pool)
-        .await?;
-    sqlx::query("DELETE FROM memory_meta WHERE memory_id = $1")
-        .bind(memory_id)
-        .execute(&db.pool)
-        .await?;
-    Ok(())
+    let result = async {
+        // Explicit child-first cleanup keeps this correct even when a SQLite
+        // connection has foreign-key enforcement disabled.
+        sqlx::query("DELETE FROM memory_influence_policy WHERE memory_id = $1")
+            .bind(memory_id)
+            .execute(&db.pool)
+            .await?;
+        sqlx::query("DELETE FROM memory_evidence_roots WHERE memory_id = $1")
+            .bind(memory_id)
+            .execute(&db.pool)
+            .await?;
+        sqlx::query("DELETE FROM memory_meta WHERE memory_id = $1")
+            .bind(memory_id)
+            .execute(&db.pool)
+            .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 /// Remove a memory's entity-index rows. Called from `purge_memory` so the
 /// inverted index never retains rows for a deleted memory.
 pub async fn delete_memory_entities(db: &Database, memory_id: i64) -> Result<()> {
-    sqlx::query("DELETE FROM memory_entities WHERE memory_id = $1")
-        .bind(memory_id)
-        .execute(&db.pool)
-        .await?;
-    Ok(())
+    let result = async {
+        sqlx::query("DELETE FROM memory_entities WHERE memory_id = $1")
+            .bind(memory_id)
+            .execute(&db.pool)
+            .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 /// Link a memory to its verbatim pre-LLM session transcript blob (CCR).
 pub async fn set_memory_session_blob(db: &Database, memory_id: i64, hash: &str) -> Result<()> {
-    sqlx::query("UPDATE memory_meta SET session_blob = $1 WHERE memory_id = $2")
-        .bind(hash)
-        .bind(memory_id)
-        .execute(&db.pool)
-        .await?;
-    Ok(())
+    let result = async {
+        sqlx::query("UPDATE memory_meta SET session_blob = $1 WHERE memory_id = $2")
+            .bind(hash)
+            .bind(memory_id)
+            .execute(&db.pool)
+            .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = crate::hooks::invalidate_generated_files(db).await {
+        tracing::warn!(%error, "Memory changed but generated context invalidation failed");
+    }
+    result
 }
 
 /// The CCR blob hash of a memory's session transcript, if one was stored.

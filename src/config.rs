@@ -23,6 +23,8 @@ pub struct Config {
     #[serde(default = "default_vertex_location")]
     pub vertex_location: String,
     pub inject_limit: usize,
+    #[serde(default)]
+    pub working_set: crate::working_set::Config,
     pub max_observation_bytes: usize,
     pub db_path: String,
     #[serde(default)]
@@ -809,6 +811,7 @@ impl Default for Config {
             vertex_project: None,
             vertex_location: default_vertex_location(),
             inject_limit: 5,
+            working_set: crate::working_set::Config::default(),
             max_observation_bytes: 2048,
             db_path: ironmem_dir().join("mem.db").to_string_lossy().to_string(),
             database_url: None,
@@ -956,6 +959,7 @@ pub fn load() -> Result<Config> {
         serde_json::from_str(&raw)?
     };
     config.apply_influence_runtime()?;
+    config.working_set.validate()?;
     Ok(config)
 }
 

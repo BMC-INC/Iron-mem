@@ -646,6 +646,7 @@ impl IronMemServer {
         .await
         {
             Ok(expanded) => {
+                crate::access::delivered_expansion(&self.db, &expanded, &gate).await;
                 let mut json = serde_json::to_value(expanded).unwrap();
                 if let Some(obj) = json.as_object_mut() {
                     obj.insert("ok".to_string(), serde_json::json!(true));
@@ -755,6 +756,7 @@ impl IronMemServer {
                 },
             )
             .await?;
+        let delivered_ids = crate::access::gate_ids(&gate);
         let memories = gate.authorized;
         let memory_ids: Vec<i64> = memories.iter().map(|m| m.id).collect();
         let chunks = db::chunks_for_memories(&self.db, &memory_ids)
@@ -773,6 +775,13 @@ impl IronMemServer {
 
         let event_times = self.event_times_map(&memories).await;
         let evidence_chains = self.evidence_chains_json(&memory_ids, &chunks).await;
+        crate::access::delivered(
+            &self.db,
+            crate::access::Delivery::Recall,
+            &delivered_ids,
+            None,
+        )
+        .await;
         let json = serde_json::json!({
             "memories": memories,
             "advisory_memories": gate.advisory,
@@ -844,6 +853,18 @@ impl IronMemServer {
                 .unwrap_or_default(),
         )
         .unwrap_or_else(|_| serde_json::json!({}));
+        let delivered_ids = authorized_chunks
+            .iter()
+            .chain(&advisory_chunks)
+            .map(|c| c.memory_id)
+            .collect::<Vec<_>>();
+        crate::access::delivered(
+            &self.db,
+            crate::access::Delivery::Recall,
+            &delivered_ids,
+            None,
+        )
+        .await;
         let json = serde_json::json!({ "chunks": authorized_chunks, "advisory_chunks": advisory_chunks, "influence_decisions": gate.decisions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
@@ -864,6 +885,7 @@ impl IronMemServer {
             "memory_chunks": stats.total_memory_chunks,
             "db_path": self.config.db_path,
             "ccr": stats.ccr_json(),
+            "access_telemetry": crate::access::status(),
             "influence": {
                 "enabled": self.config.influence.enabled,
                 "mode": self.config.influence.mode,
@@ -903,6 +925,13 @@ impl IronMemServer {
             )
             .await?;
         let event_times = self.event_times_map(&gate.authorized).await;
+        crate::access::delivered(
+            &self.db,
+            crate::access::Delivery::Recall,
+            &crate::access::gate_ids(&gate),
+            None,
+        )
+        .await;
         let json = serde_json::json!({ "memories": gate.authorized, "advisory_memories": gate.advisory, "influence_decisions": gate.decisions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
@@ -941,6 +970,13 @@ impl IronMemServer {
             )
             .await?;
         let event_times = self.event_times_map(&gate.authorized).await;
+        crate::access::delivered(
+            &self.db,
+            crate::access::Delivery::Recall,
+            &crate::access::gate_ids(&gate),
+            None,
+        )
+        .await;
         let json = serde_json::json!({ "memories": gate.authorized, "advisory_memories": gate.advisory, "influence_decisions": gate.decisions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
@@ -975,6 +1011,13 @@ impl IronMemServer {
             )
             .await?;
         let event_times = self.event_times_map(&gate.authorized).await;
+        crate::access::delivered(
+            &self.db,
+            crate::access::Delivery::Recall,
+            &crate::access::gate_ids(&gate),
+            None,
+        )
+        .await;
         let json = serde_json::json!({ "memories": gate.authorized, "advisory_memories": gate.advisory, "influence_decisions": gate.decisions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
@@ -1021,6 +1064,9 @@ impl IronMemServer {
             .and_then(|v| v.as_i64())
             .unwrap_or(self.config.inject_limit as i64);
 
+        let revision = hooks::context_revision(&self.db)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let memories = retrieval::rank_for_injection(
             &self.db,
             self.embedder.as_deref(),
@@ -1028,7 +1074,9 @@ impl IronMemServer {
             project,
             &self.config.embedding.weights,
             self.config.embedding.recency_half_life_days,
-            limit as usize,
+            self.config
+                .working_set
+                .candidate_limit(limit.max(0) as usize),
         )
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -1046,12 +1094,32 @@ impl IronMemServer {
                 },
             )
             .await?;
-        let memories = gate.authorized;
+        let candidates = gate.authorized;
+        let memories = crate::working_set::select(
+            &self.db,
+            &candidates,
+            &self.config.working_set,
+            limit.max(0) as usize,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let report = hooks::inject_memories(&self.db, project, &memories)
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let mut report = hooks::inject_with_budget(
+            &self.db,
+            project,
+            &memories,
+            if self.config.working_set.enabled {
+                self.config.working_set.budget_bytes
+            } else {
+                24_000
+            },
+            Some(revision),
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
+        report.selection_omitted = candidates.len().saturating_sub(memories.len());
         let json = serde_json::json!({
             "injected": report.written_ids.len(),
             "injection_report": report,
@@ -1908,6 +1976,64 @@ mod tests {
 
     // ── retrieve_original (CCR) ──────────────────────────────────────────────
 
+    #[tokio::test]
+    async fn access_mcp_counts_delivered_content_and_actual_source_owner() {
+        let (server, path) = test_server().await;
+        let session = db::create_session(&server.db, "/synthetic/telemetry")
+            .await
+            .unwrap();
+        let first = db::insert_memory(
+            &server.db,
+            "/synthetic/telemetry",
+            &session,
+            "first synthetic",
+            None,
+        )
+        .await
+        .unwrap();
+        let second = db::insert_memory(
+            &server.db,
+            "/synthetic/telemetry",
+            &session,
+            "second synthetic",
+            None,
+        )
+        .await
+        .unwrap();
+        let blob = crate::ccr::store_blob(&server.db, b"synthetic exact original", None)
+            .await
+            .unwrap();
+        db::set_memory_session_blob(&server.db, first, &blob.hash)
+            .await
+            .unwrap();
+        let mut args = JsonObject::new();
+        args.insert("project".into(), serde_json::json!("/synthetic/telemetry"));
+        server.handle_get_context(&args).await.unwrap();
+        assert_eq!(
+            crate::access::stats(&server.db, &[first, second])
+                .await
+                .unwrap()[&first]
+                .recall_count,
+            1
+        );
+        args.insert("hash".into(), serde_json::json!(blob.hash));
+        args.insert("memory_id".into(), serde_json::json!(second));
+        server.handle_retrieve_original(&args).await.unwrap();
+        let stats = crate::access::stats(&server.db, &[first, second])
+            .await
+            .unwrap();
+        assert_eq!(stats[&first].expansion_count, 1);
+        assert_eq!(stats[&second].expansion_count, 0);
+        args.remove("hash");
+        server.handle_retrieve_original(&args).await.unwrap();
+        assert_eq!(
+            crate::access::stats(&server.db, &[second]).await.unwrap()[&second].expansion_count,
+            0
+        );
+        server.db.pool.close().await;
+        std::fs::remove_file(path).unwrap();
+    }
+
     async fn test_server() -> (IronMemServer, String) {
         let db_path = std::env::temp_dir().join(format!("ironmem-mcp-{}.db", uuid::Uuid::new_v4()));
         let db_path_string = db_path.to_string_lossy().to_string();
@@ -2201,6 +2327,11 @@ mod tests {
             assert!(!file.contains("mcp-blocked-content-marker"));
         }
 
+        let access = crate::access::stats(&server.db, &[memory_id])
+            .await
+            .unwrap();
+        assert_eq!(access[&memory_id].recall_count, 0);
+        assert_eq!(access[&memory_id].expansion_count, 0);
         let _ = std::fs::remove_dir_all(project_dir);
         let _ = std::fs::remove_file(path);
     }

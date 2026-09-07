@@ -1,3 +1,5 @@
+mod access;
+mod access_mutations;
 mod auto_dream;
 mod bench;
 mod ccr;
@@ -39,6 +41,7 @@ mod strutil;
 mod sweep;
 mod sync;
 mod vectorstore;
+mod working_set;
 
 use anyhow::Result;
 use chrono::{Local, TimeZone};
@@ -739,6 +742,15 @@ enum Commands {
         actor: String,
     },
 
+    /// Inspect local delivery counters and temperature without recording a recall
+    AccessStats {
+        memory_id: i64,
+        #[arg(long, default_value = "local")]
+        namespace: String,
+        #[command(flatten)]
+        purpose: RecallPurposeArgs,
+    },
+
     /// Show the full memory→action lineage (ledger + injections) for a memory
     Lineage {
         memory_id: i64,
@@ -1165,6 +1177,48 @@ async fn async_main() -> Result<()> {
             apply,
             actor,
         } => run_ledger_migrate(&cfg, &namespace, &out, apply, &actor).await?,
+        Commands::AccessStats {
+            memory_id,
+            namespace,
+            purpose,
+        } => {
+            let database = db::Database::new(&cfg.effective_database_url()).await?;
+            database.migrate().await?;
+            let memory = db::get_memory_by_id_in_namespace(&database, memory_id, &namespace)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("memory not found"))?;
+            let project = memory.project.clone();
+            let purpose = purpose.build(&namespace, &project)?;
+            let gate = egress::gate_memories(
+                &database,
+                vec![memory],
+                &namespace,
+                &project,
+                purpose.as_ref(),
+                egress::PurposeChannel::LocalOperator("ironmem:cli".into()),
+                egress::ConsumerCapabilities {
+                    reasoning_only_channel: true,
+                    ..Default::default()
+                },
+                &cfg.influence,
+            )
+            .await?;
+            anyhow::ensure!(
+                !access::gate_ids(&gate).is_empty(),
+                "memory influence denied"
+            );
+            let stats = access::stats(&database, &[memory_id])
+                .await?
+                .remove(&memory_id)
+                .ok_or_else(|| anyhow::anyhow!("memory metadata missing"))?;
+            let temperature = working_set::temperature(&stats, chrono::Utc::now().timestamp());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"stats":stats,"temperature":temperature,"history_complete":false})
+                )?
+            );
+        }
         Commands::Lineage {
             memory_id,
             namespace,
@@ -2168,6 +2222,7 @@ async fn run_search(
         Some(query),
     )
     .await?;
+    let delivered_ids = access::gate_ids(&gate);
     let egress::GateResult {
         authorized: memories,
         advisory,
@@ -2195,6 +2250,7 @@ async fn run_search(
         println!("{}", m.summary);
         println!();
     }
+    access::delivered(&database, access::Delivery::Recall, &delivered_ids, None).await;
     Ok(())
 }
 
@@ -2225,6 +2281,7 @@ async fn run_search_global(
         Some(query),
     )
     .await?;
+    let delivered_ids = access::gate_ids(&gate);
     let egress::GateResult {
         authorized: memories,
         advisory,
@@ -2257,6 +2314,7 @@ async fn run_search_global(
         println!("{}", m.summary);
         println!();
     }
+    access::delivered(&database, access::Delivery::Recall, &delivered_ids, None).await;
     Ok(())
 }
 
@@ -2288,6 +2346,7 @@ async fn run_list(
         &cfg.influence,
     )
     .await?;
+    let delivered_ids = access::gate_ids(&gate);
     let egress::GateResult {
         authorized: memories,
         advisory,
@@ -2315,6 +2374,7 @@ async fn run_list(
         println!("{}", m.summary);
         println!();
     }
+    access::delivered(&database, access::Delivery::Recall, &delivered_ids, None).await;
     Ok(())
 }
 
@@ -2427,6 +2487,7 @@ async fn run_inject(
     database.migrate().await?;
 
     let (embedder, store) = vectorstore::build_semantic(&database, cfg).await;
+    let revision = hooks::context_revision(&database).await?;
     let memories = retrieval::rank_for_injection(
         &database,
         embedder.as_deref(),
@@ -2434,7 +2495,7 @@ async fn run_inject(
         &project,
         &cfg.embedding.weights,
         cfg.embedding.recency_half_life_days,
-        limit as usize,
+        cfg.working_set.candidate_limit(limit.max(0) as usize),
     )
     .await?;
     let purpose = purpose_args.build(crate::governance::DEFAULT_NAMESPACE, &project)?;
@@ -2453,15 +2514,35 @@ async fn run_inject(
         &cfg.influence,
     )
     .await?;
-    let memories = gate.authorized;
+    let candidates = gate.authorized;
+    let memories = crate::working_set::select(
+        &database,
+        &candidates,
+        &cfg.working_set,
+        limit.max(0) as usize,
+        chrono::Utc::now().timestamp(),
+    )
+    .await?;
 
-    let report = hooks::inject_memories(&database, &project, &memories).await?;
+    let mut report = hooks::inject_with_budget(
+        &database,
+        &project,
+        &memories,
+        if cfg.working_set.enabled {
+            cfg.working_set.budget_bytes
+        } else {
+            24_000
+        },
+        Some(revision),
+    )
+    .await?;
+    report.selection_omitted = candidates.len().saturating_sub(memories.len());
     println!(
         "Injected {} memories into IRONMEM.md for {} ({} bytes; {} omitted)",
         report.written_ids.len(),
         project,
         report.bytes,
-        report.omitted
+        report.omitted + report.selection_omitted
     );
     if !report.telemetry_recorded {
         eprintln!("Context was written, but injection telemetry was not recorded.");
@@ -3129,5 +3210,73 @@ mod tests {
 
         assert!(bind.ip().is_loopback(), "remote MCP origin bound to {bind}");
         assert_eq!(bind.port(), 37779);
+    }
+}
+
+#[cfg(test)]
+mod access_cli_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn access_cli_delivery_parity() -> Result<()> {
+        anyhow::ensure!(
+            std::env::var_os("DATABASE_URL").is_none(),
+            "CLI fixture requires DATABASE_URL unset to avoid opening an external database"
+        );
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().to_str().unwrap();
+        let cfg = config::Config {
+            db_path: dir.path().join("cli.db").to_str().unwrap().into(),
+            ..Default::default()
+        };
+        let database = db::Database::new(&cfg.db_path).await?;
+        database.migrate().await?;
+        let session = db::create_session(&database, project).await?;
+        let id = db::insert_memory(
+            &database,
+            project,
+            &session,
+            "synthetictelemetry CLI fixture",
+            None,
+        )
+        .await?;
+        run_search(
+            &cfg,
+            "synthetictelemetry",
+            Some(project),
+            10,
+            "local",
+            &RecallPurposeArgs::default(),
+        )
+        .await?;
+        run_search_global(
+            &cfg,
+            "synthetictelemetry",
+            10,
+            "local",
+            &RecallPurposeArgs::default(),
+        )
+        .await?;
+        run_list(
+            &cfg,
+            Some(project),
+            10,
+            "local",
+            &RecallPurposeArgs::default(),
+        )
+        .await?;
+        assert_eq!(access::stats(&database, &[id]).await?[&id].recall_count, 3);
+        run_search(
+            &cfg,
+            "nonexistenttoken",
+            Some(project),
+            10,
+            "local",
+            &RecallPurposeArgs::default(),
+        )
+        .await?;
+        assert_eq!(access::stats(&database, &[id]).await?[&id].recall_count, 3);
+        database.pool.close().await;
+        Ok(())
     }
 }
