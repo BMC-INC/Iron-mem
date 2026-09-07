@@ -47,7 +47,7 @@ Object publication, unique chunk insertion and ownership edges commit together. 
 
 Project snapshots use version 5. Global legacy snapshots remain readable, with global restore blocked. Complete project capture includes memory content/timestamps, metadata and governance, evidence roots, policies, contradictions, entities, graph edges, skim/source links, code anchors, reflection proposals, sessions and observations. Exact source bytes are included independently of the source codec/dictionary representation. Relevant ledger records and imported audit evidence are retained as historical evidence, not replayed over the live audit log. These project subsets retain chain-boundary hashes; verification of the entire namespace ledger still requires its full ledger export.
 
-Canonical embeddings, native ANN tables and PostgreSQL text-search vectors are rebuildable. Restore invalidates native embeddings/ANN rows and rebuilds PostgreSQL text search. External vector/graph indexes require an isolated native restore and an external rebuild before serving; destructive CLI/REST restores are blocked while external backends are configured.
+Canonical embeddings, native ANN tables and PostgreSQL text-search vectors are rebuildable. Restore invalidates native embeddings/ANN rows and rebuilds PostgreSQL text search. Keyword search is available immediately; use `ironmem embed --project /absolute/project` with the chosen embedder to repopulate semantic indexes. External vector/graph indexes require an isolated native restore and an external rebuild before serving; destructive CLI/REST restores are blocked while external backends are configured.
 
 Capture holds one consistent transaction. Restore validates the complete payload, schema and source closure before replacement, then commits its relational changes, source repair and restore receipt together. Stable IDs are retained; cross-project collisions fail before replacement. SQLite's durable ID high-water mark and PostgreSQL sequences prevent future memories from reusing removed handles. Existing ledger history remains intact. Generated context is invalidated after commit; a filesystem failure is explicitly reported as a completed database restore with failed context removal.
 
@@ -66,6 +66,8 @@ ironmem gc
 ```
 
 Exports flatten the dependency chain into an independently recoverable full checkpoint and use atomic, non-overwriting output. Restores can repair missing or damaged live source blobs using verified exported originals. Legacy v4 payloads are readable and report their omissions in a dry run; destructive v4 restore is blocked because missing provenance/source state cannot be recreated honestly.
+
+Measure checkpoint payload sizes and full/delta restore wall time independently with `python3 scripts/benchmark_checkpoints.py --out OUTPUT`. Its deterministic fixture lives in a temporary database selected through `DATABASE_URL`; its timings include CLI startup and migration.
 
 ### Incremental design adjustment
 

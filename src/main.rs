@@ -1112,8 +1112,7 @@ async fn async_main() -> Result<()> {
             threshold_bytes,
             apply,
         } => {
-            let database =
-                db::Database::new(cfg.database_url.as_deref().unwrap_or(&cfg.db_path)).await?;
+            let database = db::Database::new(&cfg.effective_database_url()).await?;
             database.migrate().await?;
             println!(
                 "{}",
