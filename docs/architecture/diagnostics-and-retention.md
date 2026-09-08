@@ -85,3 +85,8 @@ copies. Reinitializing creates a new empty store; restoring an old backup can
 reintroduce erased information. Preserve or destroy backups deliberately.
 
 No personal store is purged as part of development or the included fixture tests.
+
+Filesystem freshness inspection is limited to the local process working directory
+when its absolute path exactly matches the requested project. Request paths never
+select files to read; other project scopes report database registration freshness
+without inspecting disk.

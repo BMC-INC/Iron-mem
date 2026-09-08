@@ -1,12 +1,16 @@
 # Integrated validation — 2026-09-07
 
-Implementation and local validation completed on macOS. Rust source fingerprint:
+Implementation and local validation completed on macOS. The measured build
+(preceding the final diagnostic filesystem-scope restriction) has Rust source fingerprint:
 `24762423d2a2e5d0f92dd51fa2e61a9247b59d79f46bdf07bd14f4e65c1a681e`.
 Release binary SHA-256:
 `aec12e23dc73202c3388f17266fa513376109d87b20d8f4e0beb5dd7fa702901`.
 The fingerprint follows build.rs (Cargo manifests/build script and sorted Rust
 source paths/bytes); it is not a claim that a dirty parent Git commit identifies
 uncommitted code. Debug and release build outputs recorded that same fingerprint.
+A subsequent CodeQL-driven change limits diagnostic disk reads to the process
+working directory. Focused diagnostics tests and PR CI validate that change;
+these benchmark results retain the original measured binary identity.
 
 ## Correctness and integration
 

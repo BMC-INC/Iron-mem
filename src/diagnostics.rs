@@ -155,8 +155,14 @@ pub async fn handle(
     let freshness = if let Some(row) = registration {
         let expected: String = row.get("content_hash");
         let dirty: i64 = row.get("dirty");
-        let disk = if principal.authority == "local_operator" {
-            match std::fs::read(std::path::Path::new(&request.project).join("IRONMEM.md")) {
+        // The request selects database scope, never a filesystem read path.
+        // Inspect only the process working directory, and only when its exact
+        // absolute path is the requested local project.
+        let local_directory = std::env::current_dir().ok();
+        let disk = if principal.authority == "local_operator"
+            && local_directory.as_deref() == Some(std::path::Path::new(&request.project))
+        {
+            match std::fs::read(local_directory.unwrap().join("IRONMEM.md")) {
                 Ok(bytes) => {
                     if format!("{:x}", Sha256::digest(bytes)) == expected {
                         "matches_registration"
@@ -168,7 +174,7 @@ pub async fn handle(
                 Err(_) => "unreadable",
             }
         } else {
-            "not_inspected_on_remote_request"
+            "not_inspected_outside_local_working_directory"
         };
         json!({"registered":true,"dirty":dirty>0,"disk":disk})
     } else {
@@ -222,6 +228,14 @@ mod tests {
             include_content: false,
             purpose: None,
         };
+        sqlx::query(
+            "INSERT INTO generated_context_files(project,content_hash,dirty) VALUES($1,$2,0)",
+        )
+        .bind("fixture")
+        .bind("synthetic-hash")
+        .execute(&database.pool)
+        .await
+        .unwrap();
         let principal = PolicyPrincipal::local_operator("test");
         let mut cfg = Config::default();
         cfg.influence.enabled = true;
@@ -229,6 +243,10 @@ mod tests {
             .await
             .unwrap();
         assert!(report["context"].is_null());
+        assert_eq!(
+            report["generated_context"]["disk"],
+            "not_inspected_outside_local_working_directory"
+        );
         assert_eq!(report["entries"][0]["memory_id"], id);
         assert!(!report.to_string().contains("diagnostic canary"));
         let outsider = PolicyPrincipal::configured(
