@@ -132,6 +132,7 @@ pub fn router(state: AppState) -> Router {
         .route("/retrieve_original", post(retrieve_original))
         .route("/remember", post(remember))
         .route("/assertions", post(assertion_request))
+        .route("/diagnostics", post(diagnostic_request))
         .route("/profile", get(get_profile))
         .route("/refresh_profile", post(refresh_profile))
         .route("/corrections", get(list_corrections))
@@ -1012,6 +1013,29 @@ fn rest_policy_principal(
         ),
         None => crate::influence::PolicyPrincipal::local_operator("ironmem:rest-local"),
     }
+}
+
+async fn diagnostic_request(
+    State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
+    Json(request): Json<crate::diagnostics::Request>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    crate::diagnostics::handle(
+        &state.db,
+        &state.config,
+        &rest_policy_principal(agent),
+        request,
+    )
+    .await
+    .map(Json)
+    .map_err(|error| {
+        let status = if crate::influence::policy_error(&error).is_some() {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        (status, error.to_string())
+    })
 }
 
 async fn assertion_request(
@@ -2402,6 +2426,52 @@ mod workbench_tests {
     use axum::body::{to_bytes, Body};
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn diagnostics_rest_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::Database::new(dir.path().join("rest.db").to_str().unwrap())
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        let session = db::create_session(&db, "diagnostic").await.unwrap();
+        db::insert_memory(&db, "diagnostic", &session, "canary", None)
+            .await
+            .unwrap();
+        let state = Arc::new(AppState {
+            db,
+            config: Config::default(),
+            embedder: None,
+            store: Arc::new(crate::vectorstore::BruteForceStore),
+        });
+        let request = || {
+            serde_json::from_value(
+                serde_json::json!({"namespace":"local","project":"diagnostic","query":"canary"}),
+            )
+            .unwrap()
+        };
+        let report = diagnostic_request(State(state.clone()), None, Json(request()))
+            .await
+            .unwrap();
+        assert!(report.0["context"].is_null());
+        let agent = AgentIdentity {
+            agent_id: "test".into(),
+            namespaces: vec!["other".into()],
+            capabilities: vec!["diagnostics:read".into()],
+        };
+        assert_eq!(
+            diagnostic_request(
+                State(state.clone()),
+                Some(axum::Extension(agent)),
+                Json(request())
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        state.db.pool.close().await;
+    }
 
     #[tokio::test]
     async fn assertions_rest_contract() {

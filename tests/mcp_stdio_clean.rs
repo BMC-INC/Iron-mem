@@ -12,16 +12,17 @@ use std::time::{Duration, Instant};
 #[test]
 fn mcp_stdio_stdout_is_pure_json() {
     let bin = env!("CARGO_BIN_EXE_ironmem");
-    let db = std::env::temp_dir().join(format!("ironmem-stdio-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&db);
+    let fixture = tempfile::tempdir().expect("isolated settings directory");
+    let db = fixture.path().join("stdio.db");
+    let settings = fixture.path().join("settings.json");
+    std::fs::write(&settings, serde_json::json!({"db_path":db}).to_string()).unwrap();
 
     let mut child = Command::new(bin)
+        .arg("--config")
+        .arg(&settings)
         .arg("mcp")
-        // Pass the same kind of raw filesystem path users can configure and let
-        // IronMem normalize it. Hand-rolled sqlite:// URLs are easy to get wrong
-        // on Windows drive-letter paths and can make the child exit before MCP
-        // stdio starts.
-        .env("DATABASE_URL", &db)
+        .env_remove("DATABASE_URL")
+        .env_remove("IRONMEM_MCP_TRANSPORT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

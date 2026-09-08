@@ -1,0 +1,100 @@
+{
+  "build_profile_operator_declared": "release",
+  "faults": {
+    "concurrent_cli_writers": {
+      "committed_memories": 12,
+      "unique_ids": true,
+      "writers": 4
+    },
+    "corrupted_checkpoint": "refused before destructive restore; original memory count preserved",
+    "process_exit_before_commit": "rollback verified",
+    "repeated_full_delta_recovery": {
+      "cycles": 200,
+      "wall_seconds": 189.6178840749999
+    },
+    "sqlite_page_exhaustion": "SQLITE_FULL rollback verified; not a host filesystem exhaustion test"
+  },
+  "limitations": [
+    "Synthetic ~1KB summaries; no model or external backend calls.",
+    "CLI startup/migration/diagnostics included; first and warm samples reported separately.",
+    "SQLite page exhaustion is not physical disk exhaustion. Bounded cycles are not months of production evidence."
+  ],
+  "physical_disk_full": {
+    "tested": false
+  },
+  "provenance": {
+    "binary_sha256": "aec12e23dc73202c3388f17266fa513376109d87b20d8f4e0beb5dd7fa702901",
+    "cpu_count": 16,
+    "machine": "x86_64",
+    "machine_load": "uncontrolled; arms run serially on the same host",
+    "platform": "macOS-26.6.2-x86_64-i386-64bit-Mach-O",
+    "processor": "i386",
+    "python": "3.14.6",
+    "timing_clock": "perf_counter"
+  },
+  "runner_sha256": "6c01c52f0f03838f43e859b4a79bab4e8baaf37fc0de5e9e1b02a30d7315389c",
+  "scale": [
+    {
+      "checkpoint_cli_ms": 198.7091609989875,
+      "db_and_wal_bytes": 704512,
+      "first_cli_ms": 120.8603610029968,
+      "memories": 100,
+      "p50_ms": 131.4389184990432,
+      "p95_ms": 136.87821499843267,
+      "warm_cli_ms": [
+        130.39914199907798,
+        130.2291569991212,
+        124.40829000115627,
+        132.47869499900844,
+        129.18434200037154,
+        136.87821499843267,
+        132.83612799932598,
+        129.93716100027086,
+        135.1364200017997,
+        132.55399300032877
+      ]
+    },
+    {
+      "checkpoint_cli_ms": 1387.6586810001754,
+      "db_and_wal_bytes": 2457600,
+      "first_cli_ms": 139.88107399927685,
+      "memories": 1000,
+      "p50_ms": 144.9257750009565,
+      "p95_ms": 157.39312499863445,
+      "warm_cli_ms": [
+        144.2790450018947,
+        139.02501800112077,
+        138.7131240007875,
+        142.1265199969639,
+        145.57250500001828,
+        148.26071399875218,
+        146.1511179986701,
+        140.51188999656006,
+        157.39312499863445,
+        146.63735100111808
+      ]
+    },
+    {
+      "checkpoint_cli_ms": 14119.345033999707,
+      "db_and_wal_bytes": 19685376,
+      "first_cli_ms": 320.5598730019119,
+      "memories": 10000,
+      "p50_ms": 248.72103949928714,
+      "p95_ms": 255.1075050032523,
+      "warm_cli_ms": [
+        247.06919500022195,
+        253.51005799893755,
+        250.29506899954868,
+        244.4528790001641,
+        255.1075050032523,
+        238.81554800027516,
+        248.9785830002802,
+        248.4634959982941,
+        246.72812100106967,
+        252.46971600063262
+      ]
+    }
+  ],
+  "schema": 1,
+  "concurrent_workload": "Local CPU model benchmark active during this run. Do not use these timings as idle-machine performance."
+}

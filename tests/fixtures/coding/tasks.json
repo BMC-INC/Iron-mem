@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "tasks": [
+    {
+      "id": "money-architecture",
+      "category": "architecture",
+      "query": "invoice money cents",
+      "instruction": "Implement invoice_total(prices) in solution.py. Follow the established invoice money representation. Return the sum of the prices.",
+      "memories": [
+        "Architecture decision: invoice money prices and totals are integer cents. Reject non-integer prices with ValueError; do not silently convert dollars or floating point."
+      ],
+      "tests": "from solution import invoice_total\nassert invoice_total([105, 210]) == 315\nassert invoice_total([]) == 0\ntry:\n invoice_total([1.5])\nexcept ValueError: pass\nelse: raise AssertionError('floating-point price accepted')",
+      "smoke_solution": "def invoice_total(prices):\n if any(type(p) is not int for p in prices): raise ValueError('integer cents required')\n return sum(prices)\n",
+      "baseline_solution": "def invoice_total(prices):\n return sum(prices)\n"
+    },
+    {
+      "id": "timezone-correction",
+      "category": "corrected_assumption",
+      "query": "timestamp timezone naive UTC",
+      "instruction": "Implement normalize_timestamp(value) in solution.py. Accept an ISO timestamp string and return an aware UTC datetime using our corrected timestamp convention.",
+      "memories": [
+        "Earlier assumption: naive timestamps represented local server time.",
+        "Correction: timestamp inputs without timezone must now raise ValueError. A timezone is mandatory; aware timestamp inputs normalize to UTC, including trailing Z."
+      ],
+      "tests": "from solution import normalize_timestamp\nfrom datetime import timezone\nassert normalize_timestamp('2025-01-01T02:00:00+02:00').hour == 0\nassert normalize_timestamp('2025-01-01T00:00:00Z').utcoffset().total_seconds() == 0\ntry:\n normalize_timestamp('2025-01-01T00:00:00')\nexcept ValueError: pass\nelse: raise AssertionError('obsolete naive timezone assumption')",
+      "smoke_solution": "from datetime import datetime, timezone\ndef normalize_timestamp(value):\n d = datetime.fromisoformat(value.replace('Z','+00:00'))\n if d.tzinfo is None: raise ValueError('timezone required')\n return d.astimezone(timezone.utc)\n",
+      "baseline_solution": "from datetime import datetime, timezone\ndef normalize_timestamp(value):\n return datetime.fromisoformat(value.replace('Z','+00:00')).replace(tzinfo=timezone.utc)\n"
+    },
+    {
+      "id": "retry-regression",
+      "category": "cross_session_bug",
+      "query": "retry attempts exceptions last error",
+      "instruction": "Implement retry(call, attempts) in solution.py with our previously fixed retry behavior. Return the first successful call result.",
+      "memories": [
+        "Bug fix: retry attempts is the TOTAL call count, not extra retries. attempts below 1 raises ValueError before calling. Retry RuntimeError only and re-raise the final error unchanged."
+      ],
+      "tests": "from solution import retry\ncalls=[]\ndef fail():\n calls.append(1)\n raise RuntimeError('last error')\ntry: retry(fail,3)\nexcept RuntimeError as e: assert str(e)=='last error'\nelse: raise AssertionError('swallowed failure')\nassert len(calls)==3\ntry: retry(fail,0)\nexcept ValueError: pass\nelse: raise AssertionError('invalid attempts accepted')\nassert len(calls)==3\nassert retry(lambda: 7,1)==7",
+      "smoke_solution": "def retry(call, attempts):\n if attempts < 1: raise ValueError('attempts')\n for i in range(attempts):\n  try: return call()\n  except RuntimeError:\n   if i == attempts-1: raise\n",
+      "baseline_solution": "def retry(call, attempts):\n for i in range(attempts+1):\n  try: return call()\n  except RuntimeError:\n   if i == attempts: raise\n"
+    },
+    {
+      "id": "slug-reuse",
+      "category": "avoided_repeated_work",
+      "query": "slug normalization reusable helper",
+      "instruction": "Implement project_slug(value) in solution.py. Reuse the established slug behavior and avoid introducing a second normalization implementation.",
+      "files": {
+        "slug_utils.py": "import re\ndef canonical_slug(value):\n return re.sub(r'[^a-z0-9]+','-',value.strip().lower()).strip('-')\n"
+      },
+      "memories": [
+        "Completed work: slug_utils.canonical_slug is the existing project slug normalization helper. Import it for project_slug; do not reimplement normalization."
+      ],
+      "tests": "import solution, slug_utils\nassert solution.project_slug(' Hello__World! ') == 'hello-world'\nslug_utils.canonical_slug=lambda x: 'sentinel'\n# Reuse is independently checked in the source AST below, permitting from-import.\nimport ast\ntree=ast.parse(open('solution.py').read())\nassert any(isinstance(n,(ast.Import,ast.ImportFrom)) and ('slug_utils' in [a.name for a in n.names] or getattr(n,'module',None)=='slug_utils') for n in ast.walk(tree))",
+      "smoke_solution": "from slug_utils import canonical_slug\ndef project_slug(value):\n return canonical_slug(value)\n",
+      "baseline_solution": "def project_slug(value):\n return value.strip().lower().replace(' ','-')\n"
+    }
+  ]
+}

@@ -14,6 +14,7 @@ mod contradiction;
 mod corrections;
 mod db;
 mod density;
+mod diagnostics;
 #[cfg(test)]
 mod e2e;
 mod egress;
@@ -110,6 +111,9 @@ impl RecallPurposeArgs {
     version = env!("CARGO_PKG_VERSION")
 )]
 struct Cli {
+    /// Use an explicit settings file without touching ~/.ironmem/settings.json
+    #[arg(long, global = true)]
+    config: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -322,6 +326,9 @@ enum ContradictionCommands {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
+    /// Explain retrieval, governance, source availability, access and context freshness
+    Diagnose { request: String },
+
     /// Start the ironmem worker server
     Server,
 
@@ -899,13 +906,29 @@ async fn async_main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let cfg = config::load()?;
+    let cfg = match cli.config {
+        Some(path) => config::load_from(&path)?,
+        None => config::load()?,
+    };
     // Install the storage backend selection once for the process (default:
     // native engine, unchanged behavior). Every retrieval path — CLI, REST,
     // MCP — sees the same selection.
     storage::set_storage_selection(storage::StorageSelection::from_config(&cfg));
 
     match cli.command {
+        Commands::Diagnose { request } => {
+            let database = db::Database::new(&cfg.effective_database_url()).await?;
+            database.migrate().await?;
+            let report = diagnostics::handle(
+                &database,
+                &cfg,
+                &influence::PolicyPrincipal::local_operator("ironmem:cli"),
+                serde_json::from_str(&request)?,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+
         Commands::Server => run_server(cfg).await?,
         Commands::Mcp => run_mcp(cfg).await?,
         Commands::Serve { public, no_auth } => run_serve(cfg, public, no_auth).await?,

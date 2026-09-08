@@ -1,0 +1,436 @@
+{
+  "agent": {
+    "command": [
+      "python3",
+      "scripts/ollama_coding_adapter.py"
+    ],
+    "model": "phi3:mini",
+    "settings": {
+      "endpoint": "http://127.0.0.1:11567",
+      "model_digest": "4f222292793889a9a40a020799cfd28d53f3e01af25d48e06c5e708610fc47e9",
+      "num_ctx": 4096,
+      "num_predict": 768,
+      "temperature": 0
+    },
+    "version": "ollama-0.17.4"
+  },
+  "competitive_superiority_established": false,
+  "fixture_sha256": "8d596b29ded8e26a62765622cbd8b703549944e36d5c74e403a3e3787493ac9d",
+  "limitations": [
+    "Four small synthetic tasks are not a representative coding benchmark.",
+    "Harness adapter uses fixture solutions; its scores are not model accuracy.",
+    "Context budget excludes the identical task prompt and starter files.",
+    "No hidden tests or answer keys are supplied to external adapters.",
+    "Wall time includes process startup; avoided work is a reuse check, not human time saved."
+  ],
+  "measurement": "external_agent_coding_tasks",
+  "provenance": {
+    "binary_sha256": "843734de6d07265925b30e78058de18cd4d60f38410a3ed97ca59434d04bb170",
+    "cpu_count": 16,
+    "machine": "x86_64",
+    "machine_load": "uncontrolled; arms run serially on the same host",
+    "platform": "macOS-26.6.2-x86_64-i386-64bit-Mach-O",
+    "processor": "i386",
+    "python": "3.14.6",
+    "timing_clock": "perf_counter"
+  },
+  "retrievers": [],
+  "runner_sha256": "ae65c3a8132f2ba79a5db790323c41ba8d351537a8660dc91f8320c63640c15b",
+  "runs": [
+    {
+      "agent_measurement": {
+        "done_reason": "stop",
+        "eval_count": 127,
+        "load_duration": 2967638531,
+        "model_digest": "4f222292793889a9a40a020799cfd28d53f3e01af25d48e06c5e708610fc47e9",
+        "ollama_version": "0.17.4",
+        "options": {
+          "num_ctx": 4096,
+          "num_predict": 768,
+          "seed": 0,
+          "temperature": 0
+        },
+        "prompt_eval_count": 299,
+        "total_duration": 23358972560
+      },
+      "arm": "ironmem",
+      "budget_bytes": 2000,
+      "category": "architecture",
+      "context_bytes": 634,
+      "context_sha256": "a8319980f6e7ff9ae6a9046e1b3b89b484b056d95185a3c34fdb81598a14b2af",
+      "failure": "Traceback (most recent call last):\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmpfrccfg9y/check.py\", line 7, in <module>\n    else: raise AssertionError('floating-point price accepted')\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: floating-point price accepted\n",
+      "memory_ids": [
+        1
+      ],
+      "passed": false,
+      "repeat": 0,
+      "retrieval_ms": 49.388834999263054,
+      "solution": "from decimal import Decimal, InvalidOperation\n\ndef invoice_total(prices):\n    total = Decimal('0')\n    for price in prices:\n        try:\n            total += Decimal(price)\n        except InvalidOperation as e:\n            raise ValueError(f'Invalid price value: {price}') from e\n    return int(total * 100) if isinstance(total, (int, float)) else total",
+      "solution_sha256": "527031f0346983c0d73ca3537b389145c8c62d8b725a6f7fef58627feedecf3b",
+      "task": "money-architecture",
+      "wall_ms": 23633.62889199925
+    },
+    {
+      "agent_measurement": {
+        "done_reason": "stop",
+        "eval_count": 114,
+        "load_duration": 26277933,
+        "model_digest": "4f222292793889a9a40a020799cfd28d53f3e01af25d48e06c5e708610fc47e9",
+        "ollama_version": "0.17.4",
+        "options": {
+          "num_ctx": 4096,
+          "num_predict": 768,
+          "seed": 0,
+          "temperature": 0
+        },
+        "prompt_eval_count": 135,
+        "total_duration": 13312728233
+      },
+      "arm": "full_history",
+      "budget_bytes": 2000,
+      "category": "architecture",
+      "context_bytes": 167,
+      "context_sha256": "dd63142a26e925c5c738806a911ac810ced72040139a2c93956d22041087a78f",
+      "failure": "Traceback (most recent call last):\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmptqxu5gro/check.py\", line 2, in <module>\n    assert invoice_total([105, 210]) == 315\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError\n",
+      "passed": false,
+      "repeat": 0,
+      "retrieval_ms": 0.014927998563507572,
+      "solution": "import json\n\ndef invoice_total(prices):\n    if any(not isinstance(price, int) for price in prices):\n        raise ValueError('Prices must be integers representing cents')\n    total = sum(prices)\n    return {'invoice_total': f'{total} cents'}  # Returning the result as a dictionary to match JSON structure",
+      "solution_sha256": "3df910c2a17b6969bf29a4eb94c89d918c322dc8a9203e5cb5ec058b80207cd4",
+      "task": "money-architecture",
+      "wall_ms": 13539.751623000484
+    },
+    {
+      "agent_measurement": {
+        "done_reason": "stop",
+        "eval_count": 192,
+        "load_duration": 26758226,
+        "model_digest": "4f222292793889a9a40a020799cfd28d53f3e01af25d48e06c5e708610fc47e9",
+        "ollama_version": "0.17.4",
+        "options": {
+          "num_ctx": 4096,
+          "num_predict": 768,
+          "seed": 0,
+          "temperature": 0
+        },
+        "prompt_eval_count": 99,
+        "total_duration": 24256205502
+      },
+      "arm": "no_memory",
+      "budget_bytes": 2000,
+      "category": "architecture",
+      "context_bytes": 0,
+      "context_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "failure": "Traceback (most recent call last):\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmpw0g6u0uv/check.py\", line 1, in <module>\n    from solution import invoice_total\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmpw0g6u0uv/solution.py\", line 8\n    if __name__ == '__main__dependent on the provided context, I will create a Python function that calculates an invoice total and returns it as JSON.\n                   ^\nSyntaxError: unterminated string literal (detected at line 8)\n",
+      "passed": false,
+      "repeat": 0,
+      "retrieval_ms": 0.0035900011425837874,
+      "solution": "import json\n\ndef calculate_invoice_total(prices):\n    total = sum(prices)\n    return {'Invoice Total': f'${total:.2f}'}\n\n# Example usage:\nif __name__ == '__main__dependent on the provided context, I will create a Python function that calculates an invoice total and returns it as JSON.\n```python\ndef calculate_invoice_total(prices):\n    # Calculate the sum of all prices\n    total = sum(prices)\n    \n    # Return the result formatted with two decimal places, prefixed by a dollar sign\n    return {'Invoice Total': f'${total:.2f}'}\n```",
+      "solution_sha256": "919dffcce87552295be3cebc17773002731a1cf4759b2cea38367be400dae48b",
+      "task": "money-architecture",
+      "wall_ms": 24502.496924000297
+    },
+    {
+      "agent_measurement": {
+        "done_reason": "stop",
+        "eval_count": 185,
+        "load_duration": 25124880,
+        "model_digest": "4f222292793889a9a40a020799cfd28d53f3e01af25d48e06c5e708610fc47e9",
+        "ollama_version": "0.17.4",
+        "options": {
+          "num_ctx": 4096,
+          "num_predict": 768,
+          "seed": 0,
+          "temperature": 0
+        },
+        "prompt_eval_count": 148,
+        "total_duration": 25795363648
+      },
+      "arm": "full_history",
+      "budget_bytes": 2000,
+      "category": "corrected_assumption",
+      "context_bytes": 228,
+      "context_sha256": "5f9386087a87ed304e26a96261384bf1b290bb48ad1af9f8d2130e8cc39056a3",
+      "failure": "Traceback (most recent call last):\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmp1eeu70a5/check.py\", line 1, in <module>\n    from solution import normalize_timestamp\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmp1eeu70a5/solution.py\", line 3, in <module>\n    import pytz\nModuleNotFoundError: No module named 'pytz'\n",
+      "passed": false,
+      "repeat": 0,
+      "retrieval_ms": 0.015108998923096806,
+      "solution": "\nfrom datetime import datetime\nimport pytz\n\ndef normalize_timestamp(value):\n    try:\n        # Check if the input is already a timezone-aware datetime object.\n        dt = value\n        return dt\n    except TypeError as e:\n        raise ValueError(\"Naive timestamps are not allowed. Please provide an aware timestamp with timezone information.\") from e\n\n    # If it'ths naive, parse the string into a datetime object and make it timezone-aware using UTC.\n    dt = datetime.fromisoformat(value)\n    utc_dt = pytz.timezone('UTC').localize(dt)\n    return utc_dt\n",
+      "solution_sha256": "72bbade5d3e050dc4b1ddbc62f0145e37f6374d9c4547e5e84ade5da1eebf77e",
+      "task": "timezone-correction",
+      "wall_ms": 26023.935786000948
+    },
+    {
+      "agent_measurement": {
+        "done_reason": "stop",
+        "eval_count": 287,
+        "load_duration": 26039487,
+        "model_digest": "4f222292793889a9a40a020799cfd28d53f3e01af25d48e06c5e708610fc47e9",
+        "ollama_version": "0.17.4",
+        "options": {
+          "num_ctx": 4096,
+          "num_predict": 768,
+          "seed": 0,
+          "temperature": 0
+        },
+        "prompt_eval_count": 100,
+        "total_duration": 35031877227
+      },
+      "arm": "no_memory",
+      "budget_bytes": 2000,
+      "category": "corrected_assumption",
+      "context_bytes": 0,
+      "context_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "failure": "Traceback (most recent call last):\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmp8m6mb3sn/check.py\", line 1, in <module>\n    from solution import normalize_timestamp\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmp8m6mb3sn/solution.py\", line 2, in <module>\n    import iso8601\nModuleNotFoundError: No module named 'iso8601'\n",
+      "passed": false,
+      "repeat": 0,
+      "retrieval_ms": 0.0032530006137676537,
+      "solution": "\nimport iso8601\nfrom dateutil import tz\n\ndef normalize_timestamp(value):\n    try:\n        # Parse the ISO timestamp string into a datetime object without timezone information.\n        naive_datetime = iso86ner.parse_date(value)\n        \n        # Replace '+' with '/' to handle ambiguous timestamps correctly (e.g., 2019-03+04:56).\n        corrected_timestamp = value.replace('+', '/')\n        \n        # Parse the corrected timestamp into a datetime object.\n        aware_datetime = iso86ner.parse(corrected_timestamp)\n        \n        # Convert to UTC timezone and return as an aware datetime object.\n        utc_aware_datetime = tz.make_aware(aware_datetime, 'UTC')\n        \n        return utc_aware_datetime\n    except iso86ner.ParseError:\n        raise ValueError('Invalid ISO timestamp format provided. Please use YYYY-MM-DDTHH:mm:ss or with timezone information as per our convention.')\n",
+      "solution_sha256": "85864c500e6977bc6252160c9ae0df431faeb81eb5eb49ce35111f4bb411fcec",
+      "task": "timezone-correction",
+      "wall_ms": 35244.12711900004
+    },
+    {
+      "agent_measurement": {
+        "done_reason": "stop",
+        "eval_count": 170,
+        "load_duration": 25161655,
+        "model_digest": "4f222292793889a9a40a020799cfd28d53f3e01af25d48e06c5e708610fc47e9",
+        "ollama_version": "0.17.4",
+        "options": {
+          "num_ctx": 4096,
+          "num_predict": 768,
+          "seed": 0,
+          "temperature": 0
+        },
+        "prompt_eval_count": 411,
+        "total_duration": 41925653019
+      },
+      "arm": "ironmem",
+      "budget_bytes": 2000,
+      "category": "corrected_assumption",
+      "context_bytes": 954,
+      "context_sha256": "3852c55860d1555744d28094e20e5e1cefaf7cedbafbf5b1c7a6d4a59bafb6bf",
+      "failure": "Traceback (most recent call last):\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmpuyy7cgao/check.py\", line 1, in <module>\n    from solution import normalize_timestamp\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmpuyy7cgao/solution.py\", line 3, in <module>\n    from dateutil import tz\nModuleNotFoundError: No module named 'dateutil'\n",
+      "memory_ids": [
+        2,
+        1
+      ],
+      "passed": false,
+      "repeat": 0,
+      "retrieval_ms": 123.43208099991898,
+      "solution": "\nimport datetime\nfrom dateutil import tz\n\ndef normalize_timestamp(value):\n    try:\n        naive_datetime = datetime.datetime.fromisoformat(value)\n        if naive_datetime.tzinfo is None:\n            raise ValueError(\"Naive timestamps must include a timezone.\")\n        aware_utc_datetime = naive_datetime.astimezone(tz=datetime.timezone.utc).replace(microsecond=0)\n        return aware_utc_datetime\n    except ValueError as e:\n        raise ValueError(\"Invalid timestamp format.\") from e\n",
+      "solution_sha256": "b441fb8798a694266a8afa5f32ec49ea8beb92d6bd1c244b1ab5d51e3f4f2dda",
+      "task": "timezone-correction",
+      "wall_ms": 42305.710455002554
+    },
+    {
+      "agent_measurement": {
+        "done_reason": "stop",
+        "eval_count": 270,
+        "load_duration": 190465576,
+        "model_digest": "4f222292793889a9a40a020799cfd28d53f3e01af25d48e06c5e708610fc47e9",
+        "ollama_version": "0.17.4",
+        "options": {
+          "num_ctx": 4096,
+          "num_predict": 768,
+          "seed": 0,
+          "temperature": 0
+        },
+        "prompt_eval_count": 143,
+        "total_duration": 93076184799
+      },
+      "arm": "full_history",
+      "budget_bytes": 2000,
+      "category": "cross_session_bug",
+      "context_bytes": 182,
+      "context_sha256": "9d6ff766a53cd99b3c55b072854c9a83c8301177788113b175f9ee5998b436cf",
+      "failure": "Traceback (most recent call last):\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmpw06skwu5/check.py\", line 1, in <module>\n    from solution import retry\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmpw06skwu5/solution.py\", line 6\n    for attempt in range(max end attempts + 1):\n                             ^^^\nSyntaxError: invalid syntax. Did you mean 'and'?\n",
+      "passed": false,
+      "repeat": 0,
+      "retrieval_ms": 0.7138119981391355,
+      "solution": "import requests\nfrom time import sleep\n\ndef make_call(url):\n    max_attempts = 3\n    for attempt in range(max end attempts + 1):\n        try:\n            response = requests.get(url)\n            if response.ok:\n                return response.text\n        except (requests.RequestException, RuntimeError) as e:\n            print(f'Attempt {attempt} failed:', str(e))\n            sleep(2 ** attempt)  # Exponential backoff.\n    raise ValueError('Max attempts reached without success')\n\ndef retry_call(url, max_retries=3):\n    for _ in range(max_retries + 1):\n        try:\n            return make_call(url)\n        except (requests.RequestException, RuntimeError) as e:\n            print('Retrying due to error:', str(e))\n            sleep(2 ** _)  # Exponential backoff.\n    raise ValueError('Max retries reached without success')\n",
+      "solution_sha256": "4a05a339eb30643a1a139e0622bd9cf26f1aaf71a264836f726cd909a43d6191",
+      "task": "retry-regression",
+      "wall_ms": 93734.31092700048
+    },
+    {
+      "agent_measurement": {
+        "done_reason": "stop",
+        "eval_count": 592,
+        "load_duration": 28022449,
+        "model_digest": "4f222292793889a9a40a020799cfd28d53f3e01af25d48e06c5e708610fc47e9",
+        "ollama_version": "0.17.4",
+        "options": {
+          "num_ctx": 4096,
+          "num_predict": 768,
+          "seed": 0,
+          "temperature": 0
+        },
+        "prompt_eval_count": 97,
+        "total_duration": 90498804276
+      },
+      "arm": "no_memory",
+      "budget_bytes": 2000,
+      "category": "cross_session_bug",
+      "context_bytes": 0,
+      "context_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "failure": "Traceback (most recent call last):\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmpfumx6n90/check.py\", line 1, in <module>\n    from solution import retry\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmpfumx6n90/solution.py\", line 19\n    Here's the updated `solution.py` code:\n        ^\nSyntaxError: unterminated string literal (detected at line 19)\n",
+      "passed": false,
+      "repeat": 0,
+      "retrieval_ms": 0.003788998583331704,
+      "solution": "\nimport requests\nfrom time import sleep\ndef make_api_call(url):\n    for attempt in range(3, 0, -1): # Retry up to three times.\n        try:\n            response = requests.get(url)\n            if response.status_code == 200:\n                return response.json() # Return the JSON result on success\n        except requests.RequestException as e:\n            print(f'Attempt {3 - attempt}: An error occurred: {e}')\n            sleep(2 ** (3 - attempt)) # Exponential backoff.\n    return None\n\ndef retry_with_fixed_behavior():\n    url = 'https://api.example.com/data'\n    result = make_apidependent on the project history to implement a fixed behavior for retries, we will assume that there was an issue with handling exceptions and backoff properly in previous attempts. We need to ensure our retry function is robust against network issues or server errors by implementing exponential backoff and proper exception handling as per best practices.\n\nHere's the updated `solution.py` code:\n\n```python\nimport requests\nfrom time import sleep\ndef make_api_call(url):\n    for attempt in range(3, 0, -1): # Retry up to three times.\n        try:\n            response = requests.get(url)\n            if response.status_code == 2dees and the request fails due to network issues or server errors that are transient (like a timeout), we should retry with exponential backoff, which means waiting longer between each subsequent attempt.\n\nHere's how you can implement it in `solution.py`:\n\ndef make_api_call(url):\n    for attempt in range(3, 0, -1): # Retry up to three times with exponential backoff on failure (e.g., network issues or server errors).\n        try:\n            response = requests.get(url)\n            if response.status_code == 200:\n                return response.json() # Return the JSON result on success.\n        except requests.RequestException as e:\n            wait_time = 2 ** (3 - attempt) # Exponential backoff\n            print(f'Attempt {3 - attempt}: An error occurred: {e}')\n            sleep(wait_time)\n    return None\n```",
+      "solution_sha256": "cba2071040386fc7230e08694d9f52501c606543920a9603f2b72ca91f5e1534",
+      "task": "retry-regression",
+      "wall_ms": 90736.89026500142
+    },
+    {
+      "agent_measurement": {
+        "done_reason": "stop",
+        "eval_count": 606,
+        "load_duration": 25537985,
+        "model_digest": "4f222292793889a9a40a020799cfd28d53f3e01af25d48e06c5e708610fc47e9",
+        "ollama_version": "0.17.4",
+        "options": {
+          "num_ctx": 4096,
+          "num_predict": 768,
+          "seed": 0,
+          "temperature": 0
+        },
+        "prompt_eval_count": 308,
+        "total_duration": 131548526816
+      },
+      "arm": "ironmem",
+      "budget_bytes": 2000,
+      "category": "cross_session_bug",
+      "context_bytes": 666,
+      "context_sha256": "de543d7c5df25393e2be538f788e3373559b0c97cd2b1690d6e21c0becd45e1d",
+      "failure": "Traceback (most recent call last):\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmpmt9au8ks/check.py\", line 1, in <module>\n    from solution import retry\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmpmt9au8ks/solution.py\", line 31\n    def call.retry(self, func=call, max_attempts=3):\n            ^\nSyntaxError: expected '('\n",
+      "memory_ids": [
+        1
+      ],
+      "passed": false,
+      "repeat": 0,
+      "retrieval_ms": 140.0573959981557,
+      "solution": "\nimport time, requests\nfrom functenerrors import retry_runtime_error\n\ndef retrieve_original(session, memory_id):\n    # This function is assumed to be implemented elsewhere in the project.\n    pass\n\ndef call():\n    try:\n        response = requests.get('https://api.example.com/data')  # Replace with actual API endpoint as needed.\n        return response.json(), None\n    except (requests.RequestException, ValueError) as e:\n        if isinstance(e, retry_runtime_error):\n            raise\n        else:\n            time.sleep(1)\n            attempt = 0\n            max_attempts = call._retry_attempts or 3  # Assuming _retry_attempts is defined with the total count of retries.\n            while attempt < max_attempts:\n                try:\n                    response = requests.get('https://api.example.com/data')\n                    return response.json(), None\n                except (requests.RequestException, ValueError) as e:\n                    if isinstance(e, retry_runtime_error):\n                        raise\n                    attempt += 1\n            # If we've exhausted all attempts and still failed.\n            return None, 'Max retries exceeded with no successful response.'\n\ndef call.retry(self, func=call, max_attempts=3):\n    self._retry_attempts = max_attempts\n    attempt = 0\n    while attempt < self._retry_attempts:\n        try:\n            return func()\n        except retry_runtime_error as e:\n            if isinstance(e, requests.RequestException):\n                raise ValueError('Invalid number of attempts') from None  # Raise a more specific error.\n            attempt += 1\n    raise RuntimeError('Max retries exceeded with no successful response.')\n\ndef main():\n    call_instance = type('CallInstance', (object,), {'retry': call.retry})\n    result, last_error = call_instance().call()\n    if isinstance(last_error, RuntimeError):  # Handle the final error as needed.\n        print(f'Failed after all retries: {last_error}')\n    else:\n        print('Successful response received.', result)\n\nif __name__ == '__main__':\n    main()",
+      "solution_sha256": "3937cde56fc54c382869cc4c6961b68bccbc5962c5a4023426bb3610d5e11519",
+      "task": "retry-regression",
+      "wall_ms": 132049.41784400216
+    },
+    {
+      "agent_measurement": {
+        "done_reason": "stop",
+        "eval_count": 68,
+        "load_duration": 83780145,
+        "model_digest": "4f222292793889a9a40a020799cfd28d53f3e01af25d48e06c5e708610fc47e9",
+        "ollama_version": "0.17.4",
+        "options": {
+          "num_ctx": 4096,
+          "num_predict": 768,
+          "seed": 0,
+          "temperature": 0
+        },
+        "prompt_eval_count": 188,
+        "total_duration": 22377048546
+      },
+      "arm": "full_history",
+      "budget_bytes": 2000,
+      "category": "avoided_repeated_work",
+      "context_bytes": 154,
+      "context_sha256": "9446be7251ecc96c8e1633aa1e56ef8bed111e42508d0e0f258bab620e83b8dd",
+      "failure": "Traceback (most recent call last):\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmpk8r6l5lk/check.py\", line 1, in <module>\n    import solution, slug_utils\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmpk8r6l5lk/solution.py\", line 2, in <module>\n    from .slug_utils import canonical_slug\nImportError: attempted relative import with no known parent package\n",
+      "passed": false,
+      "repeat": 0,
+      "retrieval_ms": 0.03222799932700582,
+      "solution": "import json\nfrom .slug_utils import canonical_slug\nsolution = {\"project_slug\": canonical_slug('Project Title')}\nprint(json.dumps({\"files\": solution}))",
+      "solution_sha256": "7df1352096b15ba06d20c0a6d4a43369f509ca001c8ac25ee2d397f8e1484f0b",
+      "task": "slug-reuse",
+      "wall_ms": 23054.857934999745
+    },
+    {
+      "agent_measurement": {
+        "done_reason": "stop",
+        "eval_count": 71,
+        "load_duration": 39323271,
+        "model_digest": "4f222292793889a9a40a020799cfd28d53f3e01af25d48e06c5e708610fc47e9",
+        "ollama_version": "0.17.4",
+        "options": {
+          "num_ctx": 4096,
+          "num_predict": 768,
+          "seed": 0,
+          "temperature": 0
+        },
+        "prompt_eval_count": 353,
+        "total_duration": 26690278257
+      },
+      "arm": "ironmem",
+      "budget_bytes": 2000,
+      "category": "avoided_repeated_work",
+      "context_bytes": 636,
+      "context_sha256": "91381c9ceba3e196af1fe09f47496a189d59472c02044e8a667107cc822fd846",
+      "failure": "Traceback (most recent call last):\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmp4tofggsj/check.py\", line 2, in <module>\n    assert solution.project_slug(' Hello__World! ') == 'hello-world'\n           ^^^^^^^^^^^^^^^^^^^^^\nAttributeError: module 'solution' has no attribute 'project_slug'\n",
+      "memory_ids": [
+        1
+      ],
+      "passed": false,
+      "repeat": 0,
+      "retrieval_ms": 257.5917780013697,
+      "solution": "import json\nfrom slug_utils import canonical_slug\nsolution = {\"project_slug\": canonical_slug('IronMem Session Memory')}\nprint(json.dumps({\"files\": solution}))",
+      "solution_sha256": "fcad238b2ee66f542ee18631448f2527acc2671b766c38e8eba4ca2f2fae872d",
+      "task": "slug-reuse",
+      "wall_ms": 27439.144825999392
+    },
+    {
+      "agent_measurement": {
+        "done_reason": "stop",
+        "eval_count": 63,
+        "load_duration": 58061546,
+        "model_digest": "4f222292793889a9a40a020799cfd28d53f3e01af25d48e06c5e708610fc47e9",
+        "ollama_version": "0.17.4",
+        "options": {
+          "num_ctx": 4096,
+          "num_predict": 768,
+          "seed": 0,
+          "temperature": 0
+        },
+        "prompt_eval_count": 150,
+        "total_duration": 17055360072
+      },
+      "arm": "no_memory",
+      "budget_bytes": 2000,
+      "category": "avoided_repeated_work",
+      "context_bytes": 0,
+      "context_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "failure": "Traceback (most recent call last):\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmp2ds4b9le/check.py\", line 1, in <module>\n    import solution, slug_utils\n  File \"/private/var/folders/gf/k0vjwb_n69q14dsjwjjb6b540000gn/T/ironmem-coding-rcz5o0b1/tmp2ds4b9le/solution.py\", line 4, in <module>\n    print(json.dumps(solution))\n          ~~~~~~~~~~^^^^^^^^^^\n  File \"/usr/local/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/json/__init__.py\", line 235, in dumps\n    return _default_encoder.encode(obj)\n           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^\n  File \"/usr/local/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/json/encoder.py\", line 202, in encode\n    chunks = self.iterencode(o, _one_shot=True)\n  File \"/usr/local/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/json/encoder.py\", line 263, in iterencode\n    return _iterencode(o, 0)\n  File \"/usr/local/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/json/encoder.py\", line 182, in default\n    raise TypeError(f'Object of type {o.__class__.__name__} '\n                    f'is not JSON serializable')\nTypeError: Object of type function is not JSON serializable\nwhen serializing dict item 'project_slug'\n",
+      "passed": false,
+      "repeat": 0,
+      "retrieval_ms": 0.007921000360511243,
+      "solution": "import json\nfrom slug_utils import canonical_slug\nsolution = {\"project_slug\": canonical_slug}\nprint(json.dumps(solution))",
+      "solution_sha256": "e3095ac5063622402c06823c24a559fa9d4802ae56aa7660bb756f5fcc42b20c",
+      "task": "slug-reuse",
+      "wall_ms": 17655.692741001985
+    }
+  ],
+  "schema": 1,
+  "summary": {
+    "full_history": {
+      "passed": 0,
+      "total": 4
+    },
+    "ironmem": {
+      "passed": 0,
+      "total": 4
+    },
+    "no_memory": {
+      "passed": 0,
+      "total": 4
+    }
+  },
+  "valid_for_comparative_claims": false,
+  "pilot_notes": [
+    "All twelve generated solutions failed executable checks.",
+    "This pilot used the initial adapter prompt, which did not explicitly state the stdlib-only environment.",
+    "The debug executable was rebuilt during the pilot; the final recorded binary hash does not identify every invocation. The final runner pins a private temporary binary copy.",
+    "Adapter argv paths normalized for publication; solutions and outcomes unchanged."
+  ]
+}

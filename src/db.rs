@@ -643,7 +643,7 @@ async fn migrate_evidence_roots(db: &Database) -> Result<()> {
              SELECT m.rowid, 0.5, CAST(m.created_at AS INTEGER) FROM memories m
              WHERE NOT EXISTS (
                 SELECT 1 FROM memory_meta mm WHERE mm.memory_id = m.rowid
-             )",
+             ) ON CONFLICT(memory_id) DO NOTHING",
             )
             .execute(&db.pool)
             .await?
@@ -654,7 +654,7 @@ async fn migrate_evidence_roots(db: &Database) -> Result<()> {
              SELECT m.id, 0.5, m.created_at FROM memories m
              WHERE NOT EXISTS (
                 SELECT 1 FROM memory_meta mm WHERE mm.memory_id = m.id
-             )",
+             ) ON CONFLICT(memory_id) DO NOTHING",
             )
             .execute(&db.pool)
             .await?
@@ -2223,15 +2223,16 @@ pub async fn insert_memory(
     let result = async {
     let now = Utc::now().timestamp();
 
+    // Publish the row, relational parent and evidence root in one transaction.
+    // Otherwise a concurrent startup migration can repair the half-published row.
+    let mut tx = begin_write(db).await?;
     let memory_id = match db.backend {
         Backend::Sqlite => {
-            let mut tx = begin_write(db).await?;
             let row = sqlx::query("UPDATE memory_identity_highwater SET maximum=MAX(maximum,COALESCE((SELECT MAX(rowid) FROM memories),0),COALESCE((SELECT MAX(memory_id) FROM memory_meta),0))+1 WHERE singleton=1 RETURNING maximum")
                 .fetch_one(&mut *tx).await?;
             let id: i64 = row.get("maximum");
             sqlx::query("INSERT INTO memories(rowid,project,session_id,summary,tags,created_at) VALUES($1,$2,$3,$4,$5,$6)")
                 .bind(id).bind(project).bind(session_id).bind(summary).bind(tags).bind(now).execute(&mut *tx).await?;
-            tx.commit().await?;
             id
         }
         Backend::Postgres => {
@@ -2247,7 +2248,7 @@ pub async fn insert_memory(
             .bind(now)
             .bind(summary)
             .bind(tags)
-            .fetch_one(&db.pool)
+            .fetch_one(&mut *tx)
             .await?;
             row.get("id")
         }
@@ -2277,25 +2278,13 @@ pub async fn insert_memory(
         ),
         None => new_evidence_root_id(),
     };
-    if let Err(error) = sqlx::query(
-        "INSERT INTO memory_meta(
-            memory_id, importance, created_at, evidence_root_id, derivation_depth
-         ) VALUES($1, 0.5, $2, $3, 0)",
-    )
-    .bind(memory_id)
-    .bind(now)
-    .bind(&root)
-    .execute(&db.pool)
-    .await
-    {
-        let _ = delete_memory(db, memory_id).await;
-        return Err(error.into());
-    }
-    if let Err(error) = persist_primary_evidence_root(db, memory_id, &root, 0, now).await {
-        let _ = delete_memory(db, memory_id).await;
-        let _ = delete_memory_meta(db, memory_id).await;
-        return Err(error);
-    }
+    sqlx::query(
+        "INSERT INTO memory_meta(memory_id,importance,created_at,evidence_root_id,derivation_depth)
+         VALUES($1,0.5,$2,$3,0)",
+    ).bind(memory_id).bind(now).bind(&root).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO memory_evidence_roots(memory_id,evidence_root_id,role,created_at) VALUES($1,$2,'primary',$3)")
+        .bind(memory_id).bind(&root).bind(now).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(memory_id)
 
     }.await;
@@ -9562,6 +9551,34 @@ mod tests {
         assert!(ledger.iter().any(|e| e.op_type == "remember"));
         assert!(ledger.iter().any(|e| e.op_type == "forget"));
 
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_creation_rolls_back_row_meta_and_identity_on_evidence_failure() -> Result<()> {
+        let (db, path) = test_db().await?;
+        let session = create_session(&db, "atomic").await?;
+        sqlx::query("CREATE TRIGGER fixture_reject_evidence BEFORE INSERT ON memory_evidence_roots BEGIN SELECT RAISE(ABORT,'fixture evidence failure'); END").execute(&db.pool).await?;
+        assert!(
+            insert_memory(&db, "atomic", &session, "must rollback", None)
+                .await
+                .is_err()
+        );
+        for table in ["memories", "memory_meta", "memory_evidence_roots"] {
+            let count: i64 = sqlx::query(&format!("SELECT COUNT(*) AS n FROM {table}"))
+                .fetch_one(&db.pool)
+                .await?
+                .get("n");
+            assert_eq!(count, 0, "partial memory remained in {table}");
+        }
+        sqlx::query("DROP TRIGGER fixture_reject_evidence")
+            .execute(&db.pool)
+            .await?;
+        let id = insert_memory(&db, "atomic", &session, "complete", None).await?;
+        assert!(get_memory_by_id(&db, id).await?.is_some());
+        assert_eq!(memory_evidence_roots(&db, id).await?.len(), 1);
+        db.pool.close().await;
         let _ = std::fs::remove_file(path);
         Ok(())
     }
