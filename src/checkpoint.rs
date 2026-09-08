@@ -74,6 +74,7 @@ const TABLES: &[&str] = &[
     "reflection_proposals",
     "contradiction_sets",
     "contradiction_members",
+    "assertion_events",
 ];
 
 fn filter(table: &str, id: &str) -> String {
@@ -386,9 +387,24 @@ pub async fn load(db: &Database, hash: &str) -> Result<State> {
 }
 fn validate(state: &State) -> Result<()> {
     ensure!(
-        state.tables.len() == TABLES.len() && TABLES.iter().all(|t| state.tables.contains_key(*t)),
+        (state.tables.len() == TABLES.len() || state.tables.len() + 1 == TABLES.len())
+            && TABLES
+                .iter()
+                .filter(|t| **t != crate::assertions::TABLE)
+                .all(|t| state.tables.contains_key(*t))
+            && state.tables.keys().all(|t| TABLES.contains(&t.as_str())),
         "checkpoint table inventory mismatch"
     );
+    if let Some(table) = state.tables.get(crate::assertions::TABLE) {
+        crate::assertions::validate_checkpoint(table)?;
+        ensure!(
+            table
+                .rows
+                .iter()
+                .all(|r| r.get("project").and_then(Value::as_str) == Some(&state.project)),
+            "cross-project assertion"
+        );
+    }
     for table in state.tables.values() {
         for (name, kind) in &table.fields {
             ensure!(
@@ -518,7 +534,7 @@ pub async fn create(
                 let base = load(db, &hash).await?;
                 if parent.state_hash == envelope.state_hash {
                     envelope = parent;
-                } else if parent.depth < 8 {
+                } else if parent.depth < 8 && base.tables.keys().eq(state.tables.keys()) {
                     let delta = difference(&base, &state)?;
                     let candidate = Envelope {
                         version: 5,
@@ -633,12 +649,37 @@ pub async fn restore(
     }
     let current = capture(&mut tx, db, &state.project, false).await?;
     for name in TABLES {
+        if *name == crate::assertions::TABLE && !state.tables.contains_key(*name) {
+            continue;
+        }
         ensure!(
             current.tables[*name].fields == state.tables[*name].fields,
             "checkpoint schema differs for {name}"
         );
     }
     let mut replacement = state.clone();
+    // Restore cannot erase immutable events or rewind an expected-version cursor.
+    // Older v5 checkpoints have no assertion table; preserve the live extension.
+    let live_assertions = &current.tables[crate::assertions::TABLE];
+    let saved = replacement
+        .tables
+        .entry(crate::assertions::TABLE.into())
+        .or_insert_with(|| Table {
+            fields: live_assertions.fields.clone(),
+            rows: vec![],
+        });
+    for live in &live_assertions.rows {
+        if let Some(historical) = saved.rows.iter().find(|r| r["id"] == live["id"]) {
+            ensure!(historical == live, "assertion immutable identity collision");
+        } else {
+            saved.rows.push(live.clone());
+        }
+    }
+    saved
+        .rows
+        .sort_by_cached_key(|r| serde_json::to_string(r).unwrap());
+    crate::assertions::validate_checkpoint(saved)?;
+
     // Never roll authorization backwards when restoring content.
     for row in &mut replacement.tables.get_mut("memory_meta").unwrap().rows {
         if let Some(live) = current.tables["memory_meta"]
@@ -893,14 +934,9 @@ pub async fn restore(
     sqlx::query("INSERT INTO checkpoint_restore_events(id,snapshot_id,project,state_hash,created_at) VALUES($1,$2,$3,$4,$5)")
         .bind(uuid::Uuid::new_v4().to_string()).bind(snapshot_id).bind(&state.project).bind(state_hash(&replacement)?).bind(chrono::Utc::now().timestamp()).execute(&mut *tx).await?;
     tx.commit().await?;
-    // Invalidate generated context after the durable state transition. If removal fails,
-    // report it rather than claiming a stale file is safe. Embeddings are rebuilt on demand.
-    let path = std::path::Path::new(&state.project).join("IRONMEM.md");
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => anyhow::bail!("checkpoint restored, but stale context removal failed: {e}"),
-    }
+    // Only remove files whose registered generated hash still matches. User edits
+    // and unrelated files survive restore; failed removals remain durably queued.
+    crate::hooks::invalidate_generated_files(db).await?;
     Ok(RestoreCounts {
         memories: replacement.tables["memories"].rows.len(),
         edges: replacement.tables["memory_edges"].rows.len(),
@@ -950,6 +986,53 @@ pub async fn import(db: &Database, path: &std::path::Path, dry_run: bool) -> Res
         "export integrity mismatch"
     );
     Ok(restore(db, &state, "import", dry_run).await?.memories)
+}
+
+/// Remove a snapshot root; descendant dependencies continue pinning its blob.
+pub async fn delete(db: &Database, snapshot_id: &str) -> Result<()> {
+    let mut tx = transaction(db).await?;
+    let row = sqlx::query("DELETE FROM brain_snapshots WHERE id=$1 RETURNING blob_hash,project")
+        .bind(snapshot_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("snapshot not found"))?;
+    let hash: String = row.get("blob_hash");
+    let project: Option<String> = row.try_get("project")?;
+    sqlx::query("UPDATE blobs SET refcount=refcount-1 WHERE hash=$1 AND refcount>0")
+        .bind(&hash)
+        .execute(&mut *tx)
+        .await?;
+    if let Some(project) = project {
+        sqlx::query("DELETE FROM checkpoint_heads WHERE project=$1 AND blob_hash=$2")
+            .bind(&project)
+            .bind(&hash)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO checkpoint_heads(project,blob_hash) SELECT project,blob_hash FROM brain_snapshots WHERE project=$1 ORDER BY created_at DESC,id DESC LIMIT 1 ON CONFLICT(project) DO NOTHING").bind(project).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// External index coordination requires an offline rebuild; do not serve stale mirrors.
+pub fn ensure_native_restore(cfg: &crate::config::Config, dry_run: bool) -> Result<()> {
+    ensure!(dry_run || (cfg.storage.vector_backend=="native" && cfg.storage.graph_backend=="native"),"restore with external indexes requires an isolated native database and an external index rebuild before serving it");
+    Ok(())
+}
+
+/// Checkpoints can contain many memories across namespaces; they must not be
+/// released by authorizing a single memory handle or an otherwise-unbound hash.
+pub async fn ensure_source_object(db: &Database, hash: &str) -> Result<()> {
+    let count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM checkpoint_objects WHERE hash=$1")
+        .bind(hash)
+        .fetch_one(&db.pool)
+        .await?
+        .get("n");
+    ensure!(
+        count == 0,
+        "checkpoint content requires explicit snapshot export"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1167,51 +1250,4 @@ mod tests {
         db.pool.close().await;
         Ok(())
     }
-}
-
-/// Remove a snapshot root; descendant dependencies continue pinning its blob.
-pub async fn delete(db: &Database, snapshot_id: &str) -> Result<()> {
-    let mut tx = transaction(db).await?;
-    let row = sqlx::query("DELETE FROM brain_snapshots WHERE id=$1 RETURNING blob_hash,project")
-        .bind(snapshot_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("snapshot not found"))?;
-    let hash: String = row.get("blob_hash");
-    let project: Option<String> = row.try_get("project")?;
-    sqlx::query("UPDATE blobs SET refcount=refcount-1 WHERE hash=$1 AND refcount>0")
-        .bind(&hash)
-        .execute(&mut *tx)
-        .await?;
-    if let Some(project) = project {
-        sqlx::query("DELETE FROM checkpoint_heads WHERE project=$1 AND blob_hash=$2")
-            .bind(&project)
-            .bind(&hash)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("INSERT INTO checkpoint_heads(project,blob_hash) SELECT project,blob_hash FROM brain_snapshots WHERE project=$1 ORDER BY created_at DESC,id DESC LIMIT 1 ON CONFLICT(project) DO NOTHING").bind(project).execute(&mut *tx).await?;
-    }
-    tx.commit().await?;
-    Ok(())
-}
-
-/// External index coordination requires an offline rebuild; do not serve stale mirrors.
-pub fn ensure_native_restore(cfg: &crate::config::Config, dry_run: bool) -> Result<()> {
-    ensure!(dry_run || (cfg.storage.vector_backend=="native" && cfg.storage.graph_backend=="native"),"restore with external indexes requires an isolated native database and an external index rebuild before serving it");
-    Ok(())
-}
-
-/// Checkpoints can contain many memories across namespaces; they must not be
-/// released by authorizing a single memory handle or an otherwise-unbound hash.
-pub async fn ensure_source_object(db: &Database, hash: &str) -> Result<()> {
-    let count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM checkpoint_objects WHERE hash=$1")
-        .bind(hash)
-        .fetch_one(&db.pool)
-        .await?
-        .get("n");
-    ensure!(
-        count == 0,
-        "checkpoint content requires explicit snapshot export"
-    );
-    Ok(())
 }

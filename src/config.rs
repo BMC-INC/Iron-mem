@@ -23,6 +23,10 @@ pub struct Config {
     #[serde(default = "default_vertex_location")]
     pub vertex_location: String,
     pub inject_limit: usize,
+    #[serde(default)]
+    pub working_set: crate::working_set::Config,
+    #[serde(default)]
+    pub assertions: crate::assertions::Config,
     pub max_observation_bytes: usize,
     pub db_path: String,
     #[serde(default)]
@@ -809,6 +813,8 @@ impl Default for Config {
             vertex_project: None,
             vertex_location: default_vertex_location(),
             inject_limit: 5,
+            working_set: crate::working_set::Config::default(),
+            assertions: crate::assertions::Config::default(),
             max_observation_bytes: 2048,
             db_path: ironmem_dir().join("mem.db").to_string_lossy().to_string(),
             database_url: None,
@@ -889,7 +895,7 @@ impl Config {
         std::env::var("DATABASE_URL")
             .ok()
             .or_else(|| self.database_url.clone())
-            .unwrap_or_else(|| format!("sqlite://{}?mode=rwc", self.db_path))
+            .unwrap_or_else(|| crate::db::sqlite_file_url(std::path::Path::new(&self.db_path)))
     }
 
     pub fn effective_mcp_transport(&self) -> String {
@@ -956,6 +962,7 @@ pub fn load() -> Result<Config> {
         serde_json::from_str(&raw)?
     };
     config.apply_influence_runtime()?;
+    config.working_set.validate()?;
     Ok(config)
 }
 
@@ -965,6 +972,22 @@ pub fn save(config: &Config) -> Result<()> {
     let json = serde_json::to_string_pretty(config)?;
     std::fs::write(settings_path(), json)?;
     Ok(())
+}
+
+/// Opt-in physical format. Disabling writes never disables the chunked reader.
+pub fn ccr_chunk_threshold() -> Result<Option<usize>> {
+    let Some(value) = std::env::var_os("IRONMEM_CCR_CHUNK_THRESHOLD_BYTES") else {
+        return Ok(None);
+    };
+    let threshold: usize = value
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid CCR threshold encoding"))?
+        .parse()?;
+    anyhow::ensure!(
+        (128 * 1024..=512 * 1024 * 1024).contains(&threshold),
+        "CCR threshold must be between 128 KiB and 512 MiB"
+    );
+    Ok(Some(threshold))
 }
 
 #[cfg(test)]
@@ -978,6 +1001,32 @@ mod tests {
         "max_observation_bytes": 2048,
         "db_path": "/tmp/mem.db"
     }"#;
+
+    #[test]
+    fn configured_database_paths_use_portable_sqlite_urls() {
+        assert!(
+            std::env::var_os("DATABASE_URL").is_none(),
+            "isolated configuration test requires DATABASE_URL unset"
+        );
+        let mut cfg = Config {
+            db_path: r"C:\Users\runner\memory.db".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.effective_database_url(),
+            "sqlite:///C:/Users/runner/memory.db?mode=rwc"
+        );
+        cfg.db_path = "/tmp/memory.db".into();
+        assert_eq!(
+            cfg.effective_database_url(),
+            "sqlite:///tmp/memory.db?mode=rwc"
+        );
+        cfg.database_url = Some("postgres://example.invalid/memory".into());
+        assert_eq!(
+            cfg.effective_database_url(),
+            "postgres://example.invalid/memory"
+        );
+    }
 
     #[test]
     fn missing_embedding_key_yields_defaults() {
@@ -1075,20 +1124,4 @@ mod tests {
         assert!(cfg.influence.require_trusted_attestation);
         assert!(cfg.influence.fail_closed_on_policy_error);
     }
-}
-
-/// Opt-in physical format. Disabling writes never disables the chunked reader.
-pub fn ccr_chunk_threshold() -> Result<Option<usize>> {
-    let Some(value) = std::env::var_os("IRONMEM_CCR_CHUNK_THRESHOLD_BYTES") else {
-        return Ok(None);
-    };
-    let threshold: usize = value
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("invalid CCR threshold encoding"))?
-        .parse()?;
-    anyhow::ensure!(
-        (128 * 1024..=512 * 1024 * 1024).contains(&threshold),
-        "CCR threshold must be between 128 KiB and 512 MiB"
-    );
-    Ok(Some(threshold))
 }

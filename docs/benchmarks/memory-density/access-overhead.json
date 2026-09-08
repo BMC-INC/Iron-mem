@@ -1,0 +1,12 @@
+{
+  "backend": "sqlite",
+  "cache": "warm process, uncontrolled OS cache",
+  "p50_us": 1560,
+  "p95_us": 2335,
+  "profile": "debug without debug symbols",
+  "samples": 100,
+  "schema_version": 1,
+  "scored_accuracy": null,
+  "source_sha256": "e0a7b177c96dca89ea66897ab98a175e5ff35c4dfe168f29b1ed1f6b2344e065",
+  "workload": "one memory, 120 sequential aggregate writes, discard first 20"
+}

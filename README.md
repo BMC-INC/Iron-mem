@@ -45,11 +45,44 @@
 
 <!-- SEO Keywords: AI coding assistant memory, session-aware AI tools, Rust AI tools, context preservation, Claude Code memory, Cursor context -->
 
+## Memory density, recovery, and temporal history
+
+The storage and context upgrades preserve existing memory IDs, exact originals, and governance controls:
+
+- **Bounded, actionable context:** digests fit 2,000 bytes; serialized summaries fit 4,000 bytes; generated context fits 24,000 bytes including metadata and omission notices. Renderer-owned IDs and available original-retrieval handles survive truncation. Escaped memory data cannot alter document structure. This formatting is not a model prompt-injection guarantee. CLI/MCP reports and injection history count entries actually written after atomic replacement.
+- **Memory Density Frontier:** reproducible synthetic storage measurements and seven context budgets (2/4/8/16/24/48/96 decimal KB), plus a full-context baseline. Manifests distinguish logical bytes, unique physical payload, overhead, latency and total delivered exposure. Unscored accuracy stays null; benchmark budgets above 24 KB do not raise the production ceiling.
+- **Verified CCR deduplication:** optional content-defined chunks share near-duplicate large sources while preserving the original SHA-256 address. Every reconstructed source is verified. Legacy readers, resumable conversion with dry-run, ownership-aware garbage collection and snapshot dependency retention remain available. Chunked writes stay opt-in because synthetic storage savings carried a latency cost.
+- **Complete atomic snapshots:** project checkpoints retain authoritative metadata, governance, evidence, graph/chunk state, sessions, observations and portable exact sources. Verified incremental row differences reuse unchanged state and bound replay chains. Export creates an independent recoverable checkpoint. Restore preserves current revocations, stable handles and immutable assertion history; it rebuilds derived indexes and invalidates registered generated context without removing user edits.
+- **Access telemetry and working sets:** successful recall, expansion and injection are measured separately. `ironmem access-stats MEMORY_ID` exposes observation windows, counters and temperature. Optional generic/coding/planning/debug working sets use relevance and authorization before temperature, under the same 24,000-byte ceiling. Cold memories remain searchable. Project restore starts a fresh operational telemetry window.
+- **Measured metadata interning:** a reproducible synthetic profiler compares net database size and join cost. No production schema conversion is enabled without representative evidence of material savings.
+- **Structured temporal assertions:** opt-in immutable claims distinguish valid time from recorded time, detect concurrent updates, preserve explicit supersession/retraction and abstain on conflicts. Current/as-of/history queries are available through CLI, REST and MCP, with current evidence restrictions enforced. Full/delta snapshots preserve their ordered event history. Existing prose search remains compatible.
+
+Working-set selection, chunked writes and structured assertion APIs are opt-in. Metadata interning remains gated by representative measurements; existing context limits and governed retrieval remain the baseline. No new model-based accuracy or production latency improvement is claimed. See [storage and benchmark methodology](docs/benchmarks/memory-density/README.md), [telemetry and working sets](docs/benchmarks/memory-density/ACCESS-WORKING-SETS.md), and [temporal assertion semantics and API](docs/architecture/temporal-assertions.md).
+
+```bash
+ironmem density --out /new/path/density-results
+ironmem snapshot create --project /workspace/example --incremental
+ironmem snapshot export SNAPSHOT_ID /new/path/checkpoint.json
+ironmem snapshot import /path/checkpoint.json --dry-run
+ironmem access-stats MEMORY_ID --namespace local
+```
+
+To opt in, merge the desired fields into your local settings (do not replace the full file):
+
+```json
+{
+  "working_set": {"enabled": true, "profile": "coding", "budget_bytes": 24000},
+  "assertions": {"enabled": true}
+}
+```
+
+Chunked writes use `IRONMEM_CCR_CHUNK_THRESHOLD_BYTES`, from 131072 through 536870912 bytes. Disabling chunked writes still allows reading existing chunked sources. New storage formats require a verified pre-upgrade backup for rollback to older binaries. Keep local memory databases, generated `IRONMEM.md`, source archives and private benchmark corpora out of public commits.
+
 ## Current v0.4.0 capabilities
 
 > IronMem is now a full durable memory stack: reversible originals, typed memories,
 > temporal graph recall, source-backed retrieval, adaptive skim/expand context,
-> sleep-cycle compression, governed influence controls, and 25 MCP tools.
+> sleep-cycle compression, governed influence controls, and 26 MCP tools.
 
 - **CCR - losslessly reversible memory** (Headroom pattern) - every truncated tool
   output and the verbatim pre-LLM session transcript is preserved in a
@@ -117,7 +150,7 @@
   **`refresh_profile`**.
 - **Correction miner** - error→fix loops are mined into `error_solution` memories
   and surfaced via **`list_corrections`**, so past fixes resurface when work recurs.
-- **25 MCP tools** now - including `memory_skim`, `retrieve_original`, `remember`,
+- **26 MCP tools** now - including `memory_skim`, `retrieve_original`, `remember`,
   `get_memory_influence`, `set_memory_influence`, `manage_contradiction`,
   `get_profile`, `list_corrections`, `memory_graph`, and `dream_memory`.
 - **Temporal recall + graph recall** - dated facts and `event_time` metadata power timestamp lookup, while `memory_edges` stores structured `source | relation | target` edges with valid-time filters and provenance. Temporal questions route toward date-bearing facts; relationship questions route toward graph edges.
@@ -489,7 +522,9 @@ ironmem contradiction show <set-id> # Inspect every preserved competing claim
 ironmem feedback <memory-id> --signal used --weight 1 # Reinforce or decay a memory
 ironmem reflect --dry-run # Propose durable-memory consolidation
 ironmem code-relink --dry-run # Tree-sitter Rust AST anchoring/relinking
-ironmem snapshot create --label before-refactor # CCR-backed project brain snapshot
+ironmem snapshot create --label before-refactor # Complete project checkpoint
+ironmem snapshot create --incremental # Verified delta when smaller
+ironmem assertion '{"op":"query","scope":{"namespace":"local","project":"/workspace/example","subject":"toolchain:rust","predicate":"version"}}' # Requires opt-in
 ironmem sync publish --node ci --op error_solution --payload '{"memory_id":1}' # Multi-agent event log
 ironmem eval                # Run deterministic memory-quality evals into docs/evals
 ironmem bench longmemeval --data longmemeval_s.json # LongMemEval harness (--full-context baseline, --dry-run keyless smoke)
@@ -780,7 +815,7 @@ ironmem serve
 
 ## MCP Tools
 
-IronMem currently exposes **25 MCP tools**:
+IronMem currently exposes **26 MCP tools**:
 
 | Tool | Purpose |
 | ---- | ------- |
@@ -799,6 +834,7 @@ IronMem currently exposes **25 MCP tools**:
 | `list_sessions` | List session history for a project |
 | `inject_context` | Write `IRONMEM.md` into a project root |
 | `remember` | Store an explicit typed/scoped memory |
+| `memory_assertion` | Append or query opt-in structured claims with temporal history and conflict checks |
 | `get_memory_influence` | Read a memory's effective versioned influence policy |
 | `set_memory_influence` | Apply a version-checked policy update with an atomic ledger receipt |
 | `manage_contradiction` | Create, inspect, prefer, resolve, or obsolete a preserved competing-claim set |
@@ -892,6 +928,7 @@ The REST server runs on `http://localhost:37778` by default. Current high-signal
 | `GET /memory/{id}/lineage` | Memory→action lineage: writer, governance, ledger trail, every injection with session/rank/query |
 | `GET /compliance/report` | EU AI Act Art. 12/13 report: hash-chain verification per namespace, governance inventory, snapshots |
 | `POST /feedback` | Reinforce or decay a memory's ranking |
+| `POST /assertions` | Opt-in structured assertion writes and current/as-of/history queries |
 | `GET /snapshots` / `POST /snapshots` | List or create CCR-backed brain snapshots |
 | `GET /status` | Health, DB stats, CCR stats, governance op timings, and retrieval tier metrics |
 
@@ -1242,29 +1279,20 @@ IronMem still honors per-provider environment variables if you prefer them:
 
 ## Testing Status
 
-Current local verification for this README state:
+The integrated memory-density upgrade pass uses:
 
 ```bash
-cargo test --bin ironmem
-cargo test --test mcp_stdio_clean
-cargo clippy --bin ironmem --features local-onnx -- -D warnings
+cargo build
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo run --quiet -- eval --out target/eval-reports
+# Supply an isolated IRONMEM_TEST_POSTGRES_URL for these opt-in tests:
+cargo test --bin ironmem -- postgres_foundations access_postgres assertions_postgres --ignored --test-threads=1
 ```
 
-Result:
+The local comprehensive pass covered **310 unit tests**; the subsequent Windows path regression brings the final inventory to **311 unit tests**, alongside **1 MCP stdio integration test**, **3 PostgreSQL integration tests**, and **72/72 deterministic evaluation cases**. Both LongMemEval and LoCoMo smoke suites exercise seven byte budgets plus a full-context baseline without model calls. The optional dictionary timing benchmark is separate from correctness validation. Default-feature build, all-target Clippy and formatting are checked; this batch does not retest optional ONNX/GPU backends.
 
-- **276 unit tests passed** (including the deterministic retrieval, governance,
-  and governed-influence evaluation gates)
-- **1 MCP stdio integration test passed**
-- **1 benchmark intentionally ignored** (`bench_ccr_dict_vs_floor`)
-- **0 failed**
-- **Clippy clean with `local-onnx` enabled and `-D warnings`**
-
-Coverage includes CCR round trips and corruption checks, offline fact/procedure
-extraction and idempotent recovery, typed/scoped memories, semantic and temporal
-retrieval, graph reconciliation, chunk skim/expand, sweep behavior, MCP and REST
-surfaces, policy concurrency, purpose/confirmation replay protection,
-contradiction resolution, shared egress enforcement, Workbench simulation,
-snapshot round trips, vector backfill/purge, and provider fallback.
+Coverage includes exact byte limits, adversarial context data, verified source reconstruction and GC, atomic/full/incremental snapshots, independent recovery, delivery telemetry, generated-file invalidation, working-set budgets, scoped temporal assertions, concurrent writes, evidence restrictions, and all existing retrieval/governance regressions. See [final validation evidence and remaining measurement gates](docs/benchmarks/memory-density/FINAL-VALIDATION.md). Local results and remote CI are recorded separately; neither changes the installed service.
 
 ---
 

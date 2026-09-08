@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "fixture": "50 deterministic summaries and authoritative metadata; one update; no source blobs",
+  "code_sha": "0c66eacd17a474dd03a59e280420676765ec2b69",
+  "binary_sha256": "6f67a7c06b2c1718adb46b16286d054b1f70d63c10dac2177770b417b894a68c",
+  "working_tree_dirty": true,
+  "script_sha256": "465f6606e33e34d9ff642d646d4bbc91f60a75de6ad74790357e0760da625f72",
+  "timing_scope": "CLI startup, migration and operation wall time; debug binary; OS cache and concurrent machine load uncontrolled",
+  "full": {
+    "id": "snap-553dbd8e-54b4-47eb-b163-01ea0457c783",
+    "hash": "5d3c4951e144fc684b41e72e99be7447bfa2661c11f645cc0f4bacedeabd7a85",
+    "serialized_bytes": 180005,
+    "stored_bytes": 2254,
+    "cli_wall_ms": 442.0233990003908,
+    "restore_cli_wall_ms": 616.094589999193
+  },
+  "unchanged": {
+    "id": "snap-65c8ff5f-4b4a-4311-b48e-c03bb230d47f",
+    "hash": "5d3c4951e144fc684b41e72e99be7447bfa2661c11f645cc0f4bacedeabd7a85",
+    "serialized_bytes": 180005,
+    "stored_bytes": 2254,
+    "cli_wall_ms": 548.4763259992178
+  },
+  "delta": {
+    "id": "snap-726498a4-acf3-4308-a1d0-7f8aac9eb0bb",
+    "hash": "a8d3a24ebd1ff34966c76956430dfa449b048c39ab4f8cc24cb3e223066daff1",
+    "serialized_bytes": 4081,
+    "stored_bytes": 558,
+    "cli_wall_ms": 454.230691999328,
+    "restore_cli_wall_ms": 634.603728998627
+  },
+  "export_bytes": 177375,
+  "roundtrip_verified": true
+}

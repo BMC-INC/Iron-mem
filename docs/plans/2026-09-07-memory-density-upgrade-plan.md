@@ -1,6 +1,6 @@
 # IronMem memory density and storage upgrade plan
 
-Status: Phase A merged in PR #45. Phases B–D implemented in the storage-foundations batch, with final validation recorded in `docs/benchmarks/memory-density/`. Task 11 uses complete transactional row-set differences rather than an incomplete mutation journal; see the implementation methodology. Phases E–G remain pending.
+Status: A merged in PR #45; B–D merged in PR #46. E implements delivery telemetry and opt-in working sets. F profiling completed without a justified production interning migration. G implements opt-in immutable assertion events, governed temporal queries, and snapshot integration. Final integrated validation and explicit plan adjustments are recorded in `docs/benchmarks/memory-density/FINAL-VALIDATION.md`. Scored model evaluation and representative-data rollout gates remain separate; no production defaults or installed runtime were changed.
 Prepared: 2026-09-07.
 
 ## Verified starting point
@@ -265,7 +265,7 @@ Verification: temporal/update/abstention benchmark categories, snapshot round-tr
 
 For each slice, run focused tests first, such as `cargo test --bin ironmem hooks::tests`, `cargo test --bin ironmem compress::tests`, `cargo test --bin ironmem ccr::tests`, or `cargo test --bin ironmem snapshot::tests`. New filters must match real tests; zero matched tests is not evidence.
 
-At phase integration boundaries, use the existing CI commands: `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, and `cargo run --quiet -- eval --out target/eval-reports`. Schema/storage phases also need actual PostgreSQL integration coverage; passing default SQLite tests does not prove portability. Keep optional ONNX/GPU checks limited to changes affecting those paths. Existing CI covers three operating systems; verify atomic file replacement on each.
+User update (2026-09-07): for the E/F batch, run only focused tests for additions and affected contracts. Defer this comprehensive integration command set until the remaining work through G is complete; do not trigger full CI prematurely. At that final boundary, use the existing CI commands: `cargo build`, `cargo test`, `cargo clippy -- -D warnings`, and `cargo run --quiet -- eval --out target/eval-reports`. Schema/storage phases also need actual PostgreSQL integration coverage; passing default SQLite tests does not prove portability. Keep optional ONNX/GPU checks limited to changes affecting those paths. Existing CI covers three operating systems; verify atomic file replacement on each.
 
 Each implementation PR should contain its own fixtures, migration/rollback notes and relevant benchmark artifacts. Avoid bundling schema rewrites with unrelated work. Release proof distinguishes local tests, remote SHA/checks, merged state, installed binary and live runtime. A merge is not proof that the local memory service was upgraded.
 
@@ -280,4 +280,4 @@ Before the first production schema migration, obtain a consistent recoverable ba
 - Which metadata families merit interning.
 - Whether semantic deltas outperform independent assertions enough to enable publicly.
 
-These do not block Phase A or local benchmark tooling. Immediate next implementation: Tasks 1–2 on PR #45, followed by context hardening and the density baseline.
+These do not block Phase A or local benchmark tooling. The implementation sequence is complete with experimental features disabled by default and the interning migration gate intentionally untriggered. E/F methodology is in `docs/benchmarks/memory-density/ACCESS-WORKING-SETS.md`; G semantics are in `docs/architecture/temporal-assertions.md`. The final validation report distinguishes completed deterministic checks from unrun paid/scored and representative-workload evaluations.

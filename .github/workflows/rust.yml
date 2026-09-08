@@ -89,4 +89,4 @@ jobs:
       - name: PostgreSQL storage and checkpoint integration
         env:
           IRONMEM_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/ironmem_test
-        run: cargo test --bin ironmem postgres_foundations -- --ignored
+        run: cargo test --bin ironmem -- postgres_foundations access_postgres assertions_postgres --ignored --test-threads=1

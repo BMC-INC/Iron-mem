@@ -64,7 +64,9 @@ def main():
         result = {'schema':1, 'fixture':'50 deterministic summaries and authoritative metadata; one update; no source blobs',
                   'code_sha':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
                   'binary_sha256':hashlib.sha256(args.binary.read_bytes()).hexdigest(),
-                  'timing_scope':'CLI startup, migration and operation wall time; debug binary; no concurrent task build/test job',
+                  'working_tree_dirty':bool(subprocess.check_output(['git','status','--porcelain','--untracked-files=no'],text=True).strip()),
+                  'script_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                  'timing_scope':'CLI startup, migration and operation wall time; debug binary; OS cache and concurrent machine load uncontrolled',
                   'full':full,'unchanged':unchanged,'delta':delta,'export_bytes':backup.stat().st_size,'roundtrip_verified':True}
         (args.out/'checkpoints.json').write_text(json.dumps(result,indent=2)+'\n')
         db.close()
