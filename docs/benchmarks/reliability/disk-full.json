@@ -1,0 +1,18 @@
+{
+  "enospc_observed": true,
+  "filler_bytes": 32178176,
+  "failed_write_preserved_memory": true,
+  "write_after_reclaim": true,
+  "provenance": {
+    "binary_sha256": "aec12e23dc73202c3388f17266fa513376109d87b20d8f4e0beb5dd7fa702901",
+    "platform": "macOS-26.6.2-x86_64-i386-64bit-Mach-O",
+    "machine": "x86_64",
+    "processor": "i386",
+    "python": "3.14.6",
+    "cpu_count": 16,
+    "timing_clock": "perf_counter",
+    "machine_load": "uncontrolled; arms run serially on the same host"
+  },
+  "build_profile": "release",
+  "method": "32 MiB disposable HFS+ disk image on macOS; actual ENOSPC, failed CLI remember, integrity check, recovery write; image unmounted and removed after this run."
+}

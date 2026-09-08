@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use crate::provider::Provider;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
+    #[serde(skip)]
+    pub settings_file: Option<PathBuf>,
     pub port: u16,
     #[serde(default)]
     pub provider: Provider,
@@ -806,6 +809,7 @@ impl Default for Config {
     fn default() -> Self {
         let provider = Provider::default();
         Self {
+            settings_file: None,
             port: 37778,
             provider,
             model: provider.default_model().to_string(),
@@ -966,11 +970,26 @@ pub fn load() -> Result<Config> {
     Ok(config)
 }
 
+/// Explicit configuration never creates or reads the user's default settings.
+pub fn load_from(path: &std::path::Path) -> Result<Config> {
+    let mut config: Config = serde_json::from_slice(&std::fs::read(path)?)?;
+    config.settings_file = Some(path.canonicalize()?);
+    config.apply_influence_runtime()?;
+    config.working_set.validate()?;
+    Ok(config)
+}
+
 pub fn save(config: &Config) -> Result<()> {
-    let dir = ironmem_dir();
-    std::fs::create_dir_all(&dir)?;
-    let json = serde_json::to_string_pretty(config)?;
-    std::fs::write(settings_path(), json)?;
+    use std::io::Write;
+    let path = config.settings_file.clone().unwrap_or_else(settings_path);
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("settings path has no parent"))?;
+    std::fs::create_dir_all(dir)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(dir)?;
+    temporary.write_all(serde_json::to_string_pretty(config)?.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path)?;
     Ok(())
 }
 
@@ -1001,6 +1020,20 @@ mod tests {
         "max_observation_bytes": 2048,
         "db_path": "/tmp/mem.db"
     }"#;
+
+    #[test]
+    fn explicit_config_saves_only_to_selected_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"port":39999}"#).unwrap();
+        let mut cfg = load_from(&path).unwrap();
+        cfg.port = 39998;
+        save(&cfg).unwrap();
+        assert_eq!(load_from(&path).unwrap().port, 39998);
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("settings_file"));
+    }
 
     #[test]
     fn configured_database_paths_use_portable_sqlite_urls() {

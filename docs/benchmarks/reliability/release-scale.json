@@ -1,0 +1,130 @@
+{
+  "build_profile_operator_declared": "release",
+  "faults": {
+    "concurrent_cli_writers": {
+      "committed_memories": 12,
+      "unique_ids": true,
+      "writers": 4
+    },
+    "corrupted_checkpoint": "refused before destructive restore; original memory count preserved",
+    "process_exit_before_commit": "rollback verified",
+    "repeated_full_delta_recovery": {
+      "cycles": 2,
+      "wall_seconds": 0.5805337499987218
+    },
+    "sqlite_page_exhaustion": "SQLITE_FULL rollback verified; not a host filesystem exhaustion test"
+  },
+  "limitations": [
+    "Synthetic ~1KB summaries; no model or external backend calls.",
+    "CLI startup/migration/diagnostics included; first and warm samples reported separately.",
+    "SQLite page exhaustion is not physical disk exhaustion. Bounded cycles are not months of production evidence."
+  ],
+  "physical_disk_full": {
+    "tested": false
+  },
+  "provenance": {
+    "binary_sha256": "aec12e23dc73202c3388f17266fa513376109d87b20d8f4e0beb5dd7fa702901",
+    "cpu_count": 16,
+    "machine": "x86_64",
+    "machine_load": "uncontrolled; arms run serially on the same host",
+    "platform": "macOS-26.6.2-x86_64-i386-64bit-Mach-O",
+    "processor": "i386",
+    "python": "3.14.6",
+    "timing_clock": "perf_counter"
+  },
+  "runner_sha256": "6c01c52f0f03838f43e859b4a79bab4e8baaf37fc0de5e9e1b02a30d7315389c",
+  "scale": [
+    {
+      "checkpoint_cli_ms": 78.80161499997484,
+      "db_and_wal_bytes": 704512,
+      "first_cli_ms": 48.109221999766305,
+      "memories": 100,
+      "p50_ms": 46.48277249907551,
+      "p95_ms": 48.111813001014525,
+      "warm_cli_ms": [
+        48.111813001014525,
+        47.80731199934962,
+        45.588122000481235,
+        46.16294999868842,
+        46.20320199683192,
+        47.32742899795994,
+        46.7801890008559,
+        46.52500999873155,
+        46.57697199945687,
+        45.67388500072411,
+        46.76487000324414,
+        46.08117099996889,
+        46.44053499941947,
+        46.62865900172619,
+        47.45780299708713,
+        47.97809799856623,
+        45.56820500147296,
+        46.09861099743284,
+        45.57412099893554,
+        46.399604998441646
+      ]
+    },
+    {
+      "checkpoint_cli_ms": 526.3329379995412,
+      "db_and_wal_bytes": 2457600,
+      "first_cli_ms": 57.59126400153036,
+      "memories": 1000,
+      "p50_ms": 56.16192950037657,
+      "p95_ms": 60.28036600037012,
+      "warm_cli_ms": [
+        58.63734499871498,
+        55.131471999629866,
+        55.39050099832821,
+        60.28036600037012,
+        58.339513998362236,
+        56.382695998763666,
+        56.98764699991443,
+        56.06001200067112,
+        55.9528580015467,
+        58.34434099961072,
+        55.71747900103219,
+        56.82283500209451,
+        56.01470400142716,
+        56.44100700010313,
+        55.414203998225275,
+        56.92085400005453,
+        56.26384700008202,
+        55.283369998505805,
+        55.747468999470584,
+        54.90500800078735
+      ]
+    },
+    {
+      "checkpoint_cli_ms": 5408.482317998278,
+      "db_and_wal_bytes": 19685376,
+      "first_cli_ms": 157.1369470002537,
+      "memories": 10000,
+      "p50_ms": 153.12519849976525,
+      "p95_ms": 161.65304199967068,
+      "warm_cli_ms": [
+        157.020143000409,
+        153.1478500000958,
+        153.979464997974,
+        151.28322999953525,
+        152.88114999930258,
+        151.37822999895434,
+        151.08566799972323,
+        161.65304199967068,
+        152.02482799941208,
+        151.13650399871403,
+        151.46423499754746,
+        153.2537399980356,
+        152.5446820014622,
+        155.95527200275683,
+        154.06883299874607,
+        152.8527660011605,
+        160.2697660018748,
+        153.1025469994347,
+        153.8591720018303,
+        160.29792300105328
+      ]
+    }
+  ],
+  "schema": 1,
+  "concurrent_workload": "No task-owned compiler, model inference or other test workload during this measurement. OS cache and unrelated host load remain uncontrolled."
+}

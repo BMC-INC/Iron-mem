@@ -45,6 +45,18 @@
 
 <!-- SEO Keywords: AI coding assistant memory, session-aware AI tools, Rust AI tools, context preservation, Claude Code memory, Cursor context -->
 
+## Coding evidence, diagnostics, and reliable upgrades
+
+- **Explain memory behavior:** `ironmem diagnose '<JSON>'`, REST `POST /diagnostics`, and MCP `memory_diagnose` share lexical candidate positions, real policy decisions, source availability, lineage metadata, access/temperature and generated-context freshness. Remote inspection requires `diagnostics:read`; content is opt-in and passes the existing gate. This is a fresh lexical preview, not a fabricated explanation of past or semantic ranking.
+- **Executable coding evidence:** paired no-memory, bounded full-history and IronMem arms run isolated Python tasks covering architectural decisions, corrected assumptions, retry regressions and helper reuse. The included local Ollama adapter refuses cloud models and pins model digests. Harness checks are distinguished from scored model runs; no vendor superiority is inferred from four synthetic tasks.
+- **Recovery and scale:** a bounded runner checks interrupted writes, page exhaustion, concurrent CLI writers, corrupted checkpoints and repeated full/delta restoration. It supports a separate disposable filesystem for real ENOSPC testing and records release-build latency and database/WAL size at increasing corpus sizes. The concurrency workload found and fixed a partial memory-publication race.
+- **Explicit retention:** an offline SQLite inventory identifies active memory, immutable assertions, audit, sources and snapshots. Whole-store purge requires a reviewed content-bound plan, refuses current legal holds and active locks, and reports external copies it cannot erase. Normal `forget` is not advertised as complete physical erasure.
+- **Safer installation and upgrades:** settings and unrelated hooks are preserved, identical reinstalls create no duplicates, changed installations retain previous files and a verified SQLite backup, and local extraction needs no API key. `--config PATH` isolates trial settings. A newcomer rehearsal verifies real MCP transport, save/search, export/import and recovery.
+
+The [integrated validation](docs/benchmarks/reliability/VALIDATION.md) includes 316 passing unit tests, 200 recovery cycles, release scale measurements, and a local-model canary that **did not establish a coding-accuracy advantage**. Failures are retained alongside successful checks.
+
+See [coding and reliability methodology](docs/benchmarks/reliability/README.md), [diagnostics and retention](docs/architecture/diagnostics-and-retention.md), and [installation and recovery](docs/installation-and-recovery.md). These tools do not change the installed runtime or turn experimental features on automatically.
+
 ## Memory density, recovery, and temporal history
 
 The storage and context upgrades preserve existing memory IDs, exact originals, and governance controls:
@@ -82,7 +94,7 @@ Chunked writes use `IRONMEM_CCR_CHUNK_THRESHOLD_BYTES`, from 131072 through 5368
 
 > IronMem is now a full durable memory stack: reversible originals, typed memories,
 > temporal graph recall, source-backed retrieval, adaptive skim/expand context,
-> sleep-cycle compression, governed influence controls, and 26 MCP tools.
+> sleep-cycle compression, governed influence controls, and 27 MCP tools.
 
 - **CCR - losslessly reversible memory** (Headroom pattern) - every truncated tool
   output and the verbatim pre-LLM session transcript is preserved in a
@@ -150,7 +162,7 @@ Chunked writes use `IRONMEM_CCR_CHUNK_THRESHOLD_BYTES`, from 131072 through 5368
   **`refresh_profile`**.
 - **Correction miner** - error→fix loops are mined into `error_solution` memories
   and surfaced via **`list_corrections`**, so past fixes resurface when work recurs.
-- **26 MCP tools** now - including `memory_skim`, `retrieve_original`, `remember`,
+- **27 MCP tools** now - including `memory_skim`, `retrieve_original`, `remember`,
   `get_memory_influence`, `set_memory_influence`, `manage_contradiction`,
   `get_profile`, `list_corrections`, `memory_graph`, and `dream_memory`.
 - **Temporal recall + graph recall** - dated facts and `event_time` metadata power timestamp lookup, while `memory_edges` stores structured `source | relation | target` edges with valid-time filters and provenance. Temporal questions route toward date-bearing facts; relationship questions route toward graph edges.
@@ -815,7 +827,7 @@ ironmem serve
 
 ## MCP Tools
 
-IronMem currently exposes **26 MCP tools**:
+IronMem currently exposes **27 MCP tools**:
 
 | Tool | Purpose |
 | ---- | ------- |
@@ -834,6 +846,7 @@ IronMem currently exposes **26 MCP tools**:
 | `list_sessions` | List session history for a project |
 | `inject_context` | Write `IRONMEM.md` into a project root |
 | `remember` | Store an explicit typed/scoped memory |
+| `memory_diagnose` | Explain lexical candidates, policy, sources, access and context freshness; content is opt-in |
 | `memory_assertion` | Append or query opt-in structured claims with temporal history and conflict checks |
 | `get_memory_influence` | Read a memory's effective versioned influence policy |
 | `set_memory_influence` | Apply a version-checked policy update with an atomic ledger receipt |
@@ -928,6 +941,7 @@ The REST server runs on `http://localhost:37778` by default. Current high-signal
 | `GET /memory/{id}/lineage` | Memory→action lineage: writer, governance, ledger trail, every injection with session/rank/query |
 | `GET /compliance/report` | EU AI Act Art. 12/13 report: hash-chain verification per namespace, governance inventory, snapshots |
 | `POST /feedback` | Reinforce or decay a memory's ranking |
+| `POST /diagnostics` | Capability-scoped memory explanation with optional governed content |
 | `POST /assertions` | Opt-in structured assertion writes and current/as-of/history queries |
 | `GET /snapshots` / `POST /snapshots` | List or create CCR-backed brain snapshots |
 | `GET /status` | Health, DB stats, CCR stats, governance op timings, and retrieval tier metrics |

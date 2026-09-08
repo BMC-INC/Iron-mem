@@ -39,6 +39,10 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Build
         run: cargo build --verbose
 
@@ -57,8 +61,17 @@ jobs:
           python3 scripts/run_memory_density.py --suite longmemeval --data tests/fixtures/density/longmemeval.json --out "${{ runner.temp }}/density-lme"
           python3 scripts/run_memory_density.py --suite locomo --data tests/fixtures/density/locomo.json --out "${{ runner.temp }}/density-locomo"
 
+      - name: Installation, retention and MCP newcomer rehearsal
+        run: python scripts/test_reliability_tools.py
+
+      - name: Coding and recovery fixture gates (no model calls)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          python3 scripts/benchmark_coding.py --binary target/debug/ironmem --budgets 2000 --out "${{ runner.temp }}/coding-harness.json"
+          python3 scripts/benchmark_reliability.py --binary target/debug/ironmem --sizes 20 --samples 2 --cycles 2 --build-profile debug --out "${{ runner.temp }}/recovery-harness.json"
+
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
   postgres-foundations:
     runs-on: ubuntu-latest
