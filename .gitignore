@@ -29,3 +29,9 @@ node_modules/
 *.sqlite3-wal
 *.sqlite3-shm
 /data/
+
+# Private agent state and local handoffs must stay out of public source.
+IRONMEM.md
+HANDOFF*.md
+*_HANDOFF*.md
+.DS_Store
