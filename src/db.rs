@@ -2472,7 +2472,7 @@ pub async fn search_all_memories_in_namespace(
                AND COALESCE(mm.namespace, 'local') = $2
                AND mm.tombstoned_at IS NULL
                AND (mm.expires_at IS NULL OR mm.expires_at > $3)
-             ORDER BY memories.created_at DESC LIMIT $4"
+             ORDER BY bm25(memories), memories.created_at DESC, memories.rowid DESC LIMIT $4"
         }
         Backend::Postgres => {
             "SELECT m.id, m.project, m.session_id, m.summary, m.tags, m.created_at
@@ -2482,7 +2482,10 @@ pub async fn search_all_memories_in_namespace(
                AND COALESCE(mm.namespace, 'local') = $2
                AND mm.tombstoned_at IS NULL
                AND (mm.expires_at IS NULL OR mm.expires_at > $3)
-             ORDER BY m.created_at DESC LIMIT $4"
+             ORDER BY ts_rank(m.search_vector, plainto_tsquery($1)) DESC,
+                      m.created_at DESC,
+                      m.id DESC
+             LIMIT $4"
         }
     };
 
@@ -9024,6 +9027,44 @@ mod tests {
         assert_eq!(sessions[0].project, alpha);
         assert_eq!(sessions[0].observation_count, 1);
         assert_eq!(sessions[0].tags.as_deref(), Some("auth,docs"));
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn global_search_ranks_by_relevance_not_recency() -> Result<()> {
+        let (db, db_path) = test_db().await?;
+        let old_session = create_session(&db, "/tmp/identity").await?;
+        let exact = insert_memory(
+            &db,
+            "/tmp/identity",
+            &old_session,
+            "Founder and CEO of ExecLayer Inc., based in Monterey",
+            Some("founder,execlayer"),
+        )
+        .await?;
+        // Make the exact match strictly older than every newer, weaker match.
+        sqlx::query("UPDATE memories SET created_at = 1 WHERE rowid = ?")
+            .bind(exact)
+            .execute(&db.pool)
+            .await?;
+        let new_session = create_session(&db, "/tmp/other").await?;
+        for i in 0..5 {
+            insert_memory(
+                &db,
+                "/tmp/other",
+                &new_session,
+                &format!(
+                    "Session archive {i}: ran a build in the ExecLayer repo and pushed a branch"
+                ),
+                Some("session-archive"),
+            )
+            .await?;
+        }
+
+        let global = search_all_memories(&db, "ExecLayer founder", 3).await?;
+        assert_eq!(global.first().map(|m| m.id), Some(exact));
 
         let _ = std::fs::remove_file(db_path);
         Ok(())
