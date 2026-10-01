@@ -276,6 +276,7 @@ impl IronMemServer {
                     "properties": {
                         "project": { "type": "string", "description": "Project root path" },
                         "limit": { "type": "integer", "description": "Max results (default 5)" },
+                        "max_summary_bytes": { "type": "integer", "description": "Clip each returned summary to this many bytes (default 2000, 0 = no limit). Clipped results name the memory_id to pass to retrieve_original." },
                         "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
                         "purpose": purpose_schema()
                     },
@@ -292,6 +293,7 @@ impl IronMemServer {
                         "project": { "type": "string", "description": "Project root path" },
                         "limit": { "type": "integer", "description": "Max results (default 10)" },
                         "semantic": { "type": "boolean", "description": "Blend semantic vector search with keyword search (default true). Set false for keyword-only." },
+                        "max_summary_bytes": { "type": "integer", "description": "Clip each returned summary to this many bytes (default 2000, 0 = no limit). Clipped results name the memory_id to pass to retrieve_original." },
                         "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
                         "purpose": purpose_schema()
                     },
@@ -307,6 +309,7 @@ impl IronMemServer {
                         "query": { "type": "string", "description": "Search query" },
                         "limit": { "type": "integer", "description": "Max results (default 10)" },
                         "semantic": { "type": "boolean", "description": "Blend semantic vector search with keyword search (default true). Set false for keyword-only." },
+                        "max_summary_bytes": { "type": "integer", "description": "Clip each returned summary to this many bytes (default 2000, 0 = no limit). Clipped results name the memory_id to pass to retrieve_original." },
                         "namespace": { "type": "string", "description": "Governance namespace/realm boundary (default local)" },
                         "purpose": purpose_schema()
                     },
@@ -945,7 +948,7 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let gate = self
+        let mut gate = self
             .gate_memories(
                 memories,
                 &namespace,
@@ -966,6 +969,7 @@ impl IronMemServer {
             None,
         )
         .await;
+        clip_recall_summaries(&mut gate, args);
         let json = serde_json::json!({ "memories": gate.authorized, "advisory_memories": gate.advisory, "influence_decisions": gate.decisions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
@@ -990,7 +994,7 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let gate = self
+        let mut gate = self
             .gate_memories(
                 memories,
                 &namespace,
@@ -1011,6 +1015,7 @@ impl IronMemServer {
             None,
         )
         .await;
+        clip_recall_summaries(&mut gate, args);
         let json = serde_json::json!({ "memories": gate.authorized, "advisory_memories": gate.advisory, "influence_decisions": gate.decisions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
@@ -1031,7 +1036,7 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        let gate = self
+        let mut gate = self
             .gate_memories(
                 memories,
                 &namespace,
@@ -1052,6 +1057,7 @@ impl IronMemServer {
             None,
         )
         .await;
+        clip_recall_summaries(&mut gate, args);
         let json = serde_json::json!({ "memories": gate.authorized, "advisory_memories": gate.advisory, "influence_decisions": gate.decisions, "event_times": event_times });
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json).unwrap(),
@@ -1760,6 +1766,36 @@ fn semantic_arg(args: &JsonObject) -> bool {
         .unwrap_or(true)
 }
 
+/// Default per-memory summary ceiling for recall tools. Matches the local
+/// archive digest cap, so a digest written by current compression passes
+/// through whole while a pre-digest archive (the raw transcript, up to 48 KB)
+/// cannot flood a five-result search past the client's output limit.
+const RECALL_SUMMARY_MAX_BYTES: usize = 2_000;
+
+/// Clip each returned summary to the caller's `max_summary_bytes` (default
+/// `RECALL_SUMMARY_MAX_BYTES`, 0 = no limit). Output only: ranking and gating
+/// already ran on the full text, and the stored row is untouched.
+fn clip_recall_summaries(gate: &mut crate::egress::GateResult, args: &JsonObject) {
+    let max = args
+        .get("max_summary_bytes")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(RECALL_SUMMARY_MAX_BYTES);
+    if max == 0 {
+        return;
+    }
+    for memory in gate.authorized.iter_mut().chain(gate.advisory.iter_mut()) {
+        let original = memory.summary.len();
+        if original > max {
+            memory.summary = format!(
+                "{}\n\n[Clipped from {original} bytes. Call retrieve_original with memory_id {} for the full text.]",
+                crate::strutil::truncate_bytes(&memory.summary, max),
+                memory.id
+            );
+        }
+    }
+}
+
 fn namespace_arg(args: &JsonObject) -> String {
     crate::governance::normalize_namespace(
         args.get("namespace")
@@ -1946,6 +1982,58 @@ mod tests {
     use axum::routing::get;
     use axum::Router;
     use tower::util::ServiceExt;
+
+    fn recall_gate(summaries: &[&str]) -> crate::egress::GateResult {
+        let memory = |id: usize, summary: &str| crate::db::Memory {
+            id: id as i64,
+            project: "/tmp/p".into(),
+            session_id: "s".into(),
+            summary: summary.into(),
+            tags: None,
+            created_at: 0,
+        };
+        crate::egress::GateResult {
+            authorized: summaries
+                .iter()
+                .enumerate()
+                .map(|(i, s)| memory(i + 1, s))
+                .collect(),
+            advisory: vec![memory(99, &"a".repeat(5_000))],
+            source_required: Vec::new(),
+            denied_memory_ids: Vec::new(),
+            decisions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recall_summaries_clip_to_default_and_point_at_original() {
+        let archive = "x".repeat(40_000);
+        let mut gate = recall_gate(&["short fact", &archive]);
+        clip_recall_summaries(&mut gate, &JsonObject::new());
+
+        assert_eq!(gate.authorized[0].summary, "short fact");
+        let clipped = &gate.authorized[1].summary;
+        assert!(clipped.len() < RECALL_SUMMARY_MAX_BYTES + 200);
+        assert!(clipped.contains("Clipped from 40000 bytes"));
+        assert!(clipped.contains("retrieve_original with memory_id 2"));
+        assert!(gate.advisory[0].summary.contains("memory_id 99"));
+    }
+
+    #[test]
+    fn recall_summaries_honor_explicit_cap_and_zero_disables() {
+        let mut gate = recall_gate(&["0123456789abcdef"]);
+        let args: JsonObject =
+            serde_json::from_value(serde_json::json!({ "max_summary_bytes": 0 })).unwrap();
+        clip_recall_summaries(&mut gate, &args);
+        assert_eq!(gate.authorized[0].summary, "0123456789abcdef");
+        assert_eq!(gate.advisory[0].summary.len(), 5_000);
+
+        let args: JsonObject =
+            serde_json::from_value(serde_json::json!({ "max_summary_bytes": 8 })).unwrap();
+        clip_recall_summaries(&mut gate, &args);
+        assert!(gate.authorized[0].summary.starts_with("0123456"));
+        assert!(gate.authorized[0].summary.contains("Clipped from 16 bytes"));
+    }
 
     #[tokio::test]
     async fn auth_middleware_rejects_requests_without_token() {
