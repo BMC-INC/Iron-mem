@@ -107,7 +107,7 @@ impl RecallPurposeArgs {
 #[derive(Parser)]
 #[command(
     name = "ironmem",
-    about = "Persistent session memory for Claude Code and AI coding assistants",
+    about = "Persistent session memory for AI coding assistants",
     version = env!("CARGO_PKG_VERSION")
 )]
 struct Cli {
@@ -330,7 +330,12 @@ enum Commands {
     Diagnose { request: String },
 
     /// Start the ironmem worker server
-    Server,
+    Server {
+        /// Interface for the MCP SSE listener when transport is `sse`.
+        /// Defaults to 127.0.0.1. Overrides `IRONMEM_MCP_SSE_BIND`.
+        #[arg(long, value_name = "HOST")]
+        mcp_sse_bind: Option<String>,
+    },
 
     /// Show database stats and worker status
     Status,
@@ -929,7 +934,7 @@ async fn async_main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
 
-        Commands::Server => run_server(cfg).await?,
+        Commands::Server { mcp_sse_bind } => run_server(cfg, mcp_sse_bind).await?,
         Commands::Mcp => run_mcp(cfg).await?,
         Commands::Serve { public, no_auth } => run_serve(cfg, public, no_auth).await?,
         Commands::Status => run_status(&cfg).await?,
@@ -1307,7 +1312,7 @@ async fn async_main() -> Result<()> {
     Ok(())
 }
 
-async fn run_server(mut cfg: config::Config) -> Result<()> {
+async fn run_server(mut cfg: config::Config, mcp_sse_bind: Option<String>) -> Result<()> {
     // (Wave 4) Env overrides let the cross-encoder rerank backend be selected
     // without editing settings.json (e.g. for an A/B against the LLM reranker).
     if let Ok(b) = std::env::var("IRONMEM_RERANK_BACKEND") {
@@ -1362,8 +1367,13 @@ async fn run_server(mut cfg: config::Config) -> Result<()> {
 
     let mcp_transport = cfg.effective_mcp_transport();
     if mcp_transport == "sse" {
-        let sse_addr: std::net::SocketAddr =
-            format!("0.0.0.0:{}", cfg.mcp_sse_port).parse().unwrap();
+        let env_bind = std::env::var("IRONMEM_MCP_SSE_BIND").ok();
+        let sse_addr = resolve_server_sse_bind(
+            cfg.mcp_sse_port,
+            mcp_sse_bind.as_deref(),
+            env_bind.as_deref(),
+        )?;
+        warn_exposed_sse_without_token(sse_addr, cfg.auth_token.as_deref());
         let sse_db = db.clone();
         let sse_cfg = cfg.clone();
         tokio::spawn(async move {
@@ -1861,6 +1871,49 @@ async fn run_serve(mut cfg: config::Config, public: bool, no_auth: bool) -> Resu
 
 fn serve_bind_addr(port: u16) -> std::net::SocketAddr {
     format!("127.0.0.1:{port}").parse().unwrap()
+}
+
+/// Bind host for `ironmem server` MCP SSE. `flag` wins over `env`. Both
+/// default to loopback. A value may be a host (`0.0.0.0`) or `host:port`.
+fn resolve_server_sse_bind(
+    port: u16,
+    flag: Option<&str>,
+    env: Option<&str>,
+) -> Result<std::net::SocketAddr> {
+    let host = flag.or(env).unwrap_or("127.0.0.1");
+    parse_bind_host(host, port)
+}
+
+fn parse_bind_host(host: &str, port: u16) -> Result<std::net::SocketAddr> {
+    let host = host.trim();
+    if host.is_empty() {
+        anyhow::bail!("MCP SSE bind host is empty");
+    }
+    if let Ok(addr) = host.parse::<std::net::SocketAddr>() {
+        return Ok(addr);
+    }
+    let candidate = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    candidate
+        .parse()
+        .map_err(|err| anyhow::anyhow!("invalid MCP SSE bind '{host}': {err}"))
+}
+
+fn sse_bind_lacks_token(addr: std::net::SocketAddr, token: Option<&str>) -> bool {
+    !addr.ip().is_loopback() && token.map(str::trim).unwrap_or("").is_empty()
+}
+
+fn warn_exposed_sse_without_token(addr: std::net::SocketAddr, token: Option<&str>) {
+    if sse_bind_lacks_token(addr, token) {
+        let message = format!(
+            "MCP SSE is listening on {addr} without an auth token. Set auth_token in settings before exposing this port off localhost."
+        );
+        tracing::warn!("{message}");
+        eprintln!("warning: {message}");
+    }
 }
 
 async fn run_cloudflare_tunnel(port: u16, auth_token: Option<String>) {
@@ -3256,6 +3309,32 @@ mod tests {
 
         assert!(bind.ip().is_loopback(), "remote MCP origin bound to {bind}");
         assert_eq!(bind.port(), 37779);
+    }
+
+    #[test]
+    fn server_sse_defaults_to_loopback() {
+        let bind = resolve_server_sse_bind(37779, None, None).unwrap();
+        assert!(bind.ip().is_loopback(), "default SSE bind was {bind}");
+        assert_eq!(bind.port(), 37779);
+        assert!(!sse_bind_lacks_token(bind, None));
+    }
+
+    #[test]
+    fn server_sse_flag_overrides_env_and_warns_without_token() {
+        let bind = resolve_server_sse_bind(37779, Some("0.0.0.0"), Some("127.0.0.1")).unwrap();
+        assert_eq!(bind.ip(), std::net::Ipv4Addr::UNSPECIFIED);
+        assert!(sse_bind_lacks_token(bind, None));
+        assert!(sse_bind_lacks_token(bind, Some("  ")));
+        assert!(!sse_bind_lacks_token(bind, Some("secret")));
+    }
+
+    #[test]
+    fn server_sse_env_bind_and_explicit_port() {
+        let bind = resolve_server_sse_bind(37779, None, Some("192.0.2.10")).unwrap();
+        assert_eq!(bind, "192.0.2.10:37779".parse().unwrap());
+        let with_port = resolve_server_sse_bind(1, None, Some("127.0.0.1:39999")).unwrap();
+        assert_eq!(with_port, "127.0.0.1:39999".parse().unwrap());
+        assert!(parse_bind_host("", 1).is_err());
     }
 }
 

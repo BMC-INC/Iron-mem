@@ -53,7 +53,7 @@
 - **Explicit retention:** an offline SQLite inventory identifies active memory, immutable assertions, audit, sources and snapshots. Whole-store purge requires a reviewed content-bound plan, refuses current legal holds and active locks, and reports external copies it cannot erase. Normal `forget` is not advertised as complete physical erasure.
 - **Safer installation and upgrades:** settings and unrelated hooks are preserved, identical reinstalls create no duplicates, changed installations retain previous files and a verified SQLite backup, and local extraction needs no API key. `--config PATH` isolates trial settings. A newcomer rehearsal verifies real MCP transport, save/search, export/import and recovery.
 
-The [integrated validation](docs/benchmarks/reliability/VALIDATION.md) includes 316 passing unit tests, 200 recovery cycles, release scale measurements, and a local-model canary that **did not establish a coding-accuracy advantage**. Failures are retained alongside successful checks.
+The [integrated validation](docs/benchmarks/reliability/VALIDATION.md) records that run's unit-test result, 200 recovery cycles, release scale measurements, and a local-model canary that **did not establish a coding-accuracy advantage**. Failures are retained alongside successful checks. Current test results live in CI, not in a hard-coded count here.
 
 See [coding and reliability methodology](docs/benchmarks/reliability/README.md), [diagnostics and retention](docs/architecture/diagnostics-and-retention.md), and [installation and recovery](docs/installation-and-recovery.md). These tools do not change the installed runtime or turn experimental features on automatically.
 
@@ -178,11 +178,11 @@ Chunked writes use `IRONMEM_CCR_CHUNK_THRESHOLD_BYTES`, from 131072 through 5368
 - **Valid-time temporal recall:** `remember` accepts an optional `event_at` (an ISO `YYYY-MM-DD` date or a `YYYY-MM-DD..YYYY-MM-DD` range) for when an event actually occurred, distinct from the storage time (`created_at`). Valid-time dates are surfaced through an `event_times` side map on search, list, context, and skim results, powering time-aware retrieval.
 - **Derived (inferred) memories:** reflection can derive new memories from existing ones, governed as `source_type=derived` / `kind=inference` with a `derives` provenance edge and a ledger entry per inference. Derived memories are quarantined from default retrieval until a caller explicitly asks for them, so inferences never silently pollute primary recall.
 - **Opt-in auto-dream trigger:** a thin background watcher (`auto_dream.enabled`, default off, with a `gap_minutes` idle threshold) fires a consolidation and synthesis pass on projects that have gone idle. Every auto-triggered pass is recorded in the governance ledger with a `trigger_reason`, so it stays auditable instead of a black box.
-- **Current verification:** `cargo test --all-targets` passes **276 unit tests**
-  plus **1 MCP integration test**, with **1 intentionally ignored benchmark**.
-  MCP stdio cleanliness passes, and strict clippy plus the embedded Workbench
-  JavaScript syntax check are clean.
-- **Still zero telemetry. Still local-first. Your data stays yours.**
+- **Current verification:** `cargo test` on CI is the source of truth for the
+  suite size. Do not treat a number in this file as the live count. MCP stdio
+  cleanliness, strict clippy, and the embedded Workbench JavaScript syntax
+  check are part of the same bar.
+- **Local-first.** No product-analytics client. See [PRIVACY.md](PRIVACY.md).
 
 <details>
 <summary>v0.3.0</summary>
@@ -192,7 +192,7 @@ Chunked writes use `IRONMEM_CCR_CHUNK_THRESHOLD_BYTES`, from 131072 through 5368
 - **Windows support** - `install.ps1`, platform-aware messages, robust home directory detection
 - **Web UI** - browse, search, and delete memories at `http://localhost:37778/ui`
 - **Discovery tools** - list known projects, search across all projects, and inspect per-project session history
-- **Still zero telemetry. Still local-first. Your data stays yours.**
+- **Local-first.** Data stays on the machine unless you opt into a provider.
 </details>
 
 <details>
@@ -223,8 +223,9 @@ No "remember when we refactored auth yesterday?"
 OpenAI GPT-4o, Google Gemini, or Vertex AI Gemini. Local extraction remains the
 default, and enabling enrichment takes one configuration change.
 
-**Free and open source.** Runs locally or on your own infrastructure. No telemetry.
-No cloud dependency. No subscription. SQLite or Postgres storage. Single Rust binary.
+**Free and open source.** Runs locally or on your own infrastructure. No product
+analytics. No required cloud dependency. No subscription. SQLite or Postgres
+storage. Single Rust binary. See [PRIVACY.md](PRIVACY.md) for optional egress.
 
 <p align="center">
   <img src="assets/demo.gif" alt="IronMem in action" width="640"/>
@@ -476,11 +477,24 @@ cd Iron-mem
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-Add IronMem to your `PATH`:
+The installer copies the binary to `~/.ironmem/bin` and does **not** put that
+directory on `PATH`. It prints the exact line to add. On macOS and Linux:
 
 ```bash
 export PATH="$HOME/.ironmem/bin:$PATH"          # in ~/.zshrc / ~/.bashrc
 ```
+
+On Windows the installer prints a `PowerShell` command for the user `Path`.
+Optional: `./install.sh --add-to-path` symlinks `ironmem` into `~/.local/bin`
+when that directory is already on `PATH`. It does not edit shell startup files.
+
+Cursor often does not expand `~` and, when launched from a desktop icon, may
+not see your shell `PATH`. Use the absolute path the installer writes to
+`~/.ironmem/mcp.json`, or the command `ironmem` only after `PATH` is visible
+to Cursor. Details: [Cursor MCP setup](#cursor-mcp-setup).
+
+On macOS and Linux the installer also registers Claude Code hooks. Cursor does
+not use them. Pass `--no-hooks` to skip that step. The default is unchanged.
 
 No API key is required for offline extraction. If you opt into cloud enrichment,
 write the provider key to `~/.ironmem/api_key` instead of exporting it globally:
@@ -493,16 +507,20 @@ echo "your-key-here" > ~/.ironmem/api_key && chmod 600 ~/.ironmem/api_key
 > `ANTHROPIC_API_KEY` can change how other tools bill. IronMem reads
 > `~/.ironmem/api_key` automatically.
 
-Restart your terminal and Claude Code. That's it.
+Restart your terminal, then restart the coding assistant you use. That's it.
 
-**Requirements:** Rust/Cargo (the installer will tell you if it's missing)
+**Requirements:** Rust/Cargo (the installer will tell you if it's missing).
+Prebuilt release archives are not attached until a maintainer pushes a version
+tag. [RELEASING.md](RELEASING.md) describes that workflow. This repository
+does not publish those binaries by itself.
 
 ---
 
 ## CLI
 
 ```bash
-ironmem server              # Start REST + MCP SSE server
+ironmem server              # REST on 127.0.0.1; MCP SSE on 127.0.0.1 when transport is sse
+ironmem server --mcp-sse-bind 0.0.0.0  # SSE on all interfaces (warns if no auth token)
 ironmem mcp                 # Start MCP stdio server (for Claude Desktop/Code and Codex)
 ironmem serve               # Start Streamable HTTP server with bearer token auth
 ironmem serve --public      # Same + Cloudflare Tunnel for remote MCP clients
@@ -573,8 +591,8 @@ IronMem works as an **MCP server** (native integration) or via **IRONMEM.md** (p
 | **Claude Desktop** | **Yes** | Yes | [Setup →](#claude-desktop-mcp-setup) |
 | **Codex** | **Yes** | Yes | [Setup →](#codex-mcp-setup) |
 | **claude.ai** | **Yes** | Yes | [Setup →](#claudeai-web) |
-| **Cursor** | **Yes** | Yes | [Setup →](#cursor--windsurf-mcp-setup) |
-| **Windsurf** | **Yes** | Yes | [Setup →](#cursor--windsurf-mcp-setup) |
+| **Cursor** | **Yes** | Yes | [Setup →](#cursor-mcp-setup) |
+| **Windsurf** | **Yes** | Yes | [Setup →](#windsurf-mcp-setup) |
 | **ChatGPT Desktop** | **Yes** | - | [Setup →](#other-mcp-clients) |
 | **Zed** | **Yes** | - | [Setup →](#other-mcp-clients) |
 | **VS Code (Copilot/Continue/Cline)** | **Yes** | Yes | [Setup →](#other-mcp-clients) |
@@ -612,7 +630,7 @@ Create `.mcp.json` in your project root:
 {
   "mcpServers": {
     "ironmem": {
-      "command": "~/.ironmem/bin/ironmem",
+      "command": "/absolute/path/to/.ironmem/bin/ironmem",
       "args": ["mcp"],
       "env": {
         "ANTHROPIC_API_KEY": "your-key-here"
@@ -623,7 +641,64 @@ Create `.mcp.json` in your project root:
 ```
 
 > **Note:** Claude Code hooks and MCP can coexist. Hooks use the REST API for
-> automatic observation recording; MCP gives you direct tool access.
+> automatic observation recording; MCP gives you direct tool access. Replace
+> the command above with the absolute path from `~/.ironmem/mcp.json`. A `~`
+> prefix in JSON is not expanded by every client.
+
+### Cursor MCP setup
+
+Cursor launches `ironmem mcp` over stdio. Two config locations work:
+
+- Cursor Settings, then MCP, then Add Server
+- `~/.cursor/mcp.json` (Windows: `%USERPROFILE%\.cursor\mcp.json`)
+
+Prefer the absolute path written by the installer (`~/.ironmem/mcp.json` on
+the machine that ran it). Example shape:
+
+```json
+{
+  "mcpServers": {
+    "ironmem": {
+      "command": "/Users/YOU/.ironmem/bin/ironmem",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Replace `/Users/YOU/.ironmem/bin/ironmem` with the `command` value from
+`~/.ironmem/mcp.json`. On Windows that value is an absolute path to
+`ironmem.exe`, with backslashes escaped in JSON.
+
+If `ironmem` is on the `PATH` that Cursor actually uses, this also works:
+
+```json
+{
+  "mcpServers": {
+    "ironmem": {
+      "command": "ironmem",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Do not set `"command": "~/.ironmem/bin/ironmem"`. Cursor does not expand `~`
+in that field. A copy of Cursor started from the Dock or Start menu often
+does not inherit the `PATH` you exported in `~/.zshrc` or `~/.bashrc`. The
+absolute path avoids both problems.
+
+Claude Code hooks are unrelated to this setup. The installer still adds them
+on macOS and Linux unless you pass `--no-hooks`.
+
+A Cursor Marketplace plugin is not required for the config above. Listing
+that plugin is a separate step and is not part of installing the binary.
+
+### Windsurf MCP setup
+
+Windsurf uses the same stdio command. Put an absolute path in
+`"command"`, or `ironmem` when Windsurf can see it on `PATH`. Do not rely on
+`~` inside the JSON file.
 
 ### Claude Desktop MCP Setup
 
@@ -791,30 +866,14 @@ claude.ai connector.
 [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
 for best results. IronMem falls back to `npx cloudflared` if it is not installed.
 
-### Cursor / Windsurf MCP Setup
-
-Both use stdio. Add to your MCP settings:
-
-**Cursor:** Settings → MCP → Add Server
-
-**Windsurf:** Settings → MCP → Add Server
-
-```json
-{
-  "ironmem": {
-    "command": "~/.ironmem/bin/ironmem",
-    "args": ["mcp"]
-  }
-}
-```
-
 ### Other MCP Clients
 
-Any MCP client that supports **stdio** transport can use IronMem:
+Any MCP client that supports **stdio** transport can use IronMem. Use an
+absolute path, or `ironmem` when the client process can see it on `PATH`:
 
 ```json
 {
-  "command": "~/.ironmem/bin/ironmem",
+  "command": "/absolute/path/to/.ironmem/bin/ironmem",
   "args": ["mcp"]
 }
 ```
@@ -857,7 +916,7 @@ IronMem currently exposes **27 MCP tools**:
 | `memory_graph` | Query temporal graph edges for an entity, with optional valid-time filtering |
 | `reconcile_memory_graph` | Dry-run or apply duplicate/current-state graph reconciliation |
 | `dream_memory` | Preview or apply a governed sleep-cycle consolidation pass |
-| `wipe_project` | Delete all memories for one project |
+| `wipe_project` | Delete all memories for one project. `confirm: false` previews the count and deletes nothing. Omitting `confirm` still deletes so existing clients keep working. |
 
 The intended agent loop is:
 
@@ -1162,19 +1221,30 @@ IronMem can blend **keyword (FTS)** and **semantic (vector)** retrieval using
 and rank session-start injection by **relevance + recency + importance**.
 Embeddings are stored locally in SQLite via
 [`sqlite-vec`](https://github.com/asg017/sqlite-vec) or pgvector on Postgres.
-An API embedder is used only when you explicitly select one, or when `auto`
-exhausts local options and finds a compatible API key; choose `onnx`, `ollama`,
-or `none` when a hard no-egress guarantee is required.
+An API embedder is used only when you set `embedding.provider` to `openai`
+or `google`, or when `auto` is allowed to fall back (below). Choose `onnx`,
+`ollama`, or `none` when memory text must stay on this machine.
 
-**Privacy posture:** this is a governance tool, so the default is
-**local-first / no data egress**. The `auto` provider prefers a local embedder
-and silently degrades to keyword-only search if none is available.
+**Privacy posture:** the default is **local-first**. `auto` uses Ollama if it
+is reachable, then the built-in ONNX model when this binary was compiled with
+`local-onnx`, then keyword search. It does **not** call OpenAI just because
+`OPENAI_API_KEY` is set. IronMem logs a warning if a key is present and cloud
+fallback is off, and a warning when a cloud embedder is actually selected.
+See [PRIVACY.md](PRIVACY.md).
+
+Opt in to the OpenAI fallback with either of these:
+
+- `"embedding": { "allow_cloud_fallback": true }` in `~/.ironmem/settings.json`
+- `IRONMEM_EMBED_ALLOW_CLOUD=1`
+
+Google embeddings are never selected by that fallback. Set
+`"embedding.provider": "google"` to use them.
 
 | `embedding.provider` | Behavior | Data egress |
 |----------------------|----------|-------------|
-| `"auto"` *(default)* | Use local Ollama if reachable, else the built-in ONNX model (if compiled in), else keyword-only | **None** (unless only an API key is configured) |
+| `"auto"` *(default)* | Local Ollama if reachable, else ONNX if this binary includes it, else keyword search. OpenAI only when cloud fallback is enabled and `OPENAI_API_KEY` is set | **None** unless fallback is enabled |
 | `"ollama"` | Local [Ollama](https://ollama.com) embeddings | **None** (localhost) |
-| `"onnx"` | In-process ONNX model (requires `--features local-onnx` build) | **None** |
+| `"onnx"` | In-process ONNX model (requires `--features local-onnx` build) | **None** for memory text. The first run may download model weights into `~/.ironmem/fastembed_cache` |
 | `"openai"` | OpenAI embeddings API | Sends memory text to OpenAI |
 | `"google"` | Google embeddings API | Sends memory text to Google |
 | `"none"` | Keyword-only FTS + recency injection (legacy behavior) | **None** |
@@ -1261,6 +1331,8 @@ mode.
 |:---------|:--------|:------------|
 | `DATABASE_URL` | _(none)_ | Postgres URL. Overrides `db_path` when set. |
 | `IRONMEM_MCP_TRANSPORT` | `stdio` | MCP transport: `stdio` or `sse` |
+| `IRONMEM_MCP_SSE_BIND` | `127.0.0.1` | Host for `ironmem server` MCP SSE. `--mcp-sse-bind` overrides it. Non-loopback without `auth_token` logs a warning |
+| `IRONMEM_EMBED_ALLOW_CLOUD` | off | `1` / `true` lets `auto` send memory text to OpenAI when no local embedder is available and `OPENAI_API_KEY` is set |
 | `ANTHROPIC_API_KEY` | _(none)_ | Optional; used when cloud enrichment selects Anthropic |
 | `OPENAI_API_KEY` | _(none)_ | Optional; used when cloud enrichment selects OpenAI |
 | `GOOGLE_API_KEY` | _(none)_ | Optional; used when cloud enrichment selects Google |
@@ -1304,7 +1376,7 @@ cargo run --quiet -- eval --out target/eval-reports
 cargo test --bin ironmem -- postgres_foundations access_postgres assertions_postgres --ignored --test-threads=1
 ```
 
-The local comprehensive pass covered **310 unit tests**; the subsequent Windows path regression brings the final inventory to **311 unit tests**, alongside **1 MCP stdio integration test**, **3 PostgreSQL integration tests**, and **72/72 deterministic evaluation cases**. Both LongMemEval and LoCoMo smoke suites exercise seven byte budgets plus a full-context baseline without model calls. The optional dictionary timing benchmark is separate from correctness validation. Default-feature build, all-target Clippy and formatting are checked; this batch does not retest optional ONNX/GPU backends.
+That local pass is recorded in [final validation](docs/benchmarks/memory-density/FINAL-VALIDATION.md), including the unit-test inventory from 2026-09-07, the MCP stdio integration test, three PostgreSQL integration tests, and 72/72 deterministic evaluation cases. Both LongMemEval and LoCoMo smoke suites exercise seven byte budgets plus a full-context baseline without model calls. The optional dictionary timing benchmark is separate from correctness validation. Default-feature build, all-target Clippy and formatting are checked; this batch does not retest optional ONNX/GPU backends. The live suite size is whatever CI reports for `cargo test`. Do not copy a count back into this file.
 
 Coverage includes exact byte limits, adversarial context data, verified source reconstruction and GC, atomic/full/incremental snapshots, independent recovery, delivery telemetry, generated-file invalidation, working-set budgets, scoped temporal assertions, concurrent writes, evidence restrictions, and all existing retrieval/governance regressions. See [final validation evidence and remaining measurement gates](docs/benchmarks/memory-density/FINAL-VALIDATION.md). Local results and remote CI are recorded separately; neither changes the installed service.
 

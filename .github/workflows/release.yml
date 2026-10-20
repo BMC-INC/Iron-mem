@@ -43,21 +43,24 @@ jobs:
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../ironmem-${{ matrix.target }}.tar.gz ironmem
-          cd ../../..
+          bin="target/${{ matrix.target }}/release/ironmem"
+          test -x "$bin"
+          tar czf "$GITHUB_WORKSPACE/ironmem-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" ironmem
 
       - name: Package (windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          Compress-Archive -Path target/${{ matrix.target }}/release/ironmem.exe -DestinationPath ironmem-${{ matrix.target }}.zip
+          $binary = "target/${{ matrix.target }}/release/ironmem.exe"
+          if (-not (Test-Path $binary)) { throw "missing $binary" }
+          Compress-Archive -Path $binary -DestinationPath "ironmem-${{ matrix.target }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ironmem-${{ matrix.target }}
           path: ironmem-${{ matrix.target }}.*
+          if-no-files-found: error
 
   release:
     name: Create GitHub Release
@@ -72,8 +75,19 @@ jobs:
         with:
           path: artifacts
 
+      - name: Stage archives and checksums
+        run: |
+          mkdir -p dist
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} dist/ \;
+          cd dist
+          sha256sum -- * | tee SHA256SUMS
+          test -f ironmem-x86_64-unknown-linux-gnu.tar.gz
+          test -f ironmem-x86_64-apple-darwin.tar.gz
+          test -f ironmem-aarch64-apple-darwin.tar.gz
+          test -f ironmem-x86_64-pc-windows-msvc.zip
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: artifacts/**/*
+          files: dist/*

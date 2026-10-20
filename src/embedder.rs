@@ -1,5 +1,6 @@
 //! Pluggable embedding layer. Local-first / no-egress by default:
-//! Ollama → in-process ONNX (feature) → API (opt-in) → none (FTS-only).
+//! Ollama, then in-process ONNX (feature), then keyword search.
+//! `auto` calls OpenAI only when cloud fallback is explicitly enabled.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -329,11 +330,27 @@ pub async fn resolve_embedder(cfg: &Config) -> Option<Arc<dyn Embedder>> {
                 dim,
             )))
         }
-        "openai" => build_api(ApiKind::OpenAi, "text-embedding-3-small", 1536, cfg),
-        "google" => build_api(ApiKind::Google, "text-embedding-004", 768, cfg),
+        "openai" => {
+            let embedder = build_api(ApiKind::OpenAi, "text-embedding-3-small", 1536, cfg);
+            if embedder.is_some() {
+                tracing::warn!(
+                    "Embedder: provider is openai. Memory text will be sent to api.openai.com."
+                );
+            }
+            embedder
+        }
+        "google" => {
+            let embedder = build_api(ApiKind::Google, "text-embedding-004", 768, cfg);
+            if embedder.is_some() {
+                tracing::warn!(
+                    "Embedder: provider is google. Memory text will be sent to generativelanguage.googleapis.com."
+                );
+            }
+            embedder
+        }
         "onnx" => build_onnx(),
         _ => {
-            // "auto": prefer local/no-egress.
+            // "auto": prefer local/no-egress. Cloud is opt-in.
             let model = ec
                 .model
                 .clone()
@@ -350,8 +367,13 @@ pub async fn resolve_embedder(cfg: &Config) -> Option<Arc<dyn Embedder>> {
                 }
             } else if let Some(onnx) = build_onnx() {
                 Some(onnx)
-            } else {
+            } else if select_auto_cloud(
+                cfg.embedding_cloud_fallback_enabled(),
+                resolve_api_key(Provider::Openai).is_ok(),
+            ) {
                 build_api(ApiKind::OpenAi, "text-embedding-3-small", 1536, cfg)
+            } else {
+                None
             }
         }
     };
@@ -377,6 +399,31 @@ fn build_onnx() -> Option<Arc<dyn Embedder>> {
 #[cfg(not(feature = "local-onnx"))]
 fn build_onnx() -> Option<Arc<dyn Embedder>> {
     None
+}
+
+/// Whether `auto` should use OpenAI after local options are exhausted.
+/// Logs the choice. A present API key is not enough: `allow` must be true.
+pub(crate) fn select_auto_cloud(allow: bool, openai_key_present: bool) -> bool {
+    if allow && openai_key_present {
+        tracing::warn!(
+            "Embedder: no local model is available. Cloud fallback is enabled, so memory text will be sent to OpenAI (embedding.allow_cloud_fallback or IRONMEM_EMBED_ALLOW_CLOUD). Set embedding.provider to \"none\" to keep text on this machine."
+        );
+        return true;
+    }
+    if allow {
+        tracing::info!(
+            "Embedder: cloud fallback is enabled, but OPENAI_API_KEY is not set. Using keyword search only."
+        );
+        return false;
+    }
+    if openai_key_present {
+        tracing::warn!(
+            "Embedder: OPENAI_API_KEY is set, but auto will not send memory text to OpenAI. Using keyword search only. Opt in with embedding.allow_cloud_fallback true or IRONMEM_EMBED_ALLOW_CLOUD=1, or set embedding.provider to \"openai\"."
+        );
+    } else {
+        tracing::info!("Embedder: no local model is available. Using keyword search only.");
+    }
+    false
 }
 
 // ── Test double ─────────────────────────────────────────────────────
@@ -436,5 +483,13 @@ mod tests {
         let mut cfg = Config::default();
         cfg.embedding.provider = "none".to_string();
         assert!(resolve_embedder(&cfg).await.is_none());
+    }
+
+    #[test]
+    fn auto_cloud_fallback_is_opt_in() {
+        assert!(!select_auto_cloud(false, false));
+        assert!(!select_auto_cloud(false, true));
+        assert!(!select_auto_cloud(true, false));
+        assert!(select_auto_cloud(true, true));
     }
 }

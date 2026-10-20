@@ -12,7 +12,7 @@ import shutil
 import tempfile
 import unittest
 from evidence_common import Fixture, clean_env
-from install_local import install, merge_hooks
+from install_local import install, link_binary, merge_hooks, path_instructions
 from retention import plan, purge
 
 BINARY=Path(os.environ.get('IRONMEM_TEST_BINARY','target/debug/ironmem.exe' if os.name=='nt' else 'target/debug/ironmem')).resolve()
@@ -87,6 +87,20 @@ class Tools(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertFalse(Path(marker.read_text()).exists())
         self.assertTrue((self.root/'streamed'/'bin'/'ironmem').exists())
+
+    def test_install_explains_path_and_optional_symlink(self):
+        prefix=self.root/'path-install'; claude=self.root/'path-claude'; claude.mkdir()
+        result=install(SOURCE,prefix,claude,BINARY,no_hooks=True)
+        self.assertIn('does not modify PATH', result['path_instructions'])
+        self.assertIn(result['installed_binary'], result['path_instructions'])
+        self.assertIsNone(result['path_link'])
+        self.assertFalse(result['hooks_installed'])
+        notice=path_instructions(result['installed_binary'])
+        self.assertIn('absolute path', notice)
+        if os.name!='nt':
+            linked=link_binary(result['installed_binary'], self.root/'localbin')
+            self.assertTrue(Path(linked).is_symlink())
+            self.assertEqual(Path(linked).resolve(), Path(result['installed_binary']).resolve())
 
     def test_legacy_hook_merge_preserves_mixed_group(self):
         hookdir=Path('/fixture/hooks')
