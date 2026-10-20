@@ -2168,8 +2168,34 @@ mod tests {
             crate::access::stats(&server.db, &[second]).await.unwrap()[&second].expansion_count,
             0
         );
+        // The counts above are the assertion. Deleting the temp database is
+        // cleanup. On Windows, SQLite can keep the file locked for a moment
+        // after the pool closes (ERROR_SHARING_VIOLATION, os error 32). That
+        // race is not the behavior under test, and every other test in this
+        // module ignores a failed delete.
+        close_and_remove_test_db(server, &path).await;
+    }
+
+    async fn close_and_remove_test_db(server: IronMemServer, path: &str) {
         server.db.pool.close().await;
-        std::fs::remove_file(path).unwrap();
+        drop(server);
+        let candidates = [
+            std::path::PathBuf::from(path),
+            std::path::PathBuf::from(format!("{path}-wal")),
+            std::path::PathBuf::from(format!("{path}-shm")),
+        ];
+        for candidate in candidates {
+            for _ in 0..30 {
+                match std::fs::remove_file(&candidate) {
+                    Ok(()) => break,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(err) if err.raw_os_error() == Some(32) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
     }
 
     async fn test_server() -> (IronMemServer, String) {
@@ -3096,8 +3122,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        server.db.pool.close().await;
-        let _ = std::fs::remove_file(path);
+        close_and_remove_test_db(server, &path).await;
         let _ = std::fs::remove_dir_all(project);
     }
 }
