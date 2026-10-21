@@ -1664,13 +1664,18 @@ impl IronMemServer {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ErrorData::invalid_params("missing 'project'", None))?;
         // Optional. `false` previews. Omitted or `true` deletes, matching older clients.
-        let confirm = args.get("confirm").and_then(|v| v.as_bool());
+        let confirm = match args.get("confirm") {
+            None => true,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                ErrorData::invalid_params("'confirm' must be a boolean when provided", None)
+            })?,
+        };
 
         // Capture ids before deletion so we can purge their vectors + metadata.
         let ids = db::memory_ids_for_project(&self.db, project)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        if confirm == Some(false) {
+        if !confirm {
             let json = serde_json::json!({
                 "wiped": 0,
                 "would_wipe": ids.len(),
@@ -3117,6 +3122,78 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(wipe_body["wiped"], 1);
+        assert!(db::memory_ids_for_project(&server.db, &project_s)
+            .await
+            .unwrap()
+            .is_empty());
+
+        close_and_remove_test_db(server, &path).await;
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[tokio::test]
+    async fn wipe_project_rejects_invalid_confirm_without_mutation() {
+        let (server, path) = test_server().await;
+        let project = std::env::temp_dir().join(format!("ironmem-wipe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&project).unwrap();
+        let context = project.join("IRONMEM.md");
+        std::fs::write(&context, "keep this context").unwrap();
+        let project_s = project.to_string_lossy().to_string();
+        let session = db::create_session(&server.db, &project_s).await.unwrap();
+        let memory = db::insert_memory(&server.db, &project_s, &session, "keep me", None)
+            .await
+            .unwrap();
+
+        for invalid in [
+            serde_json::json!("false"),
+            serde_json::json!(null),
+            serde_json::json!(0),
+            serde_json::json!(1),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let args = serde_json::json!({"project": project_s, "confirm": invalid});
+            let error = server
+                .handle_wipe_project(args.as_object().unwrap())
+                .await
+                .expect_err("a malformed preview must not delete memories");
+            assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert_eq!(
+                db::memory_ids_for_project(&server.db, &project_s)
+                    .await
+                    .unwrap(),
+                vec![memory]
+            );
+            assert_eq!(
+                std::fs::read_to_string(&context).unwrap(),
+                "keep this context"
+            );
+        }
+
+        close_and_remove_test_db(server, &path).await;
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[tokio::test]
+    async fn wipe_project_omitted_confirm_preserves_legacy_delete() {
+        let (server, path) = test_server().await;
+        let project = std::env::temp_dir().join(format!("ironmem-wipe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&project).unwrap();
+        let project_s = project.to_string_lossy().to_string();
+        let session = db::create_session(&server.db, &project_s).await.unwrap();
+        db::insert_memory(&server.db, &project_s, &session, "legacy client", None)
+            .await
+            .unwrap();
+
+        let args = serde_json::json!({"project": project_s});
+        let body: serde_json::Value = serde_json::from_str(&result_text(
+            &server
+                .handle_wipe_project(args.as_object().unwrap())
+                .await
+                .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(body["wiped"], 1);
         assert!(db::memory_ids_for_project(&server.db, &project_s)
             .await
             .unwrap()

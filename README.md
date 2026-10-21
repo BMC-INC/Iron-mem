@@ -1223,10 +1223,13 @@ Embeddings are stored locally in SQLite via
 [`sqlite-vec`](https://github.com/asg017/sqlite-vec) or pgvector on Postgres.
 An API embedder is used only when you set `embedding.provider` to `openai`
 or `google`, or when `auto` is allowed to fall back (below). Choose `onnx`,
-`ollama`, or `none` when memory text must stay on this machine.
+`ollama` at a loopback URL, or `none` for on-device embeddings. These settings
+govern embeddings; profile refresh, LLM reranking, Observer extraction, and
+fact synthesis have independent cloud-call triggers described in
+[PRIVACY.md](PRIVACY.md).
 
-**Privacy posture:** the default is **local-first**. `auto` uses Ollama if it
-is reachable, then the built-in ONNX model when this binary was compiled with
+**Privacy posture:** the default is **local-first**. `auto` uses Ollama at
+`embedding.ollama_url` (localhost by default) if it is reachable, then the built-in ONNX model when this binary was compiled with
 `local-onnx`, then keyword search. It does **not** call OpenAI just because
 `OPENAI_API_KEY` is set. IronMem logs a warning if a key is present and cloud
 fallback is off, and a warning when a cloud embedder is actually selected.
@@ -1240,16 +1243,16 @@ Opt in to the OpenAI fallback with either of these:
 Google embeddings are never selected by that fallback. Set
 `"embedding.provider": "google"` to use them.
 
-| `embedding.provider` | Behavior | Data egress |
+| `embedding.provider` | Behavior | Embedding data egress |
 |----------------------|----------|-------------|
-| `"auto"` *(default)* | Local Ollama if reachable, else ONNX if this binary includes it, else keyword search. OpenAI only when cloud fallback is enabled and `OPENAI_API_KEY` is set | **None** unless fallback is enabled |
-| `"ollama"` | Local [Ollama](https://ollama.com) embeddings | **None** (localhost) |
+| `"auto"` *(default)* | Ollama at the configured URL if reachable, else ONNX if this binary includes it, else keyword search. OpenAI only when cloud fallback is enabled and `OPENAI_API_KEY` is set | **None** with the default localhost URL and fallback off; remote Ollama or OpenAI fallback sends text |
+| `"ollama"` | [Ollama](https://ollama.com) embeddings at `embedding.ollama_url` | **None** at the default localhost URL; a custom remote URL sends text to that server |
 | `"onnx"` | In-process ONNX model (requires `--features local-onnx` build) | **None** for memory text. The first run may download model weights into `~/.ironmem/fastembed_cache` |
 | `"openai"` | OpenAI embeddings API | Sends memory text to OpenAI |
 | `"google"` | Google embeddings API | Sends memory text to Google |
 | `"none"` | Keyword-only FTS + recency injection (legacy behavior) | **None** |
 
-**Recommended local setup (no egress):**
+**Recommended local embedding setup:**
 
 ```bash
 # Install Ollama, then pull an embedding model:
@@ -1257,7 +1260,7 @@ ollama pull nomic-embed-text
 # IronMem's "auto" provider will detect and use it automatically.
 ```
 
-**Built-in ONNX (no Ollama, no network):** compile with the optional feature so embeddings run fully in-process:
+**Built-in ONNX:** compile with the optional feature so embeddings run fully in-process. The first load may download model weights:
 
 ```bash
 cargo install --path . --features local-onnx
@@ -1343,8 +1346,11 @@ mode.
 
 ### API Key
 
-IronMem does not need an LLM API key for local extraction. A key is only needed
-when you explicitly enable cloud enrichment.
+IronMem does not need an LLM API key for local extraction. Provider credentials
+are used by optional features, including cloud enrichment, explicit
+profile refresh, LLM reranking, Observer extraction, fact synthesis, and cloud
+embeddings. Local compression and disabled embeddings do not disable those
+other features. See [PRIVACY.md](PRIVACY.md) for each trigger.
 
 **Recommended (Anthropic):** write the key to `~/.ironmem/api_key`:
 

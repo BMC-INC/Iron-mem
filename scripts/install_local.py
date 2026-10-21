@@ -59,11 +59,13 @@ def path_instructions(binary_path):
     on_path=bindir in os.environ.get('PATH','').split(os.pathsep)
     state='That directory is already on PATH for this process.' if on_path else 'That directory is not on PATH for this process.'
     if os.name=='nt':
+        # Single-quoted PowerShell literals preserve $, backticks, and commands.
+        path_prefix="'"+(bindir+';').replace("'","''")+"'"
         return (
             f'Installed {binary}. This installer does not modify PATH. {state}\n'
-            f'Current session: $env:Path = "{bindir};" + $env:Path\n'
+            f'Current session: $env:Path = {path_prefix} + $env:Path\n'
             'User PATH for new terminals:\n'
-            f'  [Environment]::SetEnvironmentVariable("Path", "{bindir};" + [Environment]::GetEnvironmentVariable("Path","User"), "User")\n'
+            f'  [Environment]::SetEnvironmentVariable("Path", {path_prefix} + [Environment]::GetEnvironmentVariable("Path","User"), "User")\n'
             'Cursor and other GUI apps may not expand ~ and may not inherit a shell PATH. '
             f'In MCP settings set command to this absolute path: {binary}\n'
             'Optional: rerun with --add-to-path DIR to symlink the binary into DIR.'
@@ -71,7 +73,7 @@ def path_instructions(binary_path):
     return (
         f'Installed {binary}. This installer does not modify PATH. {state}\n'
         'Add this to ~/.zshrc or ~/.bashrc, then open a new terminal:\n'
-        f'  export PATH="{bindir}:$PATH"\n'
+        f'  export PATH={shlex.quote(bindir)}:"$PATH"\n'
         'Or rerun with --add-to-path to symlink into ~/.local/bin (only helps if that directory is already on PATH).\n'
         'Cursor launched from a desktop icon often does not inherit shell PATH, and it may not expand ~ in MCP config. '
         f'Use command "ironmem" only when PATH is visible to Cursor, or set command to this absolute path: {binary}\n'
