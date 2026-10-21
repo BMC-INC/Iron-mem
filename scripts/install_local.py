@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 from evidence_common import connection
 import subprocess
+import sys
 import tempfile
 from urllib.parse import unquote
 
@@ -50,7 +51,50 @@ def merge_hooks(settings,hook_dir):
     return settings
 
 
-def install(source,prefix,claude_dir,binary=None,no_hooks=False,external_backup_confirmed=False):
+def path_instructions(binary_path):
+    """Tell the operator how to reach the binary. The installer does not edit PATH."""
+    binary_path=Path(binary_path)
+    bindir=str(binary_path.parent)
+    binary=str(binary_path)
+    on_path=bindir in os.environ.get('PATH','').split(os.pathsep)
+    state='That directory is already on PATH for this process.' if on_path else 'That directory is not on PATH for this process.'
+    if os.name=='nt':
+        # Single-quoted PowerShell literals preserve $, backticks, and commands.
+        path_prefix="'"+(bindir+';').replace("'","''")+"'"
+        return (
+            f'Installed {binary}. This installer does not modify PATH. {state}\n'
+            f'Current session: $env:Path = {path_prefix} + $env:Path\n'
+            'User PATH for new terminals:\n'
+            f'  [Environment]::SetEnvironmentVariable("Path", {path_prefix} + [Environment]::GetEnvironmentVariable("Path","User"), "User")\n'
+            'Cursor and other GUI apps may not expand ~ and may not inherit a shell PATH. '
+            f'In MCP settings set command to this absolute path: {binary}\n'
+            'Optional: rerun with --add-to-path DIR to symlink the binary into DIR.'
+        )
+    return (
+        f'Installed {binary}. This installer does not modify PATH. {state}\n'
+        'Add this to ~/.zshrc or ~/.bashrc, then open a new terminal:\n'
+        f'  export PATH={shlex.quote(bindir)}:"$PATH"\n'
+        'Or rerun with --add-to-path to symlink into ~/.local/bin (only helps if that directory is already on PATH).\n'
+        'Cursor launched from a desktop icon often does not inherit shell PATH, and it may not expand ~ in MCP config. '
+        f'Use command "ironmem" only when PATH is visible to Cursor, or set command to this absolute path: {binary}\n'
+        'The same absolute command is written to mcp.json beside the binary.'
+    )
+
+
+def link_binary(target, link_dir):
+    link_dir=Path(link_dir).expanduser().resolve()
+    link_dir.mkdir(parents=True, exist_ok=True)
+    link=link_dir/('ironmem.exe' if os.name=='nt' else 'ironmem')
+    target=Path(target).resolve()
+    if link.is_symlink() and link.resolve()==target:
+        return str(link)
+    if link.exists() or link.is_symlink():
+        raise OSError(f'{link} exists and is not an IronMem symlink; remove it or choose another directory')
+    os.symlink(target, link)
+    return str(link)
+
+
+def install(source,prefix,claude_dir,binary=None,no_hooks=False,external_backup_confirmed=False,link_dir=None):
     source=Path(source).resolve(); prefix=Path(prefix).resolve(); claude_dir=Path(claude_dir).resolve()
     if not no_hooks and prefix != (Path.home()/'.ironmem').resolve():
         no_hooks=True  # Custom installs use the absolute --config MCP descriptor.
@@ -111,9 +155,18 @@ def install(source,prefix,claude_dir,binary=None,no_hooks=False,external_backup_
             if old[p] is None: p.unlink()
             else: atomic(p,*old[p])
         raise
+    linked=None
+    link_error=None
+    if link_dir is not None:
+        try:
+            linked=link_binary(target, link_dir)
+        except OSError as exc:
+            link_error=str(exc)
+    instructions=path_instructions(target)
     return {'installed_binary':str(target),'changed_files':len(changes),'backup':str(backup) if backup else None,
             'mcp_configuration':str(prefix/'mcp.json'),'service_restarted':False,'hooks_installed':not no_hooks and os.name!='nt',
-            'note':'Local extraction needs no cloud key. Merge mcp.json into your assistant configuration. Restart running IronMem processes deliberately after verifying your backup.'}
+            'path_directory':str(target.parent),'path_instructions':instructions,'path_link':linked,'path_link_error':link_error,
+            'note':'Local extraction needs no cloud key. The binary is not placed on PATH; see path_instructions. Merge mcp.json (absolute command path) into your assistant configuration. On macOS and Linux, Claude Code hooks are installed unless --no-hooks was passed. Restart running IronMem processes deliberately after verifying your backup.'}
 
 
 def main():
@@ -124,8 +177,20 @@ def main():
     parser.add_argument('--binary',type=Path)
     parser.add_argument('--no-hooks',action='store_true')
     parser.add_argument('--external-backup-confirmed',action='store_true')
+    parser.add_argument('--add-to-path',nargs='?',const=str(Path.home()/'.local'/'bin'),default=None,
+                        help='Symlink ironmem into DIR (default: ~/.local/bin). Does not edit shell startup files.')
     args=parser.parse_args()
-    print(json.dumps(install(args.source,args.prefix,args.claude_dir,args.binary,args.no_hooks,args.external_backup_confirmed),indent=2))
+    result=install(args.source,args.prefix,args.claude_dir,args.binary,args.no_hooks,args.external_backup_confirmed,args.add_to_path)
+    print(json.dumps(result,indent=2))
+    print(result['path_instructions'], file=sys.stderr)
+    if result['hooks_installed']:
+        print('Claude Code hooks were installed. Pass --no-hooks to skip them. Cursor does not use these hooks.', file=sys.stderr)
+    elif os.name!='nt':
+        print('Claude Code hooks were not installed.', file=sys.stderr)
+    if result.get('path_link'):
+        print(f'Symlinked {result["path_link"]}', file=sys.stderr)
+    if result.get('path_link_error'):
+        print(f'Could not symlink onto PATH: {result["path_link_error"]}', file=sys.stderr)
 
 
 if __name__=='__main__': main()

@@ -708,6 +708,11 @@ pub struct EmbeddingConfig {
     pub model: Option<String>,
     #[serde(default = "default_ollama_url")]
     pub ollama_url: String,
+    /// When `provider` is `auto` and no local embedder is available, send
+    /// memory text to OpenAI if `OPENAI_API_KEY` is set. Off by default.
+    /// `IRONMEM_EMBED_ALLOW_CLOUD=1` enables the same path.
+    #[serde(default)]
+    pub allow_cloud_fallback: bool,
     #[serde(default)]
     pub weights: Weights,
     #[serde(default = "default_half_life")]
@@ -720,6 +725,7 @@ impl Default for EmbeddingConfig {
             provider: default_embed_provider(),
             model: None,
             ollama_url: default_ollama_url(),
+            allow_cloud_fallback: false,
             weights: Weights::default(),
             recency_half_life_days: default_half_life(),
         }
@@ -776,6 +782,17 @@ impl Weights {
 
 fn default_embed_provider() -> String {
     "auto".to_string()
+}
+
+/// Env wins when it is a recognized boolean. An unrecognized value stays off
+/// so a typo cannot send memory text to a cloud embedder.
+pub fn cloud_fallback_allowed(config_flag: bool, env_value: Option<&str>) -> bool {
+    match env_value.map(str::trim).map(str::to_ascii_lowercase) {
+        Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on") => true,
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off") => false,
+        Some(_) => false,
+        None => config_flag,
+    }
 }
 fn default_ollama_url() -> String {
     "http://localhost:11434".to_string()
@@ -904,6 +921,12 @@ impl Config {
 
     pub fn effective_mcp_transport(&self) -> String {
         std::env::var("IRONMEM_MCP_TRANSPORT").unwrap_or_else(|_| self.mcp_transport.clone())
+    }
+
+    /// `auto` may call OpenAI only when this is true and a key is present.
+    pub fn embedding_cloud_fallback_enabled(&self) -> bool {
+        let env = std::env::var("IRONMEM_EMBED_ALLOW_CLOUD").ok();
+        cloud_fallback_allowed(self.embedding.allow_cloud_fallback, env.as_deref())
     }
 
     pub fn effective_llm_max_attempts(&self) -> u32 {
@@ -1065,6 +1088,7 @@ mod tests {
     fn missing_embedding_key_yields_defaults() {
         let cfg: Config = serde_json::from_str(BASE).unwrap();
         assert_eq!(cfg.embedding.provider, "auto");
+        assert!(!cfg.embedding.allow_cloud_fallback);
         assert_eq!(cfg.embedding.weights.relevance, 0.5);
         assert_eq!(cfg.embedding.weights.recency, 0.3);
         assert_eq!(cfg.embedding.weights.importance, 0.2);
@@ -1093,6 +1117,17 @@ mod tests {
         assert_eq!(cfg.llm_retry.max_attempts, 3);
         assert_eq!(cfg.llm_retry.initial_backoff_ms, 500);
         assert_eq!(cfg.effective_llm_max_attempts(), 3);
+    }
+
+    #[test]
+    fn cloud_fallback_env_override_is_explicit() {
+        assert!(!cloud_fallback_allowed(false, None));
+        assert!(cloud_fallback_allowed(true, None));
+        assert!(cloud_fallback_allowed(false, Some("1")));
+        assert!(cloud_fallback_allowed(false, Some("true")));
+        assert!(!cloud_fallback_allowed(true, Some("0")));
+        assert!(!cloud_fallback_allowed(true, Some("false")));
+        assert!(!cloud_fallback_allowed(true, Some("maybe")));
     }
 
     #[test]

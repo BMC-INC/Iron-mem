@@ -16,17 +16,18 @@ We will acknowledge your report within 48 hours and aim to provide a fix or miti
 
 ## Scope
 
-IronMem runs entirely on your local machine. There is no cloud component, no telemetry, and no data leaves your machine (except API calls to your configured LLM provider, which you control).
+IronMem stores data on the machine where it runs. It does not send product analytics. Local access counters stay in the database. Memory text leaves the machine only on the paths described in [PRIVACY.md](PRIVACY.md).
 
-Security concerns most relevant to this project:
-- Local SQLite database access permissions
-- API key handling and storage
-- The HTTP server binds to `127.0.0.1` only (localhost)
+Network listeners:
+
+- `ironmem server` binds the REST API to `127.0.0.1` only.
+- When MCP transport is `sse` (`mcp_transport` in settings, or `IRONMEM_MCP_TRANSPORT=sse`), the MCP listener also defaults to `127.0.0.1`. Set `--mcp-sse-bind` or `IRONMEM_MCP_SSE_BIND` to listen on another interface. Binding a non-loopback address without `auth_token` prints a warning.
+- `ironmem serve` binds to `127.0.0.1` only and requires a bearer token unless you pass `--no-auth`.
 
 ## Supported Versions
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | Yes       |
+| 0.4.x   | Yes       |
 
 We only support the latest release. Please update before reporting.

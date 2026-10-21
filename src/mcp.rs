@@ -510,11 +510,12 @@ impl IronMemServer {
             ),
             Tool::new(
                 "wipe_project",
-                "Delete all memories for a project.",
+                "Delete all memories for a project. Pass confirm=false to preview the count without deleting. Omitting confirm still deletes, so existing clients keep working.",
                 schema(serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "project": { "type": "string", "description": "Project root path" }
+                        "project": { "type": "string", "description": "Project root path" },
+                        "confirm": { "type": "boolean", "description": "true deletes. false previews only. Omit to delete (existing clients)." }
                     },
                     "required": ["project"]
                 })),
@@ -1662,11 +1663,29 @@ impl IronMemServer {
             .get("project")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ErrorData::invalid_params("missing 'project'", None))?;
+        // Optional. `false` previews. Omitted or `true` deletes, matching older clients.
+        let confirm = match args.get("confirm") {
+            None => true,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                ErrorData::invalid_params("'confirm' must be a boolean when provided", None)
+            })?,
+        };
 
         // Capture ids before deletion so we can purge their vectors + metadata.
         let ids = db::memory_ids_for_project(&self.db, project)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        if !confirm {
+            let json = serde_json::json!({
+                "wiped": 0,
+                "would_wipe": ids.len(),
+                "project": project,
+                "dry_run": true,
+            });
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json).unwrap(),
+            )]));
+        }
         let mut count = 0_u64;
         for id in ids {
             match db::governed_delete_memory(
@@ -2154,8 +2173,34 @@ mod tests {
             crate::access::stats(&server.db, &[second]).await.unwrap()[&second].expansion_count,
             0
         );
+        // The counts above are the assertion. Deleting the temp database is
+        // cleanup. On Windows, SQLite can keep the file locked for a moment
+        // after the pool closes (ERROR_SHARING_VIOLATION, os error 32). That
+        // race is not the behavior under test, and every other test in this
+        // module ignores a failed delete.
+        close_and_remove_test_db(server, &path).await;
+    }
+
+    async fn close_and_remove_test_db(server: IronMemServer, path: &str) {
         server.db.pool.close().await;
-        std::fs::remove_file(path).unwrap();
+        drop(server);
+        let candidates = [
+            std::path::PathBuf::from(path),
+            std::path::PathBuf::from(format!("{path}-wal")),
+            std::path::PathBuf::from(format!("{path}-shm")),
+        ];
+        for candidate in candidates {
+            for _ in 0..30 {
+                match std::fs::remove_file(&candidate) {
+                    Ok(()) => break,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(err) if err.raw_os_error() == Some(32) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
     }
 
     async fn test_server() -> (IronMemServer, String) {
@@ -3036,5 +3081,125 @@ mod tests {
         assert_eq!(v["ok"], false);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn wipe_project_confirm_false_previews_without_deleting() {
+        let (server, path) = test_server().await;
+        let project = std::env::temp_dir().join(format!("ironmem-wipe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&project).unwrap();
+        let project_s = project.to_string_lossy().to_string();
+        let session = db::create_session(&server.db, &project_s).await.unwrap();
+        db::insert_memory(&server.db, &project_s, &session, "keep me", None)
+            .await
+            .unwrap();
+
+        let preview = serde_json::json!({"project": project_s, "confirm": false});
+        let preview_body: serde_json::Value = serde_json::from_str(&result_text(
+            &server
+                .handle_wipe_project(preview.as_object().unwrap())
+                .await
+                .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(preview_body["wiped"], 0);
+        assert_eq!(preview_body["would_wipe"], 1);
+        assert_eq!(preview_body["dry_run"], true);
+        assert_eq!(
+            db::memory_ids_for_project(&server.db, &project_s)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let wipe = serde_json::json!({"project": project_s, "confirm": true});
+        let wipe_body: serde_json::Value = serde_json::from_str(&result_text(
+            &server
+                .handle_wipe_project(wipe.as_object().unwrap())
+                .await
+                .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(wipe_body["wiped"], 1);
+        assert!(db::memory_ids_for_project(&server.db, &project_s)
+            .await
+            .unwrap()
+            .is_empty());
+
+        close_and_remove_test_db(server, &path).await;
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[tokio::test]
+    async fn wipe_project_rejects_invalid_confirm_without_mutation() {
+        let (server, path) = test_server().await;
+        let project = std::env::temp_dir().join(format!("ironmem-wipe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&project).unwrap();
+        let context = project.join("IRONMEM.md");
+        std::fs::write(&context, "keep this context").unwrap();
+        let project_s = project.to_string_lossy().to_string();
+        let session = db::create_session(&server.db, &project_s).await.unwrap();
+        let memory = db::insert_memory(&server.db, &project_s, &session, "keep me", None)
+            .await
+            .unwrap();
+
+        for invalid in [
+            serde_json::json!("false"),
+            serde_json::json!(null),
+            serde_json::json!(0),
+            serde_json::json!(1),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let args = serde_json::json!({"project": project_s, "confirm": invalid});
+            let error = server
+                .handle_wipe_project(args.as_object().unwrap())
+                .await
+                .expect_err("a malformed preview must not delete memories");
+            assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert_eq!(
+                db::memory_ids_for_project(&server.db, &project_s)
+                    .await
+                    .unwrap(),
+                vec![memory]
+            );
+            assert_eq!(
+                std::fs::read_to_string(&context).unwrap(),
+                "keep this context"
+            );
+        }
+
+        close_and_remove_test_db(server, &path).await;
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[tokio::test]
+    async fn wipe_project_omitted_confirm_preserves_legacy_delete() {
+        let (server, path) = test_server().await;
+        let project = std::env::temp_dir().join(format!("ironmem-wipe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&project).unwrap();
+        let project_s = project.to_string_lossy().to_string();
+        let session = db::create_session(&server.db, &project_s).await.unwrap();
+        db::insert_memory(&server.db, &project_s, &session, "legacy client", None)
+            .await
+            .unwrap();
+
+        let args = serde_json::json!({"project": project_s});
+        let body: serde_json::Value = serde_json::from_str(&result_text(
+            &server
+                .handle_wipe_project(args.as_object().unwrap())
+                .await
+                .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(body["wiped"], 1);
+        assert!(db::memory_ids_for_project(&server.db, &project_s)
+            .await
+            .unwrap()
+            .is_empty());
+
+        close_and_remove_test_db(server, &path).await;
+        let _ = std::fs::remove_dir_all(project);
     }
 }
