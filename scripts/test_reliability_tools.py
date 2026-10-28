@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 from evidence_common import connection
 import subprocess
+import sys
 import shutil
 import tempfile
 import unittest
@@ -17,6 +18,80 @@ from retention import plan, purge
 
 BINARY=Path(os.environ.get('IRONMEM_TEST_BINARY','target/debug/ironmem.exe' if os.name=='nt' else 'target/debug/ironmem')).resolve()
 SOURCE=Path(__file__).resolve().parent.parent
+
+
+class CodingFixtures(unittest.TestCase):
+    def check_slug_solution(self, solution):
+        task = next(task for task in json.loads(
+            (SOURCE/'tests/fixtures/coding/tasks.json').read_text())['tasks']
+            if task['id'] == 'slug-reuse')
+        with tempfile.TemporaryDirectory(prefix='ironmem-slug-check-') as temp:
+            root = Path(temp)
+            for name, content in task['files'].items():
+                (root/name).write_text(content)
+            (root/'solution.py').write_text(solution)
+            (root/'check.py').write_text(task['tests'])
+            return subprocess.run([sys.executable, '-B', 'check.py'], cwd=root,
+                                  env=clean_env(), capture_output=True, text=True,
+                                  timeout=10)
+
+    def test_slug_reuse_accepts_helper_delegation(self):
+        solutions = [
+            'import slug_utils\ndef project_slug(value):\n return slug_utils.canonical_slug(value)\n',
+            'from slug_utils import canonical_slug\ndef project_slug(value):\n return canonical_slug(value)\n',
+            'import slug_utils as slugs\ndef project_slug(value):\n return slugs.canonical_slug(value)\n',
+            'from slug_utils import canonical_slug as slug\ndef project_slug(value):\n return slug(value)\n',
+            'from slug_utils import canonical_slug as project_slug\n',
+        ]
+        for solution in solutions:
+            with self.subTest(solution=solution):
+                result = self.check_slug_solution(solution)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_slug_reuse_rejects_unused_import_and_constant(self):
+        result = self.check_slug_solution(
+            'import slug_utils\ndef project_slug(value):\n return "hello-world"\n')
+        self.assertNotEqual(result.returncode, 0, 'unused import received reuse credit')
+
+    def test_slug_reuse_rejects_duplicate_normalization(self):
+        result = self.check_slug_solution(
+            'import slug_utils, re\ndef project_slug(value):\n'
+            ' return re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")\n')
+        self.assertNotEqual(result.returncode, 0, 'duplicate implementation received reuse credit')
+
+    def test_slug_reuse_rejects_discarded_helper_result(self):
+        result = self.check_slug_solution(
+            'import slug_utils, re\ndef project_slug(value):\n'
+            ' slug_utils.canonical_slug(value)\n'
+            ' return re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")\n')
+        self.assertNotEqual(result.returncode, 0, 'discarded helper output received reuse credit')
+
+    def test_slug_reuse_rejects_changed_helper_argument(self):
+        result = self.check_slug_solution(
+            'from slug_utils import canonical_slug\ndef project_slug(value):\n'
+            ' return canonical_slug(value.strip())\n')
+        self.assertNotEqual(result.returncode, 0, 'changed input was not detected')
+
+    def test_slug_reuse_rejects_cached_helper_result(self):
+        result = self.check_slug_solution(
+            'from slug_utils import canonical_slug\n'
+            'cached = canonical_slug(" Hello__World! ")\n'
+            'def project_slug(value):\n return cached\n')
+        self.assertNotEqual(result.returncode, 0, 'cached output received reuse credit')
+
+    def test_slug_reuse_checks_inputs_beyond_original_example(self):
+        result = self.check_slug_solution(
+            'from slug_utils import canonical_slug\ndef project_slug(value):\n'
+            ' if value == " Hello__World! ": return canonical_slug(value)\n'
+            ' return "hello-world"\n')
+        self.assertNotEqual(result.returncode, 0, 'single-example implementation passed')
+
+    def test_slug_reuse_checks_real_helper_behavior(self):
+        result = self.check_slug_solution(
+            'from slug_utils import canonical_slug\ndef project_slug(value):\n'
+            ' result = canonical_slug(value)\n'
+            ' return result if not isinstance(result, str) else "wrong"\n')
+        self.assertNotEqual(result.returncode, 0, 'probe-only implementation passed')
 
 
 class Tools(unittest.TestCase):
