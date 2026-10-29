@@ -1,6 +1,6 @@
 [package]
 name = "ironmem"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Persistent session memory for AI coding assistants"
 license = "Apache-2.0"
@@ -23,10 +23,14 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["json"] }
 
 # MCP protocol
-rmcp = { version = "1.4", features = ["server", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.8", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgres", "any"] }
+# Keep SQLx internals in lockstep; only SQLite and PostgreSQL are supported.
+# The umbrella crate resolves the unused MySQL/RSA graph into Cargo.lock.
+sqlx-core = { version = "=0.8.6", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any"] }
+sqlx-sqlite = { version = "=0.8.6", features = ["any", "bundled"] }
+sqlx-postgres = { version = "=0.8.6", features = ["any"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -48,7 +52,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # CCR: content-addressed reversible blob store
-zstd = "0.13"
+zstd = "0.14.3"
 fastcdc = "=4.0.1"
 sha2 = "0.10"
 hmac = "0.12"

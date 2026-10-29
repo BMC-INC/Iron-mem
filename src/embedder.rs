@@ -189,22 +189,22 @@ impl Embedder for ApiEmbedder {
                 struct Resp {
                     embedding: Values,
                 }
-                let url = format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent?key={}",
-                    self.model, self.api_key
-                );
+                let client = crate::provider::google_api_client()?;
                 let mut out = Vec::with_capacity(texts.len());
                 for t in texts {
-                    let resp = self
-                        .client
-                        .post(&url)
-                        .json(&Req {
-                            content: Content {
-                                parts: vec![Part { text: t }],
-                            },
-                        })
-                        .send()
-                        .await?;
+                    let resp = crate::provider::google_request(
+                        &client,
+                        &self.model,
+                        "embedContent",
+                        &self.api_key,
+                    )?
+                    .json(&Req {
+                        content: Content {
+                            parts: vec![Part { text: t }],
+                        },
+                    })
+                    .send()
+                    .await?;
                     if !resp.status().is_success() {
                         return Err(anyhow!(
                             "Google embed error {}: {}",

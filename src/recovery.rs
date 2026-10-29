@@ -1,5 +1,6 @@
 //! Offline extraction receipts, health, and restart-safe transcript backfill.
 
+use crate::sqlx;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Serialize;

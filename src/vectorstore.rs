@@ -2,6 +2,7 @@
 //! `embeddings` table; each backend also syncs a real ANN index (vec0 /
 //! pgvector). `BruteForceStore` is the genuine no-extension fallback.
 
+use crate::sqlx;
 use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::Row;

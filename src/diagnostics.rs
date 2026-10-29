@@ -1,5 +1,6 @@
 //! An administrative preview of the real lexical retrieval and influence path.
 //! Rank means lexical candidate position, never an invented semantic score.
+use crate::sqlx;
 use crate::{access, config::Config, db, egress, influence::PolicyPrincipal};
 use anyhow::{ensure, Result};
 use serde::Deserialize;

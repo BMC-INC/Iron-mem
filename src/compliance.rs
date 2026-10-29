@@ -554,6 +554,7 @@ pub async fn verify_current_ledger_epoch(
 mod tests {
     use super::*;
     use crate::governance::ledger_entry_hash;
+    use crate::sqlx;
 
     async fn test_db() -> Result<(Database, String)> {
         let path = std::env::temp_dir().join(format!(

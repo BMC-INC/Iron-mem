@@ -889,38 +889,13 @@ async fn run_synthesis(
     Ok(Json(report))
 }
 
-#[derive(Deserialize)]
-pub struct CodeRelinkRequest {
-    pub project: String,
-    pub dry_run: Option<bool>,
-    pub anchor_only: Option<bool>,
-    pub relink_only: Option<bool>,
-}
-
-async fn code_relink(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<CodeRelinkRequest>,
-) -> Result<Json<crate::code_anchor::CodeRelinkReport>, (StatusCode, String)> {
-    let dry_run = body.dry_run.unwrap_or(true);
-    let mut combined = crate::code_anchor::CodeRelinkReport {
-        dry_run,
-        ..Default::default()
-    };
-    if !body.relink_only.unwrap_or(false) {
-        let r = crate::code_anchor::anchor_project(&state.db, &body.project, dry_run)
-            .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        combined.scanned_symbols = combined.scanned_symbols.max(r.scanned_symbols);
-        combined.anchors_created += r.anchors_created;
-    }
-    if !body.anchor_only.unwrap_or(false) {
-        let r = crate::code_anchor::relink_project(&state.db, &body.project, dry_run)
-            .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        combined.scanned_symbols = combined.scanned_symbols.max(r.scanned_symbols);
-        combined.anchors_relinked += r.anchors_relinked;
-    }
-    Ok(Json(combined))
+async fn code_relink() -> (StatusCode, &'static str) {
+    // Filesystem maintenance is available only to the direct local CLI. A
+    // loopback HTTP caller or agent namespace grant does not authorize paths.
+    (
+        StatusCode::FORBIDDEN,
+        "Filesystem code relinking is CLI-only; run ironmem code-relink locally",
+    )
 }
 
 #[derive(Deserialize)]
@@ -2423,9 +2398,91 @@ async fn api_list_sessions(
 #[cfg(test)]
 mod workbench_tests {
     use super::*;
+    use crate::sqlx;
     use axum::body::{to_bytes, Body};
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn code_relink_denies_http_without_changing_local_anchoring() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = db::Database::new(dir.path().join("rest.db").to_str().unwrap())
+            .await
+            .unwrap();
+        database.migrate().await.unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("lib.rs"), "fn tenant_secret() {}\n").unwrap();
+        let project = project.to_str().unwrap();
+        let session = db::create_session(&database, project).await.unwrap();
+        db::insert_memory(&database, project, &session, "tenant_secret", None)
+            .await
+            .unwrap();
+        let request = |project: &str, token: Option<&str>| {
+            let mut builder = HttpRequest::builder()
+                .method("POST")
+                .uri("/code/relink")
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                builder = builder.header("authorization", format!("Bearer {token}"));
+            }
+            builder
+                .body(Body::from(
+                    serde_json::json!({"project": project, "dry_run": false}).to_string(),
+                ))
+                .unwrap()
+        };
+        let mut config = Config::default();
+        config.agent_keys = vec![crate::config::AgentKeyConfig {
+            token: "test-agent-key".into(),
+            agent_id: "tenant-agent".into(),
+            namespaces: vec!["other-tenant".into()],
+            capabilities: vec!["code:write".into()],
+        }];
+        let app = router(AppState {
+            db: database.clone(),
+            config,
+            embedder: None,
+            store: Arc::new(crate::vectorstore::BruteForceStore),
+        });
+        for target in [project, "/nonexistent/secret-project"] {
+            let response = app
+                .clone()
+                .oneshot(request(target, Some("test-agent-key")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        assert!(db::code_anchors_for_project(&database, project)
+            .await
+            .unwrap()
+            .is_empty());
+        let local = router(AppState {
+            db: database.clone(),
+            config: Config::default(),
+            embedder: None,
+            store: Arc::new(crate::vectorstore::BruteForceStore),
+        });
+        let response = local.oneshot(request(project, None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(db::code_anchors_for_project(&database, project)
+            .await
+            .unwrap()
+            .is_empty());
+        // The CLI invokes this path directly, without an HTTP request.
+        let report = crate::code_anchor::anchor_project(&database, project, false)
+            .await
+            .unwrap();
+        assert_eq!(report.anchors_created, 1);
+        assert_eq!(
+            db::code_anchors_for_project(&database, project)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        database.pool.close().await;
+    }
 
     #[tokio::test]
     async fn diagnostics_rest_contract() {

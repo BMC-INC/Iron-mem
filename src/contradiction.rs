@@ -298,6 +298,7 @@ pub async fn list_for_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sqlx;
 
     #[test]
     fn claim_keys_are_canonical_and_cardinality_is_explicit() {

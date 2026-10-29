@@ -1,0 +1,4 @@
+# Golden compression fixtures must retain their exact original bytes on Windows.
+tests/fixtures/ccr/zstd-0.13.3/source.txt text eol=lf
+tests/fixtures/ccr/zstd-0.13.3/*.zst binary
+tests/fixtures/ccr/zstd-0.13.3/*.bin binary

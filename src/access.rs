@@ -1,6 +1,7 @@
 //! Delivery telemetry. No candidate read or authorization decision records access.
 //! Counts cover this installation's observation window, not unknown prior history.
 use crate::db::{Database, Memory};
+use crate::sqlx;
 use anyhow::{ensure, Result};
 use serde::Serialize;
 use sqlx::Row;
