@@ -24,8 +24,14 @@ truncated to the same byte ceiling. `ironmem` uses the real lexical search and
 shared governance path, rendered with the production byte-budget function. This
 baseline does not claim to measure optional semantic reranking or working sets.
 Budgets apply to memory context; the identical task prompt/starter files are extra.
-No-memory latency excludes storage work by design. Reuse is an executable import
-check, not a measurement of developer time saved.
+No-memory latency excludes storage work by design. Reuse is an executable
+delegation check, not a measurement of developer time saved. The slug fixture
+patches the canonical helper before importing the solution, so module imports,
+from-imports and aliases are checked for actual calls with the original input and
+return of the helper's result. It then reloads the solution with the real helper
+and checks normalization on several inputs. An unused import earns no reuse credit.
+This strengthens the fixture for future runs; historical result artifacts retain
+their original fixture hashes and outcomes.
 
 For a scored run, `--agent` accepts a JSON descriptor with `command` (an argv
 array), `model`, `version`, and `settings`. The trusted local command reads one
