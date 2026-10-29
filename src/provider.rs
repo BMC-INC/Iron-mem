@@ -762,12 +762,32 @@ struct GeminiPartResp {
     text: Option<String>,
 }
 
+pub(crate) fn google_api_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
+pub(crate) fn google_request(
+    client: &reqwest::Client,
+    model: &str,
+    operation: &str,
+    api_key: &str,
+) -> Result<reqwest::RequestBuilder> {
+    // Query credentials appear in reqwest connection-error URLs. Keep the key
+    // in a sensitive header instead; the Google client also forbids redirects.
+    let mut key = reqwest::header::HeaderValue::from_str(api_key)?;
+    key.set_sensitive(true);
+    Ok(client
+        .post(format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{model}:{operation}"
+        ))
+        .header("x-goog-api-key", key))
+}
+
 async fn google_text(prompt: &str, model: &str, api_key: &str) -> Result<String> {
-    let client = reqwest::Client::new();
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        model, api_key
-    );
+    let client = google_api_client()?;
 
     let req = GeminiRequest {
         contents: vec![GeminiContent {
@@ -779,8 +799,7 @@ async fn google_text(prompt: &str, model: &str, api_key: &str) -> Result<String>
         generation_config: None,
     };
 
-    let resp = client
-        .post(&url)
+    let resp = google_request(&client, model, "generateContent", api_key)?
         .header("content-type", "application/json")
         .json(&req)
         .send()
@@ -883,6 +902,26 @@ async fn vertex_text(prompt: &str, model: &str, config: &Config) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn google_credentials_are_excluded_from_urls_and_debug_output() {
+        let client = google_api_client().unwrap();
+        for operation in ["generateContent", "embedContent"] {
+            let request = google_request(&client, "test-model", operation, "synthetic-secret-key")
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(request.url().scheme(), "https");
+            assert_eq!(
+                request.url().host_str(),
+                Some("generativelanguage.googleapis.com")
+            );
+            assert!(request.url().query().is_none());
+            assert_eq!(request.headers()["x-goog-api-key"], "synthetic-secret-key");
+            assert!(request.headers()["x-goog-api-key"].is_sensitive());
+            assert!(!format!("{request:?}").contains("synthetic-secret-key"));
+        }
+    }
 
     #[test]
     fn parse_response_extracts_facts_block() {

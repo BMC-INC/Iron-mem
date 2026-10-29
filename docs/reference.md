@@ -110,6 +110,11 @@ Chunked writes use `IRONMEM_CCR_CHUNK_THRESHOLD_BYTES`, from 131072 through 5368
   benchmark-scale runs and a safe fallback when the model is unavailable.
 - **AST-bound Rust anchors** - `ironmem code-relink` uses Tree-sitter to hash Rust
   symbols and relink memories when code moves across files.
+  Filesystem relinking is a local operator action: REST `/code/relink` rejects
+  configured agent identities, including agents with namespace grants. Scans
+  skip symbolic links and stay within the canonical project root, with limits
+  of 64 directory levels, 100,000 entries, 10,000 Rust files, 8 MiB per source
+  file and 128 MiB total source. Exceeding a limit fails before anchor writes.
 - **Reflection, snapshots, and sync** - dry-run-first consolidation proposals,
   CCR-backed project brain snapshots, and an idempotent Lamport-clock sync event
   log support long-lived and multi-agent memory workflows.

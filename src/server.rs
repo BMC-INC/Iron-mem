@@ -899,8 +899,17 @@ pub struct CodeRelinkRequest {
 
 async fn code_relink(
     State(state): State<Arc<AppState>>,
+    agent: Option<axum::Extension<AgentIdentity>>,
     Json(body): Json<CodeRelinkRequest>,
 ) -> Result<Json<crate::code_anchor::CodeRelinkReport>, (StatusCode, String)> {
+    // Filesystem maintenance is an operator action. Agent namespace grants do
+    // not authorize local paths or anchors belonging to other namespaces.
+    if agent.is_some() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Code relinking requires the local operator; use ironmem code-relink".into(),
+        ));
+    }
     let dry_run = body.dry_run.unwrap_or(true);
     let mut combined = crate::code_anchor::CodeRelinkReport {
         dry_run,
@@ -2426,6 +2435,78 @@ mod workbench_tests {
     use axum::body::{to_bytes, Body};
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn code_relink_denies_agents_before_filesystem_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = db::Database::new(dir.path().join("rest.db").to_str().unwrap())
+            .await
+            .unwrap();
+        database.migrate().await.unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("lib.rs"), "fn tenant_secret() {}\n").unwrap();
+        let project = project.to_str().unwrap();
+        let session = db::create_session(&database, project).await.unwrap();
+        db::insert_memory(&database, project, &session, "tenant_secret", None)
+            .await
+            .unwrap();
+        let request = |project: &str, token: Option<&str>| {
+            let mut builder = HttpRequest::builder()
+                .method("POST")
+                .uri("/code/relink")
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                builder = builder.header("authorization", format!("Bearer {token}"));
+            }
+            builder
+                .body(Body::from(
+                    serde_json::json!({"project": project, "dry_run": false}).to_string(),
+                ))
+                .unwrap()
+        };
+        let mut config = Config::default();
+        config.agent_keys = vec![crate::config::AgentKeyConfig {
+            token: "test-agent-key".into(),
+            agent_id: "tenant-agent".into(),
+            namespaces: vec!["other-tenant".into()],
+            capabilities: vec!["code:write".into()],
+        }];
+        let app = router(AppState {
+            db: database.clone(),
+            config,
+            embedder: None,
+            store: Arc::new(crate::vectorstore::BruteForceStore),
+        });
+        for target in [project, "/nonexistent/secret-project"] {
+            let response = app
+                .clone()
+                .oneshot(request(target, Some("test-agent-key")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        assert!(db::code_anchors_for_project(&database, project)
+            .await
+            .unwrap()
+            .is_empty());
+        let local = router(AppState {
+            db: database.clone(),
+            config: Config::default(),
+            embedder: None,
+            store: Arc::new(crate::vectorstore::BruteForceStore),
+        });
+        let response = local.oneshot(request(project, None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            db::code_anchors_for_project(&database, project)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        database.pool.close().await;
+    }
 
     #[tokio::test]
     async fn diagnostics_rest_contract() {
