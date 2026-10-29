@@ -398,6 +398,7 @@ mod tests {
     use super::*;
     use crate::influence::{ActionRisk, InfluenceState};
     use crate::purpose::{PurposeAuthority, VerifiedRecallPurpose};
+    use crate::sqlx;
     use sqlx::Row;
 
     fn purpose(task: &str, risk: ActionRisk) -> VerifiedRecallPurpose {

@@ -1,6 +1,7 @@
 //! Flat, versioned FastCDC objects. Ownership edges, not chunk refcounts, drive GC.
 use super::{sha256_hex, BlobRef};
 use crate::db::{BlobRow, Database};
+use crate::sqlx;
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;

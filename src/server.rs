@@ -2432,6 +2432,7 @@ async fn api_list_sessions(
 #[cfg(test)]
 mod workbench_tests {
     use super::*;
+    use crate::sqlx;
     use axum::body::{to_bytes, Body};
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;

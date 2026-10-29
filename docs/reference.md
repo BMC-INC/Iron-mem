@@ -248,7 +248,7 @@ With IronMem:
 - [Multi-Provider Support](#multi-provider-support)
 - [MCP Setup](#mcp-setup)
 - [MCP Tools](#mcp-tools)
-- [Web UI](#web-ui)
+- [Memory Graph Workbench](#memory-graph-workbench)
 - [Governed Memory](#governed-memory)
 - [Configuration](#configuration)
 - [Testing Status](#testing-status)

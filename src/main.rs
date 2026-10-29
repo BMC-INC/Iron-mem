@@ -38,6 +38,7 @@ mod reranker;
 mod retrieval;
 mod server;
 mod snapshot;
+mod sqlx;
 mod storage;
 mod strutil;
 mod sweep;

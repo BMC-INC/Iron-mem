@@ -1,5 +1,6 @@
 //! Opt-in structured claims. Events are immutable through the public API; current
 //! pointers are derived, never selected by popularity or last-writer-wins.
+use crate::sqlx;
 use crate::{
     db::{self, Backend, Database},
     egress,

@@ -1,6 +1,7 @@
 //! Transactional row-mutation telemetry for supported mutable memory metadata.
 //! This is an operational counter, not a semantic replay journal.
 use crate::db::{Backend, Database};
+use crate::sqlx;
 use anyhow::Result;
 
 pub async fn migrate(db: &Database) -> Result<()> {

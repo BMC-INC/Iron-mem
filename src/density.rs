@@ -1,4 +1,5 @@
 //! Reproducible local storage/context frontier. Unmeasured quantities stay null.
+use crate::sqlx;
 use crate::{
     ccr,
     db::{self, Database, Memory},

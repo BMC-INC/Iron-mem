@@ -1,6 +1,7 @@
 //! Project checkpoints capture authoritative relational state under one transaction.
 //! Incremental storage uses canonical row-set differences, avoiding incomplete write hooks.
 use crate::db::{Backend, BrainSnapshot, Database};
+use crate::sqlx;
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

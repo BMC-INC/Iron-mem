@@ -2387,6 +2387,7 @@ mod tests {
     use crate::db::{create_session, insert_memory, NewMemoryEdge};
     use crate::embedder::FakeEmbedder;
     use crate::embedding_codec::normalize;
+    use crate::sqlx;
     use crate::vectorstore::SqliteVecStore;
 
     #[test]
