@@ -110,8 +110,8 @@ Chunked writes use `IRONMEM_CCR_CHUNK_THRESHOLD_BYTES`, from 131072 through 5368
   benchmark-scale runs and a safe fallback when the model is unavailable.
 - **AST-bound Rust anchors** - `ironmem code-relink` uses Tree-sitter to hash Rust
   symbols and relink memories when code moves across files.
-  Filesystem relinking is a local operator action: REST `/code/relink` rejects
-  configured agent identities, including agents with namespace grants. Scans
+  Filesystem relinking is available through the local CLI only: REST
+  `/code/relink` returns 403 for all callers with guidance to use the CLI. Scans
   skip symbolic links and stay within the canonical project root, with limits
   of 64 directory levels, 100,000 entries, 10,000 Rust files, 8 MiB per source
   file and 128 MiB total source. Exceeding a limit fails before anchor writes.
@@ -830,6 +830,21 @@ claude.ai connector.
 [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
 for best results. IronMem falls back to `npx cloudflared` if it is not installed.
 
+The HTTP transport accepts loopback Host values by default. IronMem's managed
+public tunnel rewrites its upstream Host to `localhost`. For another reverse
+proxy, either preserve that rewrite or set `IRONMEM_MCP_ALLOWED_HOSTS` to a
+comma-separated list such as `memory.example.com:443,localhost`. Entries with a
+port match that port exactly; a hostname without a port permits any port. A
+custom list replaces the defaults, so retain `localhost` when using the managed
+tunnel. Wildcards and malformed or empty entries stop startup.
+
+Native MCP clients normally omit Origin. Browser clients must have their exact
+origin listed in `IRONMEM_MCP_ALLOWED_ORIGINS`, for example
+`https://assistant.example.com`. Omitted HTTP/HTTPS ports mean 80/443, not any
+port. Credentials, URL paths and wildcards are rejected. The default rejects
+requests carrying Origin; it continues to accept native requests without Origin.
+These settings affect HTTP transport only; stdio configuration is unchanged.
+
 ### Other MCP Clients
 
 Any MCP client that supports **stdio** transport can use IronMem. Use an
@@ -1299,6 +1314,8 @@ mode.
 | `DATABASE_URL` | _(none)_ | Postgres URL. Overrides `db_path` when set. |
 | `IRONMEM_MCP_TRANSPORT` | `stdio` | MCP transport: `stdio` or `sse` |
 | `IRONMEM_MCP_SSE_BIND` | `127.0.0.1` | Host for `ironmem server` MCP SSE. `--mcp-sse-bind` overrides it. Non-loopback without `auth_token` logs a warning |
+| `IRONMEM_MCP_ALLOWED_HOSTS` | Loopback hosts | HTTP Host allowlist; comma-separated exact hosts or host:port entries. A custom list replaces the defaults. |
+| `IRONMEM_MCP_ALLOWED_ORIGINS` | No browser origins | Exact HTTP(S) origins allowed on HTTP transport; native requests without Origin are accepted. |
 | `IRONMEM_EMBED_ALLOW_CLOUD` | off | `1` / `true` lets `auto` send memory text to OpenAI when no local embedder is available and `OPENAI_API_KEY` is set |
 | `ANTHROPIC_API_KEY` | _(none)_ | Optional; used when cloud enrichment selects Anthropic |
 | `OPENAI_API_KEY` | _(none)_ | Optional; used when cloud enrichment selects OpenAI |

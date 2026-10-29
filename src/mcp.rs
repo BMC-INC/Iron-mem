@@ -45,16 +45,99 @@ fn purpose_schema() -> serde_json::Value {
 /// (e.g. unknown id / missing blob) — distinct from an MCP protocol error.
 fn error_result(message: impl Into<String>) -> CallToolResult {
     let json = serde_json::json!({ "ok": false, "error": message.into() });
-    CallToolResult::success(vec![Content::text(
+    CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&json).unwrap(),
     )])
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    if headers.get_all(header::AUTHORIZATION).iter().count() != 1 {
+        return None;
+    }
     headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+fn http_server_config(
+    allowed_hosts: Option<&str>,
+    allowed_origins: Option<&str>,
+) -> Result<StreamableHttpServerConfig> {
+    // Preserve stateless JSON responses and the existing client protocol range.
+    // Native MCP clients omit Origin; browser clients must be explicitly allowed.
+    let mut config = StreamableHttpServerConfig::default().enforce_origin_validation();
+    config.json_response = true;
+    config.legacy_session_mode = false;
+    if let Some(hosts) = allowed_hosts {
+        let mut validated = Vec::new();
+        for host in hosts.split(',').map(str::trim) {
+            let authority: axum::http::uri::Authority = host.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "IRONMEM_MCP_ALLOWED_HOSTS must contain hostnames or host:port authorities"
+                )
+            })?;
+            anyhow::ensure!(
+                !host.is_empty()
+                    && !host.contains(['*', '@', '/', '?', '#'])
+                    && !authority.host().is_empty(),
+                "IRONMEM_MCP_ALLOWED_HOSTS cannot contain empty entries, wildcards or URL components"
+            );
+            validated.push(host.to_owned());
+        }
+        config.allowed_hosts = validated;
+    }
+    if let Some(origins) = allowed_origins {
+        for origin in origins.split(',').map(str::trim) {
+            let url = reqwest::Url::parse(origin).map_err(|_| {
+                anyhow::anyhow!("IRONMEM_MCP_ALLOWED_ORIGINS must contain HTTP(S) origins")
+            })?;
+            anyhow::ensure!(
+                matches!(url.scheme(), "http" | "https")
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.path() == "/"
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+                    && !origin.contains('*'),
+                "IRONMEM_MCP_ALLOWED_ORIGINS must contain exact HTTP(S) origins without credentials, paths or wildcards"
+            );
+            let host = url
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("Origin needs a hostname"))?;
+            // rmcp's current portless entries match every port. Always record an
+            // explicit port so https://example.com means port 443 only.
+            config.allowed_origins.push(format!(
+                "{}://{}:{}",
+                url.scheme(),
+                host,
+                url.port_or_known_default()
+                    .expect("HTTP(S) has a default port")
+            ));
+        }
+    }
+    Ok(config)
+}
+
+fn optional_env(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(anyhow::anyhow!("Invalid {name}: {error}")),
+    }
+}
+
+fn http_router(server: IronMemServer, http_config: StreamableHttpServerConfig) -> axum::Router {
+    let auth_token = server.config.auth_token.clone();
+    let service = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        Arc::new(LocalSessionManager::default()),
+        http_config,
+    );
+    with_optional_bearer_auth(
+        axum::Router::new().route("/mcp", axum::routing::any_service(service)),
+        auth_token,
+    )
 }
 
 async fn require_bearer_auth(request: Request, next: Next, auth_token: String) -> Response {
@@ -143,7 +226,7 @@ impl IronMemServer {
             crate::diagnostics::handle(&self.db, &self.config, &self.policy_principal, request)
                 .await
                 .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             report.to_string(),
         )]))
     }
@@ -159,7 +242,7 @@ impl IronMemServer {
             crate::assertions::handle(&self.db, &self.config, &self.policy_principal, request)
                 .await
                 .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string(&result).unwrap(),
         )]))
     }
@@ -534,7 +617,7 @@ impl IronMemServer {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let json = serde_json::json!({ "session_id": session_id });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -560,7 +643,7 @@ impl IronMemServer {
                 "skipped": true,
                 "reason": "No tool calls recorded"
             });
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 serde_json::to_string_pretty(&json).unwrap(),
             )]));
         }
@@ -572,7 +655,7 @@ impl IronMemServer {
                     "memory_id": memory_id,
                     "skipped": false
                 });
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::to_string_pretty(&json).unwrap(),
                 )]))
             }
@@ -583,7 +666,7 @@ impl IronMemServer {
                     "skipped": true,
                     "reason": format!("Compression failed: {}", e)
                 });
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::to_string_pretty(&json).unwrap(),
                 )]))
             }
@@ -619,7 +702,7 @@ impl IronMemServer {
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let json = serde_json::json!({ "id": id });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -693,7 +776,7 @@ impl IronMemServer {
                         serde_json::to_value(gate.decisions).unwrap_or_default(),
                     );
                 }
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::to_string_pretty(&json).unwrap(),
                 )]))
             }
@@ -716,7 +799,7 @@ impl IronMemServer {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let json = serde_json::json!({ "memory_id": memory_id });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -828,7 +911,7 @@ impl IronMemServer {
             "event_times": event_times,
             "evidence_chains": evidence_chains
         });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -904,7 +987,7 @@ impl IronMemServer {
         )
         .await;
         let json = serde_json::json!({ "chunks": authorized_chunks, "advisory_chunks": advisory_chunks, "influence_decisions": gate.decisions, "event_times": event_times });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -932,7 +1015,7 @@ impl IronMemServer {
                 "events": db::influence_event_status(&self.db).await.unwrap_or_else(|_| serde_json::json!({})),
             },
         });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -972,7 +1055,7 @@ impl IronMemServer {
         .await;
         clip_recall_summaries(&mut gate, args);
         let json = serde_json::json!({ "memories": gate.authorized, "advisory_memories": gate.advisory, "influence_decisions": gate.decisions, "event_times": event_times });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -1018,7 +1101,7 @@ impl IronMemServer {
         .await;
         clip_recall_summaries(&mut gate, args);
         let json = serde_json::json!({ "memories": gate.authorized, "advisory_memories": gate.advisory, "influence_decisions": gate.decisions, "event_times": event_times });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -1060,7 +1143,7 @@ impl IronMemServer {
         .await;
         clip_recall_summaries(&mut gate, args);
         let json = serde_json::json!({ "memories": gate.authorized, "advisory_memories": gate.advisory, "influence_decisions": gate.decisions, "event_times": event_times });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -1073,7 +1156,7 @@ impl IronMemServer {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let json = serde_json::json!({ "projects": projects });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -1090,7 +1173,7 @@ impl IronMemServer {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let json = serde_json::json!({ "sessions": sessions });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -1168,7 +1251,7 @@ impl IronMemServer {
             "denied_memory_ids": gate.denied_memory_ids,
             "influence_decisions": gate.decisions,
         });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -1292,7 +1375,7 @@ impl IronMemServer {
             "kind": db::clamp_kind(kind),
             "event_at": event_at,
         });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -1316,7 +1399,7 @@ impl IronMemServer {
         {
             Ok(policy) => {
                 let value = serde_json::json!({ "ok": true, "record": policy });
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::to_string_pretty(&value).unwrap(),
                 )]))
             }
@@ -1413,7 +1496,7 @@ impl IronMemServer {
         {
             Ok(policy) => {
                 let value = serde_json::json!({ "ok": true, "record": policy });
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::to_string_pretty(&value).unwrap(),
                 )]))
             }
@@ -1426,7 +1509,7 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let json = serde_json::json!({ "ok": true, "profile": profile });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -1449,7 +1532,7 @@ impl IronMemServer {
             "regenerated": id.is_some(),
             "profile": profile,
         });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -1466,7 +1549,7 @@ impl IronMemServer {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let json = serde_json::json!({ "corrections": corrections });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -1511,7 +1594,7 @@ impl IronMemServer {
             "at_time": at_time,
             "edges": edges,
         });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -1529,7 +1612,7 @@ impl IronMemServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let json = serde_json::json!({ "ok": true, "report": report });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -1628,7 +1711,7 @@ impl IronMemServer {
             _ => return Err(ErrorData::invalid_params("unknown operation", None)),
         }
         .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&result).unwrap(),
         )]))
     }
@@ -1653,7 +1736,7 @@ impl IronMemServer {
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let json = serde_json::json!({ "ok": true, "report": report });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -1682,7 +1765,7 @@ impl IronMemServer {
                 "project": project,
                 "dry_run": true,
             });
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 serde_json::to_string_pretty(&json).unwrap(),
             )]));
         }
@@ -1716,7 +1799,7 @@ impl IronMemServer {
             "wiped": count,
             "project": project,
         });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&json).unwrap(),
         )]))
     }
@@ -1842,7 +1925,7 @@ fn policy_tool_error(error: anyhow::Error) -> CallToolResult {
             }
         })
     };
-    CallToolResult::error(vec![Content::text(
+    CallToolResult::error(vec![ContentBlock::text(
         serde_json::to_string_pretty(&value).unwrap(),
     )])
 }
@@ -1869,8 +1952,8 @@ fn string_array_arg(
 }
 
 impl ServerHandler for IronMemServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("IronMem", env!("CARGO_PKG_VERSION")))
     }
 
@@ -1886,9 +1969,9 @@ impl ServerHandler for IronMemServer {
         &self,
         request: CallToolRequestParams,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         let args = request.arguments.unwrap_or_default();
-        match request.name.as_ref() {
+        let result = match request.name.as_ref() {
             "memory_diagnose" => self.handle_diagnose(&args).await,
             "memory_assertion" => self.handle_assertion(&args).await,
             "session_start" => self.handle_session_start(&args).await,
@@ -1920,7 +2003,8 @@ impl ServerHandler for IronMemServer {
                 format!("unknown tool: {}", request.name),
                 None,
             )),
-        }
+        }?;
+        Ok(result.into())
     }
 }
 
@@ -1944,6 +2028,10 @@ pub async fn run_streamable_http(
     config: Config,
     bind: SocketAddr,
 ) -> Result<()> {
+    let allowed_hosts = optional_env("IRONMEM_MCP_ALLOWED_HOSTS")?;
+    let allowed_origins = optional_env("IRONMEM_MCP_ALLOWED_ORIGINS")?;
+    let http_config = http_server_config(allowed_hosts.as_deref(), allowed_origins.as_deref())?;
+    let cancellation = http_config.cancellation_token.clone();
     let (embedder, store) = vectorstore::build_semantic(&db, &config).await;
     let policy_principal = crate::influence::PolicyPrincipal::configured(
         "ironmem:mcp:http",
@@ -1958,22 +2046,7 @@ pub async fn run_streamable_http(
         store,
         policy_principal,
     };
-    let auth_token = server.config.auth_token.clone();
-
-    // rmcp >=1.4 marks StreamableHttpServerConfig #[non_exhaustive], so it can no
-    // longer be built with a struct literal — start from Default and set fields.
-    let mut http_config = StreamableHttpServerConfig::default();
-    http_config.json_response = true;
-    http_config.stateful_mode = false;
-
-    let session_manager = Arc::new(LocalSessionManager::default());
-    let service =
-        StreamableHttpService::new(move || Ok(server.clone()), session_manager, http_config);
-
-    let app = with_optional_bearer_auth(
-        axum::Router::new().route("/mcp", axum::routing::any_service(service)),
-        auth_token,
-    );
+    let app = http_router(server, http_config);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("IronMem MCP Streamable HTTP server listening on {}", bind);
@@ -1986,6 +2059,7 @@ pub async fn run_streamable_http(
             }
         }
         _ = tokio::signal::ctrl_c() => {
+            cancellation.cancel();
             tracing::info!("Shutting down...");
         }
     }
@@ -2001,6 +2075,193 @@ mod tests {
     use axum::routing::get;
     use axum::Router;
     use tower::util::ServiceExt;
+
+    #[test]
+    fn sdk_upgrade_preserves_all_twenty_seven_tool_schemas() {
+        let baseline: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/mcp_tools_before_rmcp_3.json"
+        ))
+        .unwrap();
+        let tools = IronMemServer::build_tool_list();
+        assert_eq!(tools.len(), 27);
+        assert_eq!(serde_json::to_value(tools).unwrap(), baseline);
+    }
+
+    #[test]
+    fn http_allowlists_reject_ambiguous_configuration_and_use_exact_origin_ports() {
+        for host in [
+            "",
+            "*",
+            "trusted.example,",
+            "https://trusted.example",
+            "user@trusted.example",
+        ] {
+            assert!(http_server_config(Some(host), None).is_err(), "{host}");
+        }
+        for origin in [
+            "",
+            "null",
+            "https://*.example",
+            "https://u:p@example.com",
+            "https://example.com/path",
+        ] {
+            assert!(http_server_config(None, Some(origin)).is_err(), "{origin}");
+        }
+        let config = http_server_config(
+            Some("mcp.example:443, localhost:8789"),
+            Some("https://app.example, http://[::1]:8789"),
+        )
+        .unwrap();
+        assert_eq!(config.allowed_hosts, ["mcp.example:443", "localhost:8789"]);
+        assert_eq!(
+            config.allowed_origins,
+            ["https://app.example:443", "http://[::1]:8789"]
+        );
+        assert!(!config.legacy_session_mode);
+    }
+
+    async fn http_rpc(
+        app: &Router,
+        host: &str,
+        origin: Option<&str>,
+        token: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::HOST, host)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-03-26");
+        if let Some(origin) = origin {
+            request = request.header(header::ORIGIN, origin);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            response.headers().get("mcp-session-id").is_none(),
+            "HTTP must stay stateless"
+        );
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    fn initialize_request() -> serde_json::Value {
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"sdk-http-regression","version":"1"}}})
+    }
+
+    #[tokio::test]
+    async fn upgraded_http_transport_enforces_auth_host_origin_and_preserves_save_recall() {
+        let (mut server, path) = test_server().await;
+        Arc::make_mut(&mut server.config).auth_token = Some("synthetic-test-token".into());
+        server.policy_principal = crate::influence::PolicyPrincipal::configured(
+            "ironmem:mcp:http",
+            "shared_mcp",
+            vec![],
+            vec![],
+        );
+        let app = http_router(server.clone(), http_server_config(None, None).unwrap());
+        for (host, origin, token, expected) in [
+            ("localhost", None, "wrong-token", StatusCode::UNAUTHORIZED),
+            (
+                "attacker.example",
+                None,
+                "synthetic-test-token",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "localhost",
+                Some("https://attacker.example"),
+                "synthetic-test-token",
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            assert_eq!(
+                http_rpc(&app, host, origin, token, initialize_request())
+                    .await
+                    .0,
+                expected
+            );
+        }
+        let (status, initialized) = http_rpc(
+            &app,
+            "localhost",
+            None,
+            "synthetic-test-token",
+            initialize_request(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            initialized["result"]["serverInfo"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        let (status, tools) = http_rpc(
+            &app,
+            "localhost",
+            None,
+            "synthetic-test-token",
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            tools["result"]["tools"],
+            serde_json::to_value(IronMemServer::build_tool_list()).unwrap()
+        );
+        let (status, saved) = http_rpc(&app, "localhost", None, "synthetic-test-token", serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"remember","arguments":{"project":"synthetic-sdk","text":"SDK migration canary cobalt harbor","scope":"project","kind":"project_config","classification":"public"}}})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(saved.get("error").is_none(), "{saved}");
+        assert_ne!(saved["result"]["isError"], true, "{saved}");
+        let (status, recalled) = http_rpc(&app, "localhost", None, "synthetic-test-token", serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search_memories","arguments":{"project":"synthetic-sdk","query":"cobalt","semantic":false,"limit":3}}})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(recalled["result"]["isError"], true, "{recalled}");
+        assert!(
+            recalled
+                .to_string()
+                .contains("SDK migration canary cobalt harbor"),
+            "{recalled}"
+        );
+        let public = http_router(
+            server.clone(),
+            http_server_config(Some("mcp.example:443"), Some("https://app.example")).unwrap(),
+        );
+        assert_eq!(
+            http_rpc(
+                &public,
+                "mcp.example:443",
+                Some("https://app.example"),
+                "synthetic-test-token",
+                initialize_request()
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            http_rpc(
+                &public,
+                "mcp.example:443",
+                Some("https://app.example:444"),
+                "synthetic-test-token",
+                initialize_request()
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        drop(app);
+        drop(public);
+        close_and_remove_test_db(server, &path).await;
+    }
 
     fn recall_gate(summaries: &[&str]) -> crate::egress::GateResult {
         let memory = |id: usize, summary: &str| crate::db::Memory {
@@ -2097,6 +2358,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_rejects_multiple_authorization_headers() {
+        let app = with_optional_bearer_auth(
+            Router::new().route("/mcp", get(|| async { "ok" })),
+            Some("secret-token".to_string()),
+        );
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/mcp")
+                    .header(header::AUTHORIZATION, "Bearer secret-token")
+                    .header(header::AUTHORIZATION, "Bearer other-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

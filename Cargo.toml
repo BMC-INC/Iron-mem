@@ -23,7 +23,7 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["json"] }
 
 # MCP protocol
-rmcp = { version = "1.4", features = ["server", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.8", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 
 # Database
 # Keep SQLx internals in lockstep; only SQLite and PostgreSQL are supported.

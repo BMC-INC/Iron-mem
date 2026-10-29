@@ -1,0 +1,1328 @@
+[
+  {
+    "name": "memory_diagnose",
+    "description": "Explain lexical retrieval, policy, source availability, access and context freshness. Requires diagnostics:read; content is opt-in and governed.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "request": {
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "required": [
+                "query"
+              ]
+            },
+            {
+              "required": [
+                "memory_id"
+              ]
+            }
+          ],
+          "properties": {
+            "budget_bytes": {
+              "maximum": 24000,
+              "minimum": 2000,
+              "type": "integer"
+            },
+            "include_content": {
+              "type": "boolean"
+            },
+            "memory_id": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "namespace": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "purpose": {
+              "type": "object"
+            },
+            "query": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "namespace",
+            "project"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "memory_assertion",
+    "description": "Append or query opt-in structured temporal claims. Requires assertions:read/write capability. Conflicts abstain; original evidence remains governed.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "request": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "expected_version": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memory_id": {
+                  "type": "integer"
+                },
+                "op": {
+                  "const": "write"
+                },
+                "scope": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "namespace": {
+                      "type": "string"
+                    },
+                    "predicate": {
+                      "type": "string"
+                    },
+                    "project": {
+                      "type": "string"
+                    },
+                    "subject": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "namespace",
+                    "project",
+                    "subject",
+                    "predicate"
+                  ],
+                  "type": "object"
+                },
+                "supersedes": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "valid_from": {
+                  "description": "Unix seconds, inclusive",
+                  "type": "integer"
+                },
+                "valid_until": {
+                  "description": "Unix seconds, exclusive",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "value": {
+                  "maxLength": 4096,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "op",
+                "scope",
+                "expected_version",
+                "memory_id",
+                "value",
+                "valid_from"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "history": {
+                  "type": "boolean"
+                },
+                "op": {
+                  "const": "query"
+                },
+                "purpose": {
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "recorded_before": {
+                  "description": "Unix milliseconds, inclusive",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "scope": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "namespace": {
+                      "type": "string"
+                    },
+                    "predicate": {
+                      "type": "string"
+                    },
+                    "project": {
+                      "type": "string"
+                    },
+                    "subject": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "namespace",
+                    "project",
+                    "subject",
+                    "predicate"
+                  ],
+                  "type": "object"
+                },
+                "valid_at": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "op",
+                "scope"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "session_start",
+    "description": "Start a new session for a project. Returns a session_id.",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project root path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "session_end",
+    "description": "End a session and trigger compression. Returns memory_id if compression succeeds.",
+    "inputSchema": {
+      "properties": {
+        "session_id": {
+          "description": "Session ID to end",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "record_event",
+    "description": "Record a tool call observation in the current session.",
+    "inputSchema": {
+      "properties": {
+        "input": {
+          "description": "Tool input (optional)",
+          "type": "string"
+        },
+        "output": {
+          "description": "Tool output (optional)",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project root path",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Session ID",
+          "type": "string"
+        },
+        "tool": {
+          "description": "Tool name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "project",
+        "tool"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "compress_session",
+    "description": "Manually compress a session into a memory.",
+    "inputSchema": {
+      "properties": {
+        "session_id": {
+          "description": "Session ID to compress",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get_context",
+    "description": "Retrieve memories for a project. Optionally search with a query. Results include expansion chunks with chunk_id handles for retrieve_original.",
+    "inputSchema": {
+      "properties": {
+        "limit": {
+          "description": "Max results (default 5)",
+          "type": "integer"
+        },
+        "namespace": {
+          "description": "Governance namespace/realm boundary (default local)",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project root path",
+          "type": "string"
+        },
+        "purpose": {
+          "description": "Optional purpose envelope. Strict mode requires a trusted opaque attestation.",
+          "properties": {
+            "action_risk": {
+              "enum": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "critical"
+              ],
+              "type": "string"
+            },
+            "confirmation_receipt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "intended_action": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "namespace": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "purpose_attestation": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "require_source_backing": {
+              "type": "boolean"
+            },
+            "task_type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "request_id",
+            "namespace",
+            "project",
+            "task_type",
+            "action_risk"
+          ],
+          "type": "object"
+        },
+        "query": {
+          "description": "Search query (optional)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "memory_skim",
+    "description": "Return the compressed working-memory skim chunks for one project or globally. Use chunk_id with retrieve_original to expand exact evidence on demand.",
+    "inputSchema": {
+      "properties": {
+        "global": {
+          "description": "When true, skim across all projects.",
+          "type": "boolean"
+        },
+        "limit": {
+          "description": "Max chunks (default 15)",
+          "type": "integer"
+        },
+        "namespace": {
+          "description": "Governance namespace/realm boundary (default local)",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project root path. Omit when global=true.",
+          "type": "string"
+        },
+        "purpose": {
+          "description": "Optional purpose envelope. Strict mode requires a trusted opaque attestation.",
+          "properties": {
+            "action_risk": {
+              "enum": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "critical"
+              ],
+              "type": "string"
+            },
+            "confirmation_receipt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "intended_action": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "namespace": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "purpose_attestation": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "require_source_backing": {
+              "type": "boolean"
+            },
+            "task_type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "request_id",
+            "namespace",
+            "project",
+            "task_type",
+            "action_risk"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "get_status",
+    "description": "Get database stats: total sessions, memories, observations, graph edges, and CCR storage.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "name": "retrieve_original",
+    "description": "Retrieve the verbatim original behind a compressed/truncated memory. Provide chunk_id (preferred expansion handle), observation_id, memory_id, or a blob hash.",
+    "inputSchema": {
+      "properties": {
+        "chunk_id": {
+          "description": "Chunk id returned by get_context or memory_skim; expands exact source span when available",
+          "type": "string"
+        },
+        "hash": {
+          "description": "Blob content hash (alternative to chunk_id / observation_id / memory_id)",
+          "type": "string"
+        },
+        "memory_id": {
+          "description": "Memory id whose verbatim pre-LLM session transcript to retrieve",
+          "type": "integer"
+        },
+        "namespace": {
+          "description": "Governance namespace/realm boundary (default local)",
+          "type": "string"
+        },
+        "observation_id": {
+          "description": "Observation id whose full original output to retrieve",
+          "type": "integer"
+        },
+        "purpose": {
+          "description": "Optional purpose envelope. Strict mode requires a trusted opaque attestation.",
+          "properties": {
+            "action_risk": {
+              "enum": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "critical"
+              ],
+              "type": "string"
+            },
+            "confirmation_receipt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "intended_action": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "namespace": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "purpose_attestation": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "require_source_backing": {
+              "type": "boolean"
+            },
+            "task_type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "request_id",
+            "namespace",
+            "project",
+            "task_type",
+            "action_risk"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "list_memories",
+    "description": "List recent memories for a project.",
+    "inputSchema": {
+      "properties": {
+        "limit": {
+          "description": "Max results (default 5)",
+          "type": "integer"
+        },
+        "max_summary_bytes": {
+          "description": "Clip each returned summary to this many bytes (default 2000, 0 = no limit). Clipped results name the memory_id to pass to retrieve_original.",
+          "type": "integer"
+        },
+        "namespace": {
+          "description": "Governance namespace/realm boundary (default local)",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project root path",
+          "type": "string"
+        },
+        "purpose": {
+          "description": "Optional purpose envelope. Strict mode requires a trusted opaque attestation.",
+          "properties": {
+            "action_risk": {
+              "enum": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "critical"
+              ],
+              "type": "string"
+            },
+            "confirmation_receipt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "intended_action": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "namespace": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "purpose_attestation": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "require_source_backing": {
+              "type": "boolean"
+            },
+            "task_type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "request_id",
+            "namespace",
+            "project",
+            "task_type",
+            "action_risk"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "search_memories",
+    "description": "Hybrid (keyword + semantic) search across session memories.",
+    "inputSchema": {
+      "properties": {
+        "limit": {
+          "description": "Max results (default 10)",
+          "type": "integer"
+        },
+        "max_summary_bytes": {
+          "description": "Clip each returned summary to this many bytes (default 2000, 0 = no limit). Clipped results name the memory_id to pass to retrieve_original.",
+          "type": "integer"
+        },
+        "namespace": {
+          "description": "Governance namespace/realm boundary (default local)",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project root path",
+          "type": "string"
+        },
+        "purpose": {
+          "description": "Optional purpose envelope. Strict mode requires a trusted opaque attestation.",
+          "properties": {
+            "action_risk": {
+              "enum": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "critical"
+              ],
+              "type": "string"
+            },
+            "confirmation_receipt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "intended_action": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "namespace": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "purpose_attestation": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "require_source_backing": {
+              "type": "boolean"
+            },
+            "task_type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "request_id",
+            "namespace",
+            "project",
+            "task_type",
+            "action_risk"
+          ],
+          "type": "object"
+        },
+        "query": {
+          "description": "Search query",
+          "type": "string"
+        },
+        "semantic": {
+          "description": "Blend semantic vector search with keyword search (default true). Set false for keyword-only.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "query",
+        "project"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "search_global",
+    "description": "Hybrid (keyword + semantic) search across all projects.",
+    "inputSchema": {
+      "properties": {
+        "limit": {
+          "description": "Max results (default 10)",
+          "type": "integer"
+        },
+        "max_summary_bytes": {
+          "description": "Clip each returned summary to this many bytes (default 2000, 0 = no limit). Clipped results name the memory_id to pass to retrieve_original.",
+          "type": "integer"
+        },
+        "namespace": {
+          "description": "Governance namespace/realm boundary (default local)",
+          "type": "string"
+        },
+        "purpose": {
+          "description": "Optional purpose envelope. Strict mode requires a trusted opaque attestation.",
+          "properties": {
+            "action_risk": {
+              "enum": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "critical"
+              ],
+              "type": "string"
+            },
+            "confirmation_receipt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "intended_action": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "namespace": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "purpose_attestation": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "require_source_backing": {
+              "type": "boolean"
+            },
+            "task_type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "request_id",
+            "namespace",
+            "project",
+            "task_type",
+            "action_risk"
+          ],
+          "type": "object"
+        },
+        "query": {
+          "description": "Search query",
+          "type": "string"
+        },
+        "semantic": {
+          "description": "Blend semantic vector search with keyword search (default true). Set false for keyword-only.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list_projects",
+    "description": "List all projects that have stored memories.",
+    "inputSchema": {
+      "properties": {
+        "limit": {
+          "description": "Max results (default 50)",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "list_sessions",
+    "description": "List session history for a project, including observation counts and memory tags.",
+    "inputSchema": {
+      "properties": {
+        "limit": {
+          "description": "Max results (default 20)",
+          "type": "integer"
+        },
+        "project": {
+          "description": "Project root path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "inject_context",
+    "description": "Write IRONMEM.md to a project root with recent session memories.",
+    "inputSchema": {
+      "properties": {
+        "limit": {
+          "description": "Max memories to inject (default 5)",
+          "type": "integer"
+        },
+        "namespace": {
+          "description": "Governance namespace/realm boundary (default local)",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project root path",
+          "type": "string"
+        },
+        "purpose": {
+          "description": "Optional purpose envelope. Strict mode requires a trusted opaque attestation.",
+          "properties": {
+            "action_risk": {
+              "enum": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "critical"
+              ],
+              "type": "string"
+            },
+            "confirmation_receipt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "intended_action": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "namespace": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "purpose_attestation": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "require_source_backing": {
+              "type": "boolean"
+            },
+            "task_type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "request_id",
+            "namespace",
+            "project",
+            "task_type",
+            "action_risk"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "remember",
+    "description": "Store an explicit, durable governed memory. Use scope='user' for facts/preferences that apply across projects inside the namespace; scope='project' (default) for this project only. PHI/PII requires consent_state='granted'.",
+    "inputSchema": {
+      "properties": {
+        "classification": {
+          "description": "public | internal | confidential | restricted | phi | pii",
+          "type": "string"
+        },
+        "consent_state": {
+          "description": "required | granted | denied | withdrawn; PHI/PII requires granted",
+          "type": "string"
+        },
+        "event_at": {
+          "description": "Optional ISO date YYYY-MM-DD (or range YYYY-MM-DD..YYYY-MM-DD) of when the described event actually occurred or will occur. This is the event/valid time, distinct from the storage time (created_at). Powers time-aware retrieval.",
+          "type": "string"
+        },
+        "expires_at": {
+          "description": "Optional Unix timestamp expiry",
+          "type": "integer"
+        },
+        "kind": {
+          "description": "session | error_solution | preference | architecture | learned_pattern | project_config | profile (default preference)",
+          "type": "string"
+        },
+        "legal_hold": {
+          "description": "If true, governed forget refuses deletion",
+          "type": "boolean"
+        },
+        "namespace": {
+          "description": "Governance namespace/realm boundary (default local)",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project root path",
+          "type": "string"
+        },
+        "residency": {
+          "description": "Optional residency tag",
+          "type": "string"
+        },
+        "retention_policy_id": {
+          "description": "Optional retention policy id",
+          "type": "string"
+        },
+        "scope": {
+          "description": "'project' (default) or 'user' (cross-project)",
+          "type": "string"
+        },
+        "source_ref": {
+          "description": "Optional source event, receipt, URL, or tool id",
+          "type": "string"
+        },
+        "source_type": {
+          "description": "user_input | tool_output | agent_generated | derived | external | sync_peer",
+          "type": "string"
+        },
+        "tags": {
+          "description": "Optional space-separated keywords",
+          "type": "string"
+        },
+        "text": {
+          "description": "The memory content to store verbatim",
+          "type": "string"
+        },
+        "trust_tier": {
+          "description": "high | medium | low | untrusted",
+          "type": "string"
+        },
+        "writer_identity": {
+          "description": "Writer identity for the tamper-evident ledger",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "text"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get_memory_influence",
+    "description": "Read the versioned influence policy for a memory. Requires influence_policy:read on shared HTTP MCP; local stdio is a local-operator channel.",
+    "inputSchema": {
+      "properties": {
+        "memory_id": {
+          "description": "Memory id",
+          "type": "integer"
+        },
+        "namespace": {
+          "description": "Governance namespace (default local)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "memory_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "set_memory_influence",
+    "description": "Apply a version-checked influence-policy patch and append an atomic ledger receipt. Requires influence_policy:write on shared HTTP MCP; local stdio is a local-operator channel.",
+    "inputSchema": {
+      "properties": {
+        "allowed_task_types": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
+        "clear_maximum_derivation_depth": {
+          "description": "Clear an existing depth limit; mutually exclusive with maximum_derivation_depth",
+          "type": "boolean"
+        },
+        "denied_task_types": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
+        "expected_version": {
+          "description": "Current policy version for optimistic concurrency",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "maximum_action_risk": {
+          "enum": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "type": "string"
+        },
+        "maximum_derivation_depth": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_id": {
+          "description": "Memory id",
+          "type": "integer"
+        },
+        "namespace": {
+          "description": "Governance namespace (default local)",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Required audit reason",
+          "type": "string"
+        },
+        "request_id": {
+          "description": "Optional caller request id; generated when omitted",
+          "type": "string"
+        },
+        "requires_human_confirmation": {
+          "type": "boolean"
+        },
+        "requires_original_source": {
+          "type": "boolean"
+        },
+        "state": {
+          "enum": [
+            "eligible",
+            "quarantined",
+            "reasoning_only",
+            "action_restricted",
+            "blocked",
+            "superseded"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "memory_id",
+        "expected_version",
+        "reason"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "manage_contradiction",
+    "description": "Create, inspect, prefer, or resolve a versioned contradiction set. Mutations require influence_policy:write; reads require influence_policy:read.",
+    "inputSchema": {
+      "properties": {
+        "basis": {
+          "type": "string"
+        },
+        "cardinality": {
+          "enum": [
+            "single",
+            "set",
+            "ordered",
+            "custom"
+          ],
+          "type": "string"
+        },
+        "claim_key": {
+          "type": "string"
+        },
+        "expected_version": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "members": {
+          "items": {
+            "properties": {
+              "memory_id": {
+                "type": "integer"
+              },
+              "stance": {
+                "enum": [
+                  "supports",
+                  "contradicts",
+                  "competing"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "memory_id",
+              "stance"
+            ],
+            "type": "object"
+          },
+          "maxItems": 32,
+          "minItems": 2,
+          "type": "array"
+        },
+        "namespace": {
+          "description": "Governance namespace (default local)",
+          "type": "string"
+        },
+        "operation": {
+          "enum": [
+            "create",
+            "get",
+            "prefer",
+            "resolve",
+            "obsolete"
+          ],
+          "type": "string"
+        },
+        "preferred_memory_id": {
+          "type": "integer"
+        },
+        "project": {
+          "type": "string"
+        },
+        "realm": {
+          "enum": [
+            "project",
+            "user"
+          ],
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get_profile",
+    "description": "Get the current user profile (durable cross-project facts + recent activity), if one has been generated.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "name": "refresh_profile",
+    "description": "Regenerate the user profile from scope=user memories (uses the LLM when available, else a deterministic local rollup) and return it.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "name": "list_corrections",
+    "description": "List mined error\u2192fix corrections (kind=error_solution) \u2014 past failures and how they were resolved. Optionally scope to a project.",
+    "inputSchema": {
+      "properties": {
+        "limit": {
+          "description": "Max results (default 10)",
+          "type": "integer"
+        },
+        "project": {
+          "description": "Project root path (omit for all projects)",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "memory_graph",
+    "description": "Query temporal graph edges for an entity. Returns active edges by default; include_superseded=true returns provenance history.",
+    "inputSchema": {
+      "properties": {
+        "at_time": {
+          "description": "Optional YYYY-MM-DD valid-time filter",
+          "type": "string"
+        },
+        "entity": {
+          "description": "Entity to query (person, project, organization, concept)",
+          "type": "string"
+        },
+        "include_superseded": {
+          "description": "Include duplicate/superseded historical edges (default false)",
+          "type": "boolean"
+        },
+        "limit": {
+          "description": "Max graph edges (default 20)",
+          "type": "integer"
+        },
+        "project": {
+          "description": "Optional project root path; omit for all projects",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entity"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "reconcile_memory_graph",
+    "description": "Scan temporal graph edges and mark duplicates/current-state supersessions. Use dry_run=true to preview.",
+    "inputSchema": {
+      "properties": {
+        "dry_run": {
+          "description": "Report what would change without writing (default false)",
+          "type": "boolean"
+        },
+        "project": {
+          "description": "Optional project root path; omit for all projects",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "dream_memory",
+    "description": "Run a safe sleep-cycle consolidation pass. Defaults to dry_run=true and apply=false; use apply=true only when proposed memories should be promoted.",
+    "inputSchema": {
+      "properties": {
+        "apply": {
+          "description": "Promote proposed consolidations into memories (default false)",
+          "type": "boolean"
+        },
+        "dry_run": {
+          "description": "Preview proposals without writing them (default true)",
+          "type": "boolean"
+        },
+        "limit": {
+          "description": "Max memories per kind to scan (default 200)",
+          "type": "integer"
+        },
+        "project": {
+          "description": "Optional project root path; omit for all projects",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "wipe_project",
+    "description": "Delete all memories for a project. Pass confirm=false to preview the count without deleting. Omitting confirm still deletes, so existing clients keep working.",
+    "inputSchema": {
+      "properties": {
+        "confirm": {
+          "description": "true deletes. false previews only. Omit to delete (existing clients).",
+          "type": "boolean"
+        },
+        "project": {
+          "description": "Project root path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "type": "object"
+    }
+  }
+]

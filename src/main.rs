@@ -1930,7 +1930,7 @@ async fn run_cloudflare_tunnel(port: u16, auth_token: Option<String>) {
     if cloudflared.is_ok() {
         println!("\n  Starting Cloudflare Tunnel (cloudflared)...\n");
         let mut child = match tokio::process::Command::new("cloudflared")
-            .args(["tunnel", "--url", &url])
+            .args(["tunnel", "--url", &url, "--http-host-header", "localhost"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -1983,7 +1983,15 @@ async fn run_cloudflare_tunnel(port: u16, auth_token: Option<String>) {
         println!("  Trying npx fallback...\n");
 
         let mut child = match tokio::process::Command::new("npx")
-            .args(["-y", "cloudflared", "tunnel", "--url", &url])
+            .args([
+                "-y",
+                "cloudflared",
+                "tunnel",
+                "--url",
+                &url,
+                "--http-host-header",
+                "localhost",
+            ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()

@@ -889,47 +889,13 @@ async fn run_synthesis(
     Ok(Json(report))
 }
 
-#[derive(Deserialize)]
-pub struct CodeRelinkRequest {
-    pub project: String,
-    pub dry_run: Option<bool>,
-    pub anchor_only: Option<bool>,
-    pub relink_only: Option<bool>,
-}
-
-async fn code_relink(
-    State(state): State<Arc<AppState>>,
-    agent: Option<axum::Extension<AgentIdentity>>,
-    Json(body): Json<CodeRelinkRequest>,
-) -> Result<Json<crate::code_anchor::CodeRelinkReport>, (StatusCode, String)> {
-    // Filesystem maintenance is an operator action. Agent namespace grants do
-    // not authorize local paths or anchors belonging to other namespaces.
-    if agent.is_some() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Code relinking requires the local operator; use ironmem code-relink".into(),
-        ));
-    }
-    let dry_run = body.dry_run.unwrap_or(true);
-    let mut combined = crate::code_anchor::CodeRelinkReport {
-        dry_run,
-        ..Default::default()
-    };
-    if !body.relink_only.unwrap_or(false) {
-        let r = crate::code_anchor::anchor_project(&state.db, &body.project, dry_run)
-            .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        combined.scanned_symbols = combined.scanned_symbols.max(r.scanned_symbols);
-        combined.anchors_created += r.anchors_created;
-    }
-    if !body.anchor_only.unwrap_or(false) {
-        let r = crate::code_anchor::relink_project(&state.db, &body.project, dry_run)
-            .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        combined.scanned_symbols = combined.scanned_symbols.max(r.scanned_symbols);
-        combined.anchors_relinked += r.anchors_relinked;
-    }
-    Ok(Json(combined))
+async fn code_relink() -> (StatusCode, &'static str) {
+    // Filesystem maintenance is available only to the direct local CLI. A
+    // loopback HTTP caller or agent namespace grant does not authorize paths.
+    (
+        StatusCode::FORBIDDEN,
+        "Filesystem code relinking is CLI-only; run ironmem code-relink locally",
+    )
 }
 
 #[derive(Deserialize)]
@@ -2438,7 +2404,7 @@ mod workbench_tests {
     use tower::ServiceExt;
 
     #[tokio::test]
-    async fn code_relink_denies_agents_before_filesystem_access() {
+    async fn code_relink_denies_http_without_changing_local_anchoring() {
         let dir = tempfile::tempdir().unwrap();
         let database = db::Database::new(dir.path().join("rest.db").to_str().unwrap())
             .await
@@ -2498,7 +2464,16 @@ mod workbench_tests {
             store: Arc::new(crate::vectorstore::BruteForceStore),
         });
         let response = local.oneshot(request(project, None)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(db::code_anchors_for_project(&database, project)
+            .await
+            .unwrap()
+            .is_empty());
+        // The CLI invokes this path directly, without an HTTP request.
+        let report = crate::code_anchor::anchor_project(&database, project, false)
+            .await
+            .unwrap();
+        assert_eq!(report.anchors_created, 1);
         assert_eq!(
             db::code_anchors_for_project(&database, project)
                 .await
