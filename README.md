@@ -34,7 +34,7 @@ provides guided recall and explicit, user-requested saving.
 
 ## Project status
 
-The source reports version **0.4.0**. Install from source using the instructions
+The source reports version **0.4.1**. Install from source using the instructions
 below; a version in `Cargo.toml` is not a promise of a published binary release.
 See [releases](https://github.com/BMC-INC/Iron-mem/releases) and
 [release procedure](RELEASING.md) for packaged builds.

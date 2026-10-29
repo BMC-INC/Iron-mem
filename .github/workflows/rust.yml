@@ -64,6 +64,12 @@ jobs:
       - name: Installation, retention and MCP newcomer rehearsal
         run: python scripts/test_reliability_tools.py
 
+      - name: Official MCP client compatibility
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          python -m pip install mcp==1.30.0
+          python scripts/smoke_mcp_sdk.py --binary target/debug/ironmem --expected-version 0.4.1
+
       - name: Coding and recovery fixture gates (no model calls)
         if: matrix.os == 'ubuntu-latest'
         run: |

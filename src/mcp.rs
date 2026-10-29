@@ -1871,7 +1871,7 @@ fn string_array_arg(
 impl ServerHandler for IronMemServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("IronMem", "0.2.0"))
+            .with_server_info(Implementation::new("IronMem", env!("CARGO_PKG_VERSION")))
     }
 
     async fn list_tools(

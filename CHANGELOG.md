@@ -5,7 +5,12 @@ All notable changes to IronMem will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased: coding evidence and reliability
+## [0.4.1] - 2026-10-29
+
+- Report the package version consistently through MCP and CLI.
+- Package release binaries with license terms and checksums; add official MCP SDK compatibility checks.
+
+### Coding evidence and reliability
 
 - Add shared capability-scoped CLI/REST/MCP diagnostics with governed optional content, source/lineage metadata, telemetry and context freshness.
 - Add paired executable coding fixtures, a local-only pinned Ollama adapter, and explicit competitor-adapter protocol; distinguish deterministic harness checks from model results.
@@ -14,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace divergent installers with preserved settings, idempotent hook merging, atomic file replacement/rollback and verified pre-upgrade SQLite backup.
 - Add isolated `--config` loading/saving, newcomer MCP/restore rehearsal and CI coverage. No live service upgrade or default experiment enablement.
 
-## [Unreleased]
+### Included work since 0.4.0
 
 ### Added — Structured temporal assertions
 
