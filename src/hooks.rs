@@ -169,7 +169,7 @@ pub async fn inject_with_budget(
                 crate::db::Backend::Sqlite => "rowid",
                 crate::db::Backend::Postgres => "id",
             };
-            let eligible: i64 = sqlx::query(&format!("SELECT COUNT(*) AS n FROM memory_meta WHERE memory_id=$1 AND tombstoned_at IS NULL AND (expires_at IS NULL OR expires_at>$2) AND memory_id IN (SELECT {id_col} FROM memories WHERE {id_col}=$1)")).bind(memory.id).bind(chrono::Utc::now().timestamp()).fetch_one(&mut *tx).await?.get("n");
+            let eligible: i64 = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) AS n FROM memory_meta WHERE memory_id=$1 AND tombstoned_at IS NULL AND (expires_at IS NULL OR expires_at>$2) AND memory_id IN (SELECT {id_col} FROM memories WHERE {id_col}=$1)"))).bind(memory.id).bind(chrono::Utc::now().timestamp()).fetch_one(&mut *tx).await?.get("n");
             anyhow::ensure!(
                 eligible == 1,
                 "memory expired or disappeared during selection; retry injection"

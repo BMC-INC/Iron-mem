@@ -332,7 +332,7 @@ async fn archived_candidates(
                  AND er.extractor_version = $5 AND er.status = 'complete')
          ORDER BY {id} ASC LIMIT $6"
     );
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(after)
         .bind(project)
         .bind(since_timestamp)
@@ -510,7 +510,7 @@ async fn recoverable_child_id(
                 (mm.memory_id IS NULL OR (mm.kind = $5 AND mm.parent_memory_id = $6)))
          ORDER BY exact_ref DESC, {id} ASC LIMIT 1"
     );
-    Ok(sqlx::query(&sql)
+    Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(namespace)
         .bind(source_ref)
         .bind(session_id)

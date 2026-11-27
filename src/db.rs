@@ -350,17 +350,19 @@ const EVIDENCE_ROOT_BACKFILL_BATCH: i64 = 256;
 const INFLUENCE_POLICY_MIGRATION_ID: &str = "2026-08-02-influence-policy-v1";
 const INFLUENCE_POLICY_MIGRATION_VERSION: u32 = 1;
 
-async fn add_memory_meta_column(db: &Database, column_sql: &str) -> Result<()> {
+async fn add_memory_meta_column(db: &Database, column_sql: &'static str) -> Result<()> {
     match db.backend {
         Backend::Sqlite => {
-            let _ = sqlx::query(&format!("ALTER TABLE memory_meta ADD COLUMN {column_sql}"))
-                .execute(&db.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE memory_meta ADD COLUMN {column_sql}"
+            )))
+            .execute(&db.pool)
+            .await;
         }
         Backend::Postgres => {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "ALTER TABLE memory_meta ADD COLUMN IF NOT EXISTS {column_sql}"
-            ))
+            )))
             .execute(&db.pool)
             .await?;
         }
@@ -1115,7 +1117,7 @@ impl Database {
             Backend::Sqlite => "BLOB",
             Backend::Postgres => "BYTEA",
         };
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE TABLE IF NOT EXISTS embeddings (
                 owner_type TEXT NOT NULL,
                 owner_id   BIGINT NOT NULL,
@@ -1125,7 +1127,7 @@ impl Database {
                 created_at BIGINT NOT NULL,
                 PRIMARY KEY (owner_type, owner_id, model)
             )"
-        ))
+        )))
         .execute(&self.pool)
         .await?;
         sqlx::query(
@@ -1147,7 +1149,7 @@ impl Database {
         // Tool outputs / session transcripts are stored whole, deduplicated by
         // the sha256 of their ORIGINAL bytes, and compressed by a byte-exact
         // reversible codec. `refcount` tracks live references for GC (Chunk 3).
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE TABLE IF NOT EXISTS blobs (
                 hash         TEXT PRIMARY KEY,
                 content_type TEXT NOT NULL,
@@ -1158,7 +1160,7 @@ impl Database {
                 refcount     BIGINT NOT NULL DEFAULT 0,
                 created_at   BIGINT NOT NULL
             )"
-        ))
+        )))
         .execute(&self.pool)
         .await?;
 
@@ -1177,18 +1179,18 @@ impl Database {
                     .await?;
             }
         }
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE TABLE IF NOT EXISTS ccr_dicts (
                 hash         TEXT PRIMARY KEY,
                 content_type TEXT NOT NULL,
                 data         {blob_type} NOT NULL,
                 created_at   BIGINT NOT NULL
             )"
-        ))
+        )))
         .execute(&self.pool)
         .await?;
 
-        sqlx::query(&format!("CREATE TABLE IF NOT EXISTS ccr_chunks(hash TEXT PRIMARY KEY, data {blob_type} NOT NULL)"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TABLE IF NOT EXISTS ccr_chunks(hash TEXT PRIMARY KEY, data {blob_type} NOT NULL)")))
             .execute(&self.pool).await?;
         sqlx::query("CREATE TABLE IF NOT EXISTS ccr_object_chunks(object_hash TEXT NOT NULL REFERENCES blobs(hash) ON DELETE CASCADE, chunk_hash TEXT NOT NULL REFERENCES ccr_chunks(hash), PRIMARY KEY(object_hash,chunk_hash))")
             .execute(&self.pool).await?;
@@ -1794,9 +1796,9 @@ impl Database {
     pub async fn ensure_ann(&self, dim: usize) -> Result<()> {
         match self.backend {
             Backend::Sqlite => {
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(memory_id INTEGER PRIMARY KEY, embedding float[{dim}] distance_metric=cosine)"
-                ))
+                )))
                 .execute(&self.pool)
                 .await?;
             }
@@ -1806,9 +1808,9 @@ impl Database {
                     .execute(&self.pool)
                     .await
                     .ok();
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "CREATE TABLE IF NOT EXISTS memory_embeddings (memory_id BIGINT PRIMARY KEY, embedding vector({dim}))"
-                ))
+                )))
                 .execute(&self.pool)
                 .await?;
                 sqlx::query(
@@ -2566,7 +2568,7 @@ pub async fn delete_memories_for_project(db: &Database, project: &str) -> Result
         Backend::Sqlite => "rowid",
         Backend::Postgres => "id",
     };
-    sqlx::query(&format!("UPDATE memory_mutations SET mutation_count=mutation_count+1 WHERE memory_id IN (SELECT {id} FROM memories WHERE project=$1)")).bind(project).execute(&mut *tx).await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE memory_mutations SET mutation_count=mutation_count+1 WHERE memory_id IN (SELECT {id} FROM memories WHERE project=$1)"))).bind(project).execute(&mut *tx).await?;
     let count = sqlx::query("DELETE FROM memories WHERE project=$1")
         .bind(project)
         .execute(&mut *tx)
@@ -2613,7 +2615,7 @@ pub async fn memory_ids_for_project(db: &Database, project: &str) -> Result<Vec<
                AND (mm.expires_at IS NULL OR mm.expires_at > $2)"
         ),
     };
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(project)
         .bind(now)
         .fetch_all(&db.pool)
@@ -3631,7 +3633,7 @@ pub async fn influence_contexts_for(
           WHERE mm.namespace = $1 AND mm.memory_id IN ({in_list})"
     );
     let namespace = normalize_namespace(namespace);
-    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql)
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(&namespace)
         .fetch_all(&db.pool)
         .await?;
@@ -3654,14 +3656,14 @@ pub async fn influence_contexts_for(
             },
         );
     }
-    let membership_rows = sqlx::query(&format!(
+    let membership_rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT cm.memory_id, cm.contradiction_set_id
            FROM contradiction_members cm
            JOIN contradiction_sets cs ON cs.id = cm.contradiction_set_id
           WHERE cs.namespace = $1 AND cs.status = 'unresolved'
             AND cm.memory_id IN ({in_list})
           ORDER BY cm.memory_id, cm.contradiction_set_id"
-    ))
+    )))
     .bind(&namespace)
     .fetch_all(&db.pool)
     .await?;
@@ -4108,11 +4110,11 @@ async fn validate_contradiction_members(
         Backend::Sqlite => "m.rowid",
         Backend::Postgres => "m.id",
     };
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT mm.memory_id, mm.namespace, mm.scope, m.project
            FROM memory_meta mm JOIN memories m ON {memory_id_column} = mm.memory_id
           WHERE mm.memory_id IN ({ids})"
-    ))
+    )))
     .fetch_all(&db.pool)
     .await?;
     if rows.len() != request.members.len() {
@@ -5109,12 +5111,12 @@ pub async fn memories_by_event_time(
     let like = format!("%{needle}%");
     let rows: Vec<sqlx::any::AnyRow> = match project {
         Some(p) => {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT {id_col} AS id FROM memories m
                  JOIN memory_meta mm ON mm.memory_id = {id_col}
                  WHERE mm.event_time LIKE $1 AND m.project = $2
                  ORDER BY m.created_at DESC LIMIT $3"
-            ))
+            )))
             .bind(&like)
             .bind(p)
             .bind(limit as i64)
@@ -5122,12 +5124,12 @@ pub async fn memories_by_event_time(
             .await?
         }
         None => {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT {id_col} AS id FROM memories m
                  JOIN memory_meta mm ON mm.memory_id = {id_col}
                  WHERE mm.event_time LIKE $1
                  ORDER BY m.created_at DESC LIMIT $2"
-            ))
+            )))
             .bind(&like)
             .bind(limit as i64)
             .fetch_all(&db.pool)
@@ -5162,7 +5164,7 @@ pub async fn dated_memories(
     let rows: Vec<sqlx::any::AnyRow> = match project {
         Some(p) => {
             let sql = format!("{select} AND m.project = $1 ORDER BY m.created_at DESC LIMIT $2");
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(p)
                 .bind(limit as i64)
                 .fetch_all(&db.pool)
@@ -5170,7 +5172,7 @@ pub async fn dated_memories(
         }
         None => {
             let sql = format!("{select} ORDER BY m.created_at DESC LIMIT $1");
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(limit as i64)
                 .fetch_all(&db.pool)
                 .await?
@@ -5247,13 +5249,13 @@ pub async fn memories_for_entity(
     };
     let rows: Vec<sqlx::any::AnyRow> = match project {
         Some(p) => {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT {id_col} AS id, m.created_at AS ca
                  FROM memories m JOIN memory_entities me ON me.memory_id = {id_col}
                  WHERE me.entity = $1 AND m.project = $2
                  GROUP BY {id_col}, m.created_at
                  ORDER BY ca DESC LIMIT $3"
-            ))
+            )))
             .bind(&needle)
             .bind(p)
             .bind(limit as i64)
@@ -5261,13 +5263,13 @@ pub async fn memories_for_entity(
             .await?
         }
         None => {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT {id_col} AS id, m.created_at AS ca
                  FROM memories m JOIN memory_entities me ON me.memory_id = {id_col}
                  WHERE me.entity = $1
                  GROUP BY {id_col}, m.created_at
                  ORDER BY ca DESC LIMIT $2"
-            ))
+            )))
             .bind(&needle)
             .bind(limit as i64)
             .fetch_all(&db.pool)
@@ -5576,7 +5578,7 @@ pub async fn memory_edges_for_entity(
         " ORDER BY observed_at DESC, id DESC LIMIT {limit_ph}"
     ));
 
-    let mut q = sqlx::query(&sql).bind(&entity_norm);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(&entity_norm);
     if let Some(p) = project {
         q = q.bind(p);
     }
@@ -5636,7 +5638,7 @@ pub async fn memory_edges_for_entity_at(
         " ORDER BY observed_at DESC, id DESC LIMIT {limit_ph}"
     ));
 
-    let mut q = sqlx::query(&sql).bind(&entity_norm);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(&entity_norm);
     if let Some(at) = at_time {
         q = q.bind(at);
     }
@@ -5699,7 +5701,7 @@ pub async fn memory_graph_window(
         " ORDER BY observed_at DESC, id DESC LIMIT ${next}"
     ));
 
-    let mut statement = sqlx::query(&sql);
+    let mut statement = sqlx::query(sqlx::AssertSqlSafe(sql));
     if let Some(pattern) = query_pattern {
         statement = statement.bind(pattern);
     }
@@ -5726,7 +5728,7 @@ pub async fn all_memory_edges(db: &Database, project: Option<&str>) -> Result<Ve
         sql.push_str(" WHERE project = $1");
     }
     sql.push_str(" ORDER BY project ASC, source ASC, relation ASC, observed_at ASC, id ASC");
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
     if let Some(p) = project {
         q = q.bind(p);
     }
@@ -5907,25 +5909,25 @@ pub async fn memories_without_edges(
     };
     let rows: Vec<sqlx::any::AnyRow> = match project {
         Some(p) => {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT {id_col} AS id, m.project, m.session_id, m.summary, m.tags, m.created_at
                  FROM memories m
                  WHERE m.project = $1
                    AND NOT EXISTS (SELECT 1 FROM memory_edges e WHERE e.memory_id = {id_col})
                  ORDER BY m.created_at DESC LIMIT $2"
-            ))
+            )))
             .bind(p)
             .bind(limit as i64)
             .fetch_all(&db.pool)
             .await?
         }
         None => {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT {id_col} AS id, m.project, m.session_id, m.summary, m.tags, m.created_at
                  FROM memories m
                  WHERE NOT EXISTS (SELECT 1 FROM memory_edges e WHERE e.memory_id = {id_col})
                  ORDER BY m.created_at DESC LIMIT $1"
-            ))
+            )))
             .bind(limit as i64)
             .fetch_all(&db.pool)
             .await?
@@ -5982,7 +5984,9 @@ pub async fn memory_edges_for_memories(
          WHERE superseded_by IS NULL AND memory_id IN ({in_list})
          ORDER BY memory_id ASC, confidence DESC, observed_at DESC, id DESC"
     );
-    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql).fetch_all(&db.pool).await?;
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&db.pool)
+        .await?;
     for row in rows {
         let edge = memory_edge_from_row(row);
         out.entry(edge.memory_id).or_default().push(edge);
@@ -6135,7 +6139,7 @@ pub async fn memory_ids_for_original_reference(
                JOIN memories m ON m.session_id = o.session_id
               WHERE o.id = $1"
         );
-        for row in sqlx::query(&sql)
+        for row in sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(observation_id)
             .fetch_all(&db.pool)
             .await?
@@ -6160,7 +6164,11 @@ pub async fn memory_ids_for_original_reference(
                JOIN memories m ON m.session_id = o.session_id
               WHERE o.output_blob = $1"
         );
-        for row in sqlx::query(&sql).bind(hash).fetch_all(&db.pool).await? {
+        for row in sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(hash)
+            .fetch_all(&db.pool)
+            .await?
+        {
             ids.insert(row.get("memory_id"));
         }
     }
@@ -6188,7 +6196,9 @@ pub async fn chunks_for_memories(
          WHERE memory_id IN ({in_list})
          ORDER BY memory_id ASC, ordinal ASC"
     );
-    let rows = sqlx::query(&sql).fetch_all(&db.pool).await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&db.pool)
+        .await?;
     for row in rows {
         let chunk = memory_chunk_from_row(row);
         out.entry(chunk.memory_id).or_default().push(chunk);
@@ -6318,7 +6328,7 @@ pub async fn search_memory_chunk_parents_in_namespace(
          ORDER BY score DESC, ca DESC, mc.memory_id DESC
          LIMIT ${limit_param}"
     );
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
     for term in &terms {
         query = query.bind(format!("%{term}%"));
     }
@@ -6354,7 +6364,9 @@ pub async fn memory_edges_for_memories_with_history(
          WHERE memory_id IN ({in_list})
          ORDER BY memory_id ASC, confidence DESC, observed_at DESC, id DESC"
     );
-    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql).fetch_all(&db.pool).await?;
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&db.pool)
+        .await?;
     for row in rows {
         let edge = memory_edge_from_row(row);
         out.entry(edge.memory_id).or_default().push(edge);
@@ -6430,7 +6442,10 @@ pub async fn activation_meta_for(
          LEFT JOIN memory_meta mm ON mm.memory_id = {id_col}
          WHERE {id_col} IN ({in_list})"
     );
-    for r in sqlx::query(&sql).fetch_all(&db.pool).await? {
+    for r in sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&db.pool)
+        .await?
+    {
         let id: i64 = r.get("id");
         out.insert(
             id,
@@ -6624,7 +6639,10 @@ pub async fn score_adjustments_for_memories(
         "SELECT memory_id, COALESCE(SUM(weight), 0.0) AS score
          FROM memory_feedback WHERE memory_id IN ({in_list}) GROUP BY memory_id"
     );
-    for r in sqlx::query(&feedback_sql).fetch_all(&db.pool).await? {
+    for r in sqlx::query(sqlx::AssertSqlSafe(feedback_sql))
+        .fetch_all(&db.pool)
+        .await?
+    {
         let id: i64 = r.get("memory_id");
         out.entry(id)
             .or_insert_with(|| MemoryScoreAdjustment {
@@ -6637,7 +6655,10 @@ pub async fn score_adjustments_for_memories(
         "SELECT memory_id, COUNT(*) AS cnt
          FROM injection_events WHERE memory_id IN ({in_list}) GROUP BY memory_id"
     );
-    for r in sqlx::query(&injection_sql).fetch_all(&db.pool).await? {
+    for r in sqlx::query(sqlx::AssertSqlSafe(injection_sql))
+        .fetch_all(&db.pool)
+        .await?
+    {
         let id: i64 = r.get("memory_id");
         out.entry(id)
             .or_insert_with(|| MemoryScoreAdjustment {
@@ -6671,7 +6692,10 @@ pub async fn trust_meta_for(
         "SELECT memory_id, trust_ref_count, trust_last_validated_at
          FROM memory_meta WHERE memory_id IN ({in_list})"
     );
-    for r in sqlx::query(&sql).fetch_all(&db.pool).await? {
+    for r in sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&db.pool)
+        .await?
+    {
         let id: i64 = r.get("memory_id");
         let rc: i64 = r.try_get::<i64, _>("trust_ref_count").unwrap_or(0);
         let lv: Option<i64> = r
@@ -7028,7 +7052,7 @@ pub async fn reflection_proposals(
     sql.push_str(&format!(
         " ORDER BY created_at DESC, id DESC LIMIT {limit_ph}"
     ));
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
     if let Some(p) = project {
         q = q.bind(p);
     }
@@ -7277,7 +7301,9 @@ pub async fn kinds_for_memories(
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!("SELECT memory_id, kind FROM memory_meta WHERE memory_id IN ({in_list})");
-    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql).fetch_all(&db.pool).await?;
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&db.pool)
+        .await?;
     for r in rows {
         let id: i64 = r.get("memory_id");
         if let Some(kind) = r.try_get::<Option<String>, _>("kind").ok().flatten() {
@@ -7306,7 +7332,9 @@ pub async fn trust_tiers_for(
         .join(",");
     let sql =
         format!("SELECT memory_id, trust_tier FROM memory_meta WHERE memory_id IN ({in_list})");
-    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql).fetch_all(&db.pool).await?;
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&db.pool)
+        .await?;
     for r in rows {
         let id: i64 = r.get("memory_id");
         if let Some(tier) = r.try_get::<Option<String>, _>("trust_tier").ok().flatten() {
@@ -7335,7 +7363,9 @@ pub async fn event_times_for(
         .join(",");
     let sql =
         format!("SELECT memory_id, event_time FROM memory_meta WHERE memory_id IN ({in_list})");
-    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql).fetch_all(&db.pool).await?;
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&db.pool)
+        .await?;
     for r in rows {
         let id: i64 = r.get("memory_id");
         if let Some(et) = r.try_get::<Option<String>, _>("event_time").ok().flatten() {
@@ -7390,7 +7420,7 @@ pub async fn get_recent_memories_scoped_in_namespace(
     };
     sql.push_str(&format!(" ORDER BY m.created_at DESC LIMIT {limit_ph}"));
 
-    let mut q = sqlx::query(&sql)
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(clamp_scope(scope))
         .bind(namespace)
         .bind(now);
@@ -7430,7 +7460,7 @@ pub async fn get_profile_memory(db: &Database) -> Result<Option<Memory>> {
            AND (mm.expires_at IS NULL OR mm.expires_at > $1)
          ORDER BY m.created_at DESC LIMIT 1"
     );
-    let row: Option<sqlx::any::AnyRow> = sqlx::query(&sql)
+    let row: Option<sqlx::any::AnyRow> = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(Utc::now().timestamp())
         .fetch_optional(&db.pool)
         .await?;
@@ -7461,7 +7491,7 @@ pub async fn count_user_memories(db: &Database) -> Result<i64> {
            AND mm.tombstoned_at IS NULL
            AND (mm.expires_at IS NULL OR mm.expires_at > $1)"
     );
-    let row: sqlx::any::AnyRow = sqlx::query(&sql)
+    let row: sqlx::any::AnyRow = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(Utc::now().timestamp())
         .fetch_one(&db.pool)
         .await?;
@@ -7498,7 +7528,7 @@ pub async fn get_memories_by_kind(
     };
     sql.push_str(&format!(" ORDER BY m.created_at DESC LIMIT {limit_ph}"));
 
-    let mut q = sqlx::query(&sql)
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(clamp_kind(kind))
         .bind(Utc::now().timestamp());
     if let Some(p) = project {
@@ -7789,7 +7819,7 @@ pub async fn memory_ids_missing_embedding(
     if project.is_some() {
         sql.push_str(" AND m.project = $2");
     }
-    let mut q = sqlx::query(&sql).bind(model);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(model);
     if let Some(p) = project {
         q = q.bind(p);
     }
@@ -7879,7 +7909,7 @@ pub async fn memories_by_ids_in_namespace(
             AND mm.tombstoned_at IS NULL
             AND (mm.expires_at IS NULL OR mm.expires_at > $2)"
     );
-    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(&sql)
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(namespace)
         .bind(now)
         .fetch_all(&db.pool)
@@ -7915,7 +7945,7 @@ pub async fn all_memory_ids_with_text(
     if project.is_some() {
         sql.push_str(" WHERE m.project = $1");
     }
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
     if let Some(p) = project {
         q = q.bind(p);
     }
@@ -9608,10 +9638,12 @@ mod tests {
                 .is_err()
         );
         for table in ["memories", "memory_meta", "memory_evidence_roots"] {
-            let count: i64 = sqlx::query(&format!("SELECT COUNT(*) AS n FROM {table}"))
-                .fetch_one(&db.pool)
-                .await?
-                .get("n");
+            let count: i64 = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) AS n FROM {table}"
+            )))
+            .fetch_one(&db.pool)
+            .await?
+            .get("n");
             assert_eq!(count, 0, "partial memory remained in {table}");
         }
         sqlx::query("DROP TRIGGER fixture_reject_evidence")

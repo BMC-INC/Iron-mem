@@ -1,31 +1,25 @@
-# Contributing to Iron-Mem
+# Contributing to IronMem
 
-Thanks for your interest in contributing. Iron-Mem is a small, focused tool — contributions are welcome as long as they serve the core use case: lightweight, provider-agnostic session memory for AI coding assistants.
+IronMem provides persistent project memory for coding assistants. Keep the default SQLite installation local and lightweight.
 
 ## Before you open a PR
 
 Open an issue first. Describe what you want to change and why. This saves both of us time — if the change doesn't fit the project's direction, better to know before you build it.
 
-## What gets accepted
+## Scope
 
-- Bug fixes
-- Hook compatibility improvements for other AI coding tools (Cursor, Windsurf, Copilot, etc.)
-- Performance improvements to the Rust worker
-- Documentation improvements
+Bug fixes, regression tests, performance improvements and documentation are welcome for the CLI, MCP server, REST API, workbench, hooks and supported optional integrations. The [reference](docs/reference.md) describes supported storage backends and configuration. Discuss new runtime dependencies, storage backends and remote services in an issue before adding them. Keep optional dependencies off the default runtime path.
 
-## What won't be accepted
+## Tests
 
-- Adding new runtime dependencies (no Bun, no Python, no external databases)
-- Web UI or dashboard features
-- Sync, cloud, or multi-machine features
-- Anything that makes the install more complex
+Add automated tests for every major new capability. Include a regression test when fixing a bug where practical. Exercise the affected interface and its failure cases. Describe the commands and results in the pull request. For documentation-only changes, check the links and examples you changed.
 
 ## How to submit a PR
 
 1. Fork the repo
 2. Create a branch: `git checkout -b fix/your-fix-name`
 3. Make your changes
-4. Test locally with `cargo build --release` and verify hooks work end-to-end
+4. For Rust changes, run `cargo test --locked` and `cargo clippy --locked --all-targets -- -D warnings`. Verify hooks end to end when changing them
 5. Open a PR against `main` with a clear description of what changed and why
 
 ## Code style
@@ -34,4 +28,4 @@ Standard Rust formatting. Run `cargo fmt` before submitting. No warnings allowed
 
 ## Questions
 
-Open an issue. Don't email directly.
+Use [Issues](https://github.com/BMC-INC/Iron-mem/issues) for general questions. For a suspected vulnerability, follow the [security policy](SECURITY.md).
