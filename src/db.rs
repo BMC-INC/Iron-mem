@@ -8922,11 +8922,11 @@ mod tests {
         let user_ids: Vec<i64> = users.iter().map(|m| m.id).collect();
         assert!(
             user_ids.contains(&m2) && user_ids.contains(&m3),
-            "{user_ids:?}"
+            "both user-scoped test memories must be present"
         );
         assert!(
             !user_ids.contains(&m1) && !user_ids.contains(&m4),
-            "{user_ids:?}"
+            "project-scoped test memories must be absent"
         );
 
         // Project-scope for beta → m4 (legacy, no meta) but NOT m3 (user-scope).

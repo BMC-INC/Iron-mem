@@ -2280,17 +2280,45 @@ async fn run_sync(cfg: &config::Config, action: SyncCommands) -> Result<()> {
     Ok(())
 }
 
+// Only the health flag is required. Older and newer servers expose different metrics.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct CliStatus {
+    ok: bool,
+    #[serde(flatten)]
+    metrics: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+async fn read_status(mut response: reqwest::Response) -> Result<CliStatus> {
+    const MAX_STATUS_BYTES: usize = 1024 * 1024;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "Status endpoint returned {}",
+        response.status()
+    );
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            chunk.len() <= MAX_STATUS_BYTES - body.len(),
+            "Status response exceeds 1 MiB"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| anyhow::anyhow!("Invalid status document"))
+}
+
 async fn run_status(cfg: &config::Config) -> Result<()> {
     let url = format!("http://127.0.0.1:{}/status", cfg.port);
-    match reqwest::get(&url).await {
-        Ok(resp) => {
-            let text = resp.text().await?;
-            // Pretty print
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                println!("{}", serde_json::to_string_pretty(&v)?);
-            } else {
-                println!("{}", text);
-            }
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    match client.get(&url).send().await {
+        Ok(response) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&read_status(response).await?)?
+            );
         }
         Err(_) => {
             println!("❌ ironmem server is not running (port {})", cfg.port);
@@ -2345,7 +2373,7 @@ async fn run_search(
     println!("Found {} memories:\n", memories.len() + advisory.len());
     for m in memories {
         println!("─────────────────────────────────");
-        println!("ID: {} | Session: {}", m.id, m.session_id);
+        println!("ID: {}", m.id);
         println!("{}", m.summary);
         if let Some(tags) = m.tags {
             println!("Tags: {}", tags);
@@ -2408,7 +2436,7 @@ async fn run_search_global(
     for m in memories {
         println!("─────────────────────────────────");
         println!("Project: {}", m.project);
-        println!("ID: {} | Session: {}", m.id, m.session_id);
+        println!("ID: {}", m.id);
         println!("{}", m.summary);
         if let Some(tags) = m.tags {
             println!("Tags: {}", tags);
@@ -3032,11 +3060,11 @@ async fn run_compress_cmd(cfg: &config::Config, session_id: &str) -> Result<()> 
     // Surface a friendly error early if the session doesn't exist.
     db::get_session(&database, session_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
+        .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
     let observations = db::get_observations_for_session(&database, session_id).await?;
     if observations.is_empty() {
-        println!("No observations for session {}", session_id);
+        println!("No observations for this session");
         return Ok(());
     }
 
@@ -3138,7 +3166,6 @@ fn print_sweep_report(kind: &str, dry_run: bool, header: &str, report: &sweep::S
     let dry_run = dry_run || report.dry_run;
     println!("SWEEP kind={kind} dry_run={dry_run} {header}");
     for action in &report.actions {
-        let session = action.session_id.as_deref().unwrap_or("-");
         let idle = action
             .idle_secs
             .map(format_duration)
@@ -3148,8 +3175,7 @@ fn print_sweep_report(kind: &str, dry_run: bool, header: &str, report: &sweep::S
             .map(|n| n.to_string())
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "candidate session={} project={} idle={} observations={} action={} status={} reason={}{}",
-            session,
+            "candidate project={} idle={} observations={} action={} status={} reason={}{}",
             action.project,
             idle,
             observations,
@@ -3159,6 +3185,7 @@ fn print_sweep_report(kind: &str, dry_run: bool, header: &str, report: &sweep::S
             action
                 .detail
                 .as_deref()
+                .filter(|_| action.status != "failed")
                 .map(|d| format!(" detail={}", d.replace('\n', " ")))
                 .unwrap_or_default()
         );
@@ -3311,6 +3338,22 @@ fn format_timestamp(timestamp: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn status_reader_preserves_metrics_and_rejects_invalid_or_oversized_bodies() {
+        async fn read(body: Vec<u8>) -> Result<CliStatus> {
+            let response = axum::http::Response::new(reqwest::Body::from(body));
+            read_status(response.into()).await
+        }
+        let status = read(br#"{"ok":true,"sessions":3,"extra":{"count":1}}"#.to_vec())
+            .await
+            .unwrap();
+        assert!(status.ok);
+        assert_eq!(status.metrics["extra"]["count"], 1);
+        assert!(read(br#"{"ok":"yes"}"#.to_vec()).await.is_err());
+        assert!(read(b"raw console message".to_vec()).await.is_err());
+        assert!(read(vec![b' '; 1024 * 1024 + 1]).await.is_err());
+    }
 
     #[test]
     fn remote_mcp_origin_is_loopback_only() {
