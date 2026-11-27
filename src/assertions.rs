@@ -283,7 +283,7 @@ pub async fn handle(
             } else {
                 "id"
             };
-            let row = sqlx::query(&format!("SELECT m.summary FROM memories m JOIN memory_meta mm ON mm.memory_id=m.{id_col} WHERE m.{id_col}=$1 AND m.project=$2 AND mm.namespace=$3 AND mm.tombstoned_at IS NULL AND (mm.expires_at IS NULL OR mm.expires_at>$4)"))
+            let row = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT m.summary FROM memories m JOIN memory_meta mm ON mm.memory_id=m.{id_col} WHERE m.{id_col}=$1 AND m.project=$2 AND mm.namespace=$3 AND mm.tombstoned_at IS NULL AND (mm.expires_at IS NULL OR mm.expires_at>$4)")))
                 .bind(memory_id).bind(&scope.project).bind(&scope.namespace).bind(chrono::Utc::now().timestamp()).fetch_optional(&mut *tx).await?.ok_or_else(|| anyhow::anyhow!("active scoped evidence memory required"))?;
             let event = Event {
                 scope: scope.clone(),

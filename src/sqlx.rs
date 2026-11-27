@@ -9,6 +9,9 @@ pub use sqlx_core::error::Error;
 pub use sqlx_core::query::query;
 pub use sqlx_core::query_scalar::query_scalar;
 pub use sqlx_core::row::Row;
+// For SQL composed from fixed schema fragments, numeric IDs or bind placeholders.
+// Call sites bind user-supplied text separately.
+pub use sqlx_core::sql_str::AssertSqlSafe;
 pub use sqlx_core::transaction::Transaction;
 
 pub mod any {

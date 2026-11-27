@@ -10,6 +10,7 @@ use crate::influence::{normalize_task_type, ActionRisk};
 
 type HmacSha256 = Hmac<Sha256>;
 const TOKEN_VERSION: &str = "v1";
+const MIN_HMAC_KEY_BYTES: usize = 32;
 const MAX_FIELD_BYTES: usize = 512;
 const CLOCK_SKEW_SECONDS: i64 = 30;
 
@@ -218,7 +219,7 @@ pub struct TrustedRuntimeVerifier {
 
 impl TrustedRuntimeVerifier {
     pub fn new(key: Vec<u8>) -> Result<Self, PurposeError> {
-        if key.len() < 32 {
+        if key.len() < MIN_HMAC_KEY_BYTES {
             return Err(PurposeError::Invalid(
                 "attestation key must contain at least 32 bytes".to_string(),
             ));
@@ -286,6 +287,9 @@ pub fn verify_confirmation(
     purpose: &VerifiedRecallPurpose,
     now: i64,
 ) -> Result<ConfirmationClaims, PurposeError> {
+    if key.len() < MIN_HMAC_KEY_BYTES {
+        return Err(PurposeError::InvalidConfirmation);
+    }
     let claims: ConfirmationClaims =
         decode_signed(token, key).map_err(|_| PurposeError::InvalidConfirmation)?;
     validate_window(claims.issued_at, claims.expires_at, now)
@@ -352,7 +356,7 @@ pub fn mint_confirmation_token(
     issued_at: i64,
     expires_at: i64,
 ) -> Result<String, PurposeError> {
-    if key.len() < 32 {
+    if key.len() < MIN_HMAC_KEY_BYTES {
         return Err(PurposeError::Invalid(
             "confirmation key must contain at least 32 bytes".to_string(),
         ));
@@ -523,6 +527,17 @@ mod tests {
                 .unwrap()
                 .receipt_id,
             "confirm-1"
+        );
+        let short_key = &key[..MIN_HMAC_KEY_BYTES - 1];
+        assert_eq!(
+            verify_confirmation(
+                &encode_signed(&claims, short_key),
+                short_key,
+                &verified,
+                100
+            )
+            .unwrap_err(),
+            PurposeError::InvalidConfirmation
         );
         let mut critical = verified;
         critical.action_risk = ActionRisk::Critical;

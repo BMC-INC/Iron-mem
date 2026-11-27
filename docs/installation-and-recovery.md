@@ -3,7 +3,7 @@
 ## Install
 
 Run `./install.sh` on Unix or `./install.ps1` on Windows from a source checkout.
-Python 3.9+ and Rust/Cargo are required for source builds. The streamed Unix
+Source builds require Python 3.9+ and Rust/Cargo. The SQLx drivers require Rust 1.94 or newer. The streamed Unix
 installer also requires Git, creates one shallow temporary source checkout, and
 removes that checkout and its build outputs on exit. Both installers use the
 same implementation and `cargo build --release --locked`. For an already built

@@ -111,11 +111,11 @@ async fn transaction(db: &Database) -> Result<sqlx::Transaction<'_, sqlx::Any>> 
 async fn capture_table(
     conn: &mut AnyConnection,
     db: &Database,
-    table: &str,
+    table: &'static str,
     project: &str,
 ) -> Result<Table> {
     let fields: Vec<(String,String)> = match db.backend {
-        Backend::Sqlite => sqlx::query(&format!("PRAGMA table_info({table})")).fetch_all(&mut *conn).await?.into_iter()
+        Backend::Sqlite => sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})"))).fetch_all(&mut *conn).await?.into_iter()
             .map(|r| (r.get("name"),r.get::<String,_>("type"))).collect(),
         Backend::Postgres => sqlx::query("SELECT CAST(column_name AS TEXT) AS column_name,CAST(data_type AS TEXT) AS data_type FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=$1 ORDER BY ordinal_position")
             .bind(table).fetch_all(&mut *conn).await?.into_iter().map(|r| (r.get("column_name"),r.get("data_type"))).collect(),
@@ -125,6 +125,9 @@ async fn capture_table(
         fields.insert(0, ("rowid".into(), "BIGINT".into()));
     }
     ensure!(!fields.is_empty(), "missing checkpoint table {table}");
+    for (column, _) in &fields {
+        validate_column_name(column)?;
+    }
     let expression = fields
         .iter()
         .map(|(name, _)| format!("'{name}',{name}"))
@@ -143,7 +146,7 @@ async fn capture_table(
     } else {
         format!("SELECT CAST(row_to_json(t) AS TEXT) AS record FROM (SELECT * FROM {table} WHERE {predicate}) t")
     };
-    let mut rows: Vec<Record> = sqlx::query(&sql)
+    let mut rows: Vec<Record> = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(project)
         .fetch_all(&mut *conn)
         .await?
@@ -173,6 +176,14 @@ async fn capture_table(
     rows.sort_by_cached_key(|r| serde_json::to_string(r).expect("record serialization"));
     Ok(Table { fields, rows })
 }
+fn validate_column_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+        "invalid checkpoint column"
+    );
+    Ok(())
+}
+
 fn normalized_type(kind: &str) -> Result<&'static str> {
     match kind.to_ascii_lowercase().as_str() {
         "integer" | "bigint" | "bigserial" => Ok("BIGINT"),
@@ -196,7 +207,7 @@ async fn capture(
         );
     }
     // Cross-project contradiction membership cannot be safely partially replaced.
-    let cross: i64 = sqlx::query(&format!("SELECT COUNT(*) AS n FROM contradiction_members cm JOIN contradiction_sets cs ON cs.id=cm.contradiction_set_id WHERE (cm.memory_id IN (SELECT {} FROM memories WHERE project=$1) AND (cs.project IS NULL OR cs.project<>$1)) OR (cs.project=$1 AND cm.memory_id NOT IN (SELECT {} FROM memories WHERE project=$1))",id_col(db),id_col(db)))
+    let cross: i64 = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) AS n FROM contradiction_members cm JOIN contradiction_sets cs ON cs.id=cm.contradiction_set_id WHERE (cm.memory_id IN (SELECT {} FROM memories WHERE project=$1) AND (cs.project IS NULL OR cs.project<>$1)) OR (cs.project=$1 AND cm.memory_id NOT IN (SELECT {} FROM memories WHERE project=$1))",id_col(db),id_col(db))))
         .bind(project).fetch_one(&mut *conn).await?.get("n");
     ensure!(cross == 0,"project has cross-project contradiction sets; checkpoint requires an explicit shared-scope export");
     let mut hashes = BTreeSet::new();
@@ -408,10 +419,7 @@ fn validate(state: &State) -> Result<()> {
     }
     for table in state.tables.values() {
         for (name, kind) in &table.fields {
-            ensure!(
-                name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
-                "invalid checkpoint column"
-            );
+            validate_column_name(name)?;
             normalized_type(kind)?;
         }
         for row in &table.rows {
@@ -584,7 +592,7 @@ pub async fn create(
 async fn insert_record(
     conn: &mut AnyConnection,
     db: &Database,
-    name: &str,
+    name: &'static str,
     table: &Table,
     row: &Record,
 ) -> Result<()> {
@@ -608,7 +616,7 @@ async fn insert_record(
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!("INSERT INTO {name}({columns}) VALUES({values})");
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
     for (field, _) in &table.fields {
         let value = &row[field];
         let text = match value {
@@ -641,10 +649,10 @@ pub async fn restore(
     validate(state)?;
     let mut tx = transaction(db).await?;
     if matches!(db.backend, Backend::Postgres) {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
             TABLES.join(",")
-        ))
+        )))
         .execute(&mut *tx)
         .await?;
     }
@@ -837,7 +845,7 @@ pub async fn restore(
                     .as_str()
                     .map(str::to_owned)
                     .unwrap_or_else(|| id.to_string());
-                let count: i64 = sqlx::query(&sql)
+                let count: i64 = sqlx::query(sqlx::AssertSqlSafe(sql))
                     .bind(value)
                     .bind(&state.project)
                     .fetch_one(&mut *tx)
@@ -858,10 +866,12 @@ pub async fn restore(
         "owner_type='memory' AND owner_id IN (SELECT {} FROM memories WHERE project=$1)",
         id_col(db)
     );
-    sqlx::query(&format!("DELETE FROM embeddings WHERE {predicate}"))
-        .bind(&state.project)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM embeddings WHERE {predicate}"
+    )))
+    .bind(&state.project)
+    .execute(&mut *tx)
+    .await?;
     let vector_table = if matches!(db.backend, Backend::Sqlite) {
         "vec_memories"
     } else {
@@ -877,17 +887,17 @@ pub async fn restore(
         sqlx::query("SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema=current_schema() AND table_name=$1").bind(vector_table).fetch_one(&mut *tx).await?.get("n")
     };
     if exists > 0 {
-        sqlx::query(&format!("DELETE FROM {vector_table} WHERE memory_id IN (SELECT {} FROM memories WHERE project=$1)",id_col(db))).bind(&state.project).execute(&mut *tx).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {vector_table} WHERE memory_id IN (SELECT {} FROM memories WHERE project=$1)",id_col(db)))).bind(&state.project).execute(&mut *tx).await?;
     }
     if matches!(db.backend, Backend::Sqlite) {
         sqlx::query("UPDATE memory_identity_highwater SET maximum=MAX(maximum,COALESCE((SELECT MAX(rowid) FROM memories),0),COALESCE((SELECT MAX(memory_id) FROM memory_meta),0)) WHERE singleton=1").execute(&mut *tx).await?;
     }
     // Delete children before their relational parents. IDs stay stable for handles and history.
     for name in TABLES.iter().rev() {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {name} WHERE {}",
             filter(name, id_col(db))
-        ))
+        )))
         .bind(&state.project)
         .execute(&mut *tx)
         .await?;
@@ -914,7 +924,7 @@ pub async fn restore(
             && table.fields.iter().any(|(f, k)| f == "id" && k == "BIGINT")
         {
             // Reserve future IDs above restored stable identities.
-            sqlx::query(&format!("SELECT setval(pg_get_serial_sequence('{name}','id'),GREATEST(COALESCE((SELECT MAX(id) FROM {name}),1),nextval(pg_get_serial_sequence('{name}','id')),1),true)"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("SELECT setval(pg_get_serial_sequence('{name}','id'),GREATEST(COALESCE((SELECT MAX(id) FROM {name}),1),nextval(pg_get_serial_sequence('{name}','id')),1),true)")))
                 .execute(&mut *tx).await?;
         }
     }
@@ -925,12 +935,14 @@ pub async fn restore(
         let data = serde_json::to_string(record)?;
         sqlx::query("INSERT INTO checkpoint_audit_evidence(project,evidence_hash,data) VALUES($1,$2,$3) ON CONFLICT(project,evidence_hash) DO NOTHING").bind(&state.project).bind(digest(data.as_bytes())).bind(data).execute(&mut *tx).await?;
     }
-    sqlx::query(&format!("DELETE FROM embeddings WHERE {predicate}"))
-        .bind(&state.project)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM embeddings WHERE {predicate}"
+    )))
+    .bind(&state.project)
+    .execute(&mut *tx)
+    .await?;
     if exists > 0 {
-        sqlx::query(&format!("DELETE FROM {vector_table} WHERE memory_id IN (SELECT {} FROM memories WHERE project=$1)",id_col(db))).bind(&state.project).execute(&mut *tx).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {vector_table} WHERE memory_id IN (SELECT {} FROM memories WHERE project=$1)",id_col(db)))).bind(&state.project).execute(&mut *tx).await?;
     }
     sqlx::query("INSERT INTO checkpoint_restore_events(id,snapshot_id,project,state_hash,created_at) VALUES($1,$2,$3,$4,$5)")
         .bind(uuid::Uuid::new_v4().to_string()).bind(snapshot_id).bind(&state.project).bind(state_hash(&replacement)?).bind(chrono::Utc::now().timestamp()).execute(&mut *tx).await?;

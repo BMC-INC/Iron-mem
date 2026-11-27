@@ -16,13 +16,16 @@ Closes #
 
 <!-- Describe the tests you ran and how to reproduce them. -->
 
-- [ ] `cargo build` passes
-- [ ] `cargo test` passes
-- [ ] `cargo clippy` passes with no warnings
+<!-- For documentation-only changes, list the links or examples checked. Mark unrelated items N/A. -->
+
+- [ ] Major new functionality has automated tests. For bug fixes, link the regression test where practical.
+- [ ] `cargo build --locked` passes
+- [ ] `cargo test --locked` passes
+- [ ] `cargo clippy --locked --all-targets -- -D warnings` passes with no warnings
 - [ ] Tested manually with Claude Code / Cursor / other: ___
 
 ## Checklist
 
 - [ ] My code follows the project's style and design principles
-- [ ] I have not added any external runtime dependencies
+- [ ] I linked the prior scope discussion for any new runtime dependency
 - [ ] I have updated documentation if needed

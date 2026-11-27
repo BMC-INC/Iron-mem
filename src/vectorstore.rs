@@ -86,7 +86,7 @@ impl VectorStore for BruteForceStore {
         if project.is_some() {
             sql.push_str(" AND m.project = $2");
         }
-        let mut q = sqlx::query(&sql).bind(model);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(model);
         if let Some(p) = project {
             q = q.bind(p);
         }

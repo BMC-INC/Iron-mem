@@ -68,7 +68,7 @@ pub async fn record(
             Delivery::Recall => ("recall_count", "last_recalled_at"),
             Delivery::Expansion => ("expansion_count", "last_expanded_at"),
         };
-        sqlx::query(&format!("UPDATE memory_access SET {count}={count}+1,{last}=CASE WHEN {last} IS NULL OR {last}<$2 THEN $2 ELSE {last} END WHERE memory_id=$1")).bind(id).bind(now).execute(&mut *tx).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE memory_access SET {count}={count}+1,{last}=CASE WHEN {last} IS NULL OR {last}<$2 THEN $2 ELSE {last} END WHERE memory_id=$1"))).bind(id).bind(now).execute(&mut *tx).await?;
     }
     tx.commit().await?;
     Ok(())
@@ -130,7 +130,10 @@ pub async fn stats(db: &Database, ids: &[i64]) -> Result<BTreeMap<i64, Stats>> {
             .collect::<Vec<_>>()
             .join(",");
         let query=format!("SELECT m.memory_id,a.observed_since,a.recall_count,a.last_recalled_at,a.expansion_count,a.last_expanded_at,b.orig_len FROM memory_meta m LEFT JOIN memory_access a ON a.memory_id=m.memory_id LEFT JOIN blobs b ON b.hash=m.session_blob WHERE m.memory_id IN ({list})");
-        for row in sqlx::query(&query).fetch_all(&db.pool).await? {
+        for row in sqlx::query(sqlx::AssertSqlSafe(query))
+            .fetch_all(&db.pool)
+            .await?
+        {
             let id = row.get("memory_id");
             result.insert(
                 id,
@@ -148,13 +151,13 @@ pub async fn stats(db: &Database, ids: &[i64]) -> Result<BTreeMap<i64, Stats>> {
                 },
             );
         }
-        for row in sqlx::query(&format!("SELECT memory_id,COUNT(*) AS n,MAX(created_at) AS last FROM injection_events WHERE memory_id IN ({list}) GROUP BY memory_id")).fetch_all(&db.pool).await? {
+        for row in sqlx::query(sqlx::AssertSqlSafe(format!("SELECT memory_id,COUNT(*) AS n,MAX(created_at) AS last FROM injection_events WHERE memory_id IN ({list}) GROUP BY memory_id"))).fetch_all(&db.pool).await? {
             if let Some(s)=result.get_mut(&row.get::<i64,_>("memory_id")) { s.injection_count=row.get("n");s.last_injected_at=row.try_get("last")?; }
         }
-        for row in sqlx::query(&format!("SELECT memory_id,observed_since,mutation_count FROM memory_mutations WHERE memory_id IN ({list})")).fetch_all(&db.pool).await? {
+        for row in sqlx::query(sqlx::AssertSqlSafe(format!("SELECT memory_id,observed_since,mutation_count FROM memory_mutations WHERE memory_id IN ({list})"))).fetch_all(&db.pool).await? {
             if let Some(s)=result.get_mut(&row.get::<i64,_>("memory_id")) {s.mutation_count=Some(row.get("mutation_count"));s.mutation_observed_since=Some(row.get("observed_since"));}
         }
-        for row in sqlx::query(&format!("SELECT memory_id,COUNT(*) AS n FROM memory_ledger WHERE memory_id IN ({list}) GROUP BY memory_id")).fetch_all(&db.pool).await? {
+        for row in sqlx::query(sqlx::AssertSqlSafe(format!("SELECT memory_id,COUNT(*) AS n FROM memory_ledger WHERE memory_id IN ({list}) GROUP BY memory_id"))).fetch_all(&db.pool).await? {
             if let Some(s)=result.get_mut(&row.get::<i64,_>("memory_id")) {s.ledger_event_count=row.get("n");}
         }
     }

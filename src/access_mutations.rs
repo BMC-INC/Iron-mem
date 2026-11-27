@@ -38,11 +38,11 @@ pub async fn migrate(db: &Database) -> Result<()> {
             };
             match db.backend {
                 Backend::Sqlite => {
-                    sqlx::query(&format!("CREATE TRIGGER IF NOT EXISTS {trigger} AFTER {event} ON {table} BEGIN {body} END")).execute(&db.pool).await?;
+                    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TRIGGER IF NOT EXISTS {trigger} AFTER {event} ON {table} BEGIN {body} END"))).execute(&db.pool).await?;
                 }
                 Backend::Postgres => {
-                    sqlx::query(&format!("CREATE OR REPLACE FUNCTION {trigger}_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN {body} RETURN {reference}; END $$")).execute(&db.pool).await?;
-                    sqlx::query(&format!("CREATE OR REPLACE TRIGGER {trigger} AFTER {event} ON {table} FOR EACH ROW EXECUTE FUNCTION {trigger}_fn()")).execute(&db.pool).await?;
+                    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE OR REPLACE FUNCTION {trigger}_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN {body} RETURN {reference}; END $$"))).execute(&db.pool).await?;
+                    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE OR REPLACE TRIGGER {trigger} AFTER {event} ON {table} FOR EACH ROW EXECUTE FUNCTION {trigger}_fn()"))).execute(&db.pool).await?;
                 }
             }
         }
@@ -51,10 +51,10 @@ pub async fn migrate(db: &Database) -> Result<()> {
     let body="UPDATE memory_mutations SET mutation_count=mutation_count+1 WHERE memory_id IN (SELECT memory_id FROM contradiction_members WHERE contradiction_set_id=NEW.id); UPDATE generated_context_files SET dirty=dirty+1; UPDATE context_revision SET revision=revision+1 WHERE singleton=1;";
     match db.backend {
         Backend::Sqlite => {
-            sqlx::query(&format!("CREATE TRIGGER IF NOT EXISTS access_contradiction_update AFTER UPDATE ON contradiction_sets BEGIN {body} END")).execute(&db.pool).await?;
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TRIGGER IF NOT EXISTS access_contradiction_update AFTER UPDATE ON contradiction_sets BEGIN {body} END"))).execute(&db.pool).await?;
         }
         Backend::Postgres => {
-            sqlx::query(&format!("CREATE OR REPLACE FUNCTION access_contradiction_update_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN {body} RETURN NEW; END $$")).execute(&db.pool).await?;
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE OR REPLACE FUNCTION access_contradiction_update_fn() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN {body} RETURN NEW; END $$"))).execute(&db.pool).await?;
             sqlx::query("CREATE OR REPLACE TRIGGER access_contradiction_update AFTER UPDATE ON contradiction_sets FOR EACH ROW EXECUTE FUNCTION access_contradiction_update_fn()").execute(&db.pool).await?;
         }
     }

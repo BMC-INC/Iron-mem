@@ -174,11 +174,8 @@ pub async fn run_compression_sweep_with<C: SessionCompressor + Sync>(
 
         let action = run_one_compression(db, cfg, compressor, &candidate, &reason, idle_secs).await;
         let release_result = db::release_sweep_lease(db, &candidate.session_id, &owner).await;
-        if let Err(e) = release_result {
-            tracing::warn!(
-                "sweep: failed to release lease for {}: {e}",
-                candidate.session_id
-            );
+        if release_result.is_err() {
+            tracing::warn!("sweep: failed to release session lease");
         }
 
         match action {
