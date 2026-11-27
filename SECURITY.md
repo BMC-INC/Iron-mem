@@ -4,7 +4,7 @@
 
 If you discover a security vulnerability in IronMem, **please do not open a public GitHub issue.**
 
-Use GitHub’s private HTTPS [Report a vulnerability](https://github.com/BMC-INC/Iron-mem/security/advisories/new) form or email **security@execlayer.com**.
+Use GitHub’s private HTTPS [Report a vulnerability](https://github.com/BMC-INC/Iron-mem/security/advisories/new) form to send the report directly to the IronMem maintainers.
 
 Include:
 - A description of the vulnerability

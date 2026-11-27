@@ -59,8 +59,8 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-**security@execlayer.com**.
+reported privately to the IronMem maintainer, James Benton, at
+[james@execlayer.io](mailto:james@execlayer.io).
 
 All complaints will be reviewed and investigated promptly and fairly.
 
